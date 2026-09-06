@@ -192,7 +192,9 @@ def library():
     for p in pls:
         p["duration"] = sum(songs[n]["duration"] or 0 for n in p["songs"])
     ordered = sorted(songs.values(), key=lambda s: s["file"].lower())
-    return {"root": sm.folder(), "playlists": pls, "songs": ordered,
+    root = sm.folder()
+    return {"root": root, "root_exists": os.path.isdir(root),
+            "playlists": pls, "songs": ordered,
             "playlists_dir": sm.playlists_dir(), "levelling": sm.levelling(), "picker": bool(sm.chooser()),
             "target": sm.target(),
             # The ends of the target slider, so the page can't offer a setting

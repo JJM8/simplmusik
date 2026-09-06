@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Build a .deb of simplmusik.
+
+Everything the app needs goes in the package, including yt-dlp - which is the
+one dependency apt cannot supply, because the archive freezes versions at
+release and YouTube retires old extractors within months. The copy in here is
+fetched at build time, and `simplmusik update` replaces it later.
+
+    ./build-deb                  # build simplmusik_<version>_all.deb
+    ./build-deb --version 0.2.0  # ...with a version of your choosing
+    ./build-deb --keep           # leave the staging tree for a look
+
+Needs dpkg-deb, which is on every Debian and Ubuntu already.
+"""
+
+import importlib.machinery, importlib.util, gzip, os, shutil, subprocess, sys
+import time, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BUILD = os.path.join(HERE, "build")
+VERSION = "0.1.0"
+PKG = "simplmusik"
+MAINTAINER = "Josh <john.mcgill@mail.com>"
+
+# Where the app lands. One folder holding the lot, because the three scripts
+# find each other and their web assets relative to their own path - so as long
+# as they stay together, a system install needs no path changes at all.
+LIBDIR = "/usr/lib/simplmusik"
+APP_FILES = ["simplmusik", "server.py", "simplmusik-ui"]
+SIZES = (32, 48, 64, 128, 256)
+
+YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+
+# Everything below is in the archive on every release still supported. yt-dlp
+# is the one name deliberately absent: apt's is too old to reach any audio, so
+# the package carries its own rather than depending on a broken one.
+#
+# 3.10 is the bundled yt-dlp's floor, not ours - it refuses to import below it.
+# Saying so here is what turns "installs, then can't download anything" into
+# apt declining the install and explaining why. It rules out Ubuntu 20.04
+# (3.8), which is the oldest thing this would otherwise have landed on.
+#
+# WebKit is pinned to 4.1 with no 4.0 alternative on purpose: simplmusik-ui
+# asks for 4.1 by name, so a 4.0 that satisfied apt would still leave the
+# window falling back to a browser tab. 4.1 is in Ubuntu 22.04 and Debian 12
+# onwards, which is everything 3.10 already leaves standing.
+DEPENDS = ["python3 (>= 3.10)",
+           "mpv",
+           "ffmpeg",
+           "python3-mutagen",
+           "python3-gi",
+           "gir1.2-webkit2-4.1"]
+
+DESCRIPTION = """\
+ A local music player with a clean, minimalist interface. Plays the music on
+ your own machine, levels every song to the same loudness so you stop reaching
+ for the volume, and can pull down anything you haven't got yet.
+ .
+ It also has a CLI that speaks JSON, which is there so an assistant can drive
+ it and read back what happened.
+"""
+
+
+def load_install():
+    """The installer, imported for its icon drawing - it has no .py on the end
+    of it, so it is loaded by path rather than found on sys.path."""
+    path = os.path.join(HERE, "install")
+    loader = importlib.machinery.SourceFileLoader("simplmusik_install", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def fetch_ytdlp(dest):
+    """The newest yt-dlp zipapp, cached between builds.
+
+    Cached because it is three megabytes and does not change between two
+    builds a minute apart - and because a build should not need the network
+    twice to produce the same package."""
+    cache = os.path.join(BUILD, "yt-dlp.cache")
+    if not os.path.isfile(cache):
+        os.makedirs(BUILD, exist_ok=True)
+        print("  fetching yt-dlp ...", end=" ", flush=True)
+        try:
+            with urllib.request.urlopen(YTDLP_URL, timeout=180) as r:
+                blob = r.read()
+        except Exception as e:
+            sys.exit("\ncouldn't fetch yt-dlp: %s" % e)
+        with open(cache + ".tmp", "wb") as f:
+            f.write(blob)
+        os.replace(cache + ".tmp", cache)
+    shutil.copy2(cache, dest)
+    os.chmod(dest, 0o755)
+
+    # A zipapp is a zip, and the version is a line inside it. Reading it here
+    # means the package records what it actually shipped rather than what the
+    # release page was called.
+    version = load_cli().zipapp_version(dest)
+    if not version:
+        sys.exit("what was fetched isn't a yt-dlp zipapp")
+    return version
+
+
+def load_cli():
+    """The CLI, imported for `zipapp_version`, the same way server.py does."""
+    path = os.path.join(HERE, "simplmusik")
+    loader = importlib.machinery.SourceFileLoader("simplmusik_cli_build", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def tree(root, version, ytdlp_version):
+    """Lay the package out under `root`."""
+    def put(*parts):
+        d = os.path.join(root, *parts)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    lib = put("usr", "lib", "simplmusik")
+    for name in APP_FILES:
+        shutil.copy2(os.path.join(HERE, name), os.path.join(lib, name))
+        os.chmod(os.path.join(lib, name), 0o755)
+    shutil.copytree(os.path.join(HERE, "web"), os.path.join(lib, "web"))
+
+    # The two commands, on the PATH. Symlinks rather than wrappers because the
+    # scripts resolve their own real path, so a link costs nothing.
+    bindir = put("usr", "bin")
+    for name in ("simplmusik", "simplmusik-ui"):
+        os.symlink(os.path.join(LIBDIR, name), os.path.join(bindir, name))
+
+    # The menu entry, from the same function the checkout installer uses. No
+    # Path= here: installed, the app is on the PATH and finds its own assets.
+    inst = load_install()
+    apps = put("usr", "share", "applications")
+    with open(os.path.join(apps, "simplmusik.desktop"), "w") as f:
+        f.write(inst.desktop_entry("/usr/bin/simplmusik-ui"))
+
+    print("  drawing icons ...", end=" ", flush=True)
+    mw, mh, mask = inst.png_alpha(os.path.join(HERE, "web", "logo.png"))
+    accent = inst.rgb(inst.DEFAULT_ACCENT)
+    for size in SIZES:
+        d = put("usr", "share", "icons", "hicolor", "%dx%d" % (size, size), "apps")
+        inst.png_write(os.path.join(d, "simplmusik.png"), size,
+                       inst.draw_icon(size, accent, mw, mh, mask))
+    print("%d sizes" % len(SIZES))
+
+    doc = put("usr", "share", "doc", PKG)
+    for name in ("README.md", "DESIGNNOTES.md"):
+        src = os.path.join(HERE, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(doc, name))
+    with open(os.path.join(doc, "copyright"), "w") as f:
+        f.write(COPYRIGHT % (time.strftime("%Y"), MAINTAINER, LICENSE,
+                             ytdlp_version))
+    with gzip.GzipFile(os.path.join(doc, "changelog.Debian.gz"), "wb",
+                       mtime=0) as f:
+        f.write(changelog(version).encode())
+
+
+# There is no LICENSE file in the checkout, so there is nothing to copy one out
+# of. A package still has to say something, so it says so plainly rather than
+# picking a licence on your behalf - and the build prints a warning about it.
+LICENSE = "UNSET"
+
+COPYRIGHT = """\
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: simplmusik
+
+Files: *
+Copyright: %s %s
+License: %s
+
+Files: usr/lib/simplmusik/yt-dlp
+Copyright: The yt-dlp maintainers
+License: Unlicense
+ yt-dlp %s is bundled here as a self-contained zipapp. It is released into
+ the public domain; see https://github.com/yt-dlp/yt-dlp for the full text.
+"""
+
+
+def changelog(version):
+    stamp = time.strftime("%a, %d %b %Y %H:%M:%S %z")
+    return ("%s (%s) unstable; urgency=medium\n\n"
+            "  * Package built by ./build-deb.\n\n"
+            " -- %s  %s\n" % (PKG, version, MAINTAINER, stamp))
+
+
+def control(root, version, size_kb):
+    d = os.path.join(root, "DEBIAN")
+    os.makedirs(d, exist_ok=True)
+    fields = [("Package", PKG),
+              ("Version", version),
+              ("Section", "sound"),
+              ("Priority", "optional"),
+              ("Architecture", "all"),
+              ("Depends", ", ".join(DEPENDS)),
+              ("Installed-Size", str(size_kb)),
+              ("Maintainer", MAINTAINER),
+              ("Description", "a local music player")]
+    with open(os.path.join(d, "control"), "w") as f:
+        for k, v in fields:
+            f.write("%s: %s\n" % (k, v))
+        f.write(DESCRIPTION)
+
+    # The menu and the icon theme both keep a cache, and neither notices a new
+    # file on its own. Failing to refresh one is not worth failing an install
+    # over, though - it only means the entry shows up a login later.
+    for name, script in (("postinst", POSTINST), ("postrm", POSTINST)):
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(script)
+        os.chmod(p, 0o755)
+
+
+POSTINST = """#!/bin/sh
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+fi
+exit 0
+"""
+
+
+def normalise_modes(root):
+    """Debian wants 0755 on directories and 0644 on files, with only the things
+    meant to be run marked executable. What a checkout happens to be sitting at
+    - often group-writable, from whatever umask wrote it - is not that."""
+    runnable = set(APP_FILES) | {"yt-dlp"}
+    for dirpath, dirnames, names in os.walk(root):
+        for d in dirnames:
+            os.chmod(os.path.join(dirpath, d), 0o755)
+        for n in names:
+            p = os.path.join(dirpath, n)
+            if os.path.islink(p):
+                continue
+            os.chmod(p, 0o755 if n in runnable else 0o644)
+
+
+def du_kb(root):
+    total = 0
+    for dirpath, _, names in os.walk(root):
+        for n in names:
+            p = os.path.join(dirpath, n)
+            if not os.path.islink(p):
+                total += os.path.getsize(p)
+    return max(1, total // 1024)
+
+
+def main():
+    args = sys.argv[1:]
+    version = VERSION
+    if "--version" in args:
+        i = args.index("--version")
+        if i + 1 >= len(args):
+            sys.exit("--version needs a number, e.g. --version 0.2.0")
+        version = args[i + 1]
+    if not shutil.which("dpkg-deb"):
+        sys.exit("dpkg-deb isn't installed - `sudo apt install dpkg-dev`")
+
+    stage = os.path.join(BUILD, "%s_%s_all" % (PKG, version))
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+    os.makedirs(stage)
+    print("building %s %s" % (PKG, version))
+
+    lib = os.path.join(stage, LIBDIR.lstrip("/"))
+    os.makedirs(lib)
+    ytdlp_version = fetch_ytdlp(os.path.join(lib, "yt-dlp"))
+    print("  bundling yt-dlp %s" % ytdlp_version)
+
+    tree(stage, version, ytdlp_version)
+    normalise_modes(stage)              # before the control files, which are
+    control(stage, version, du_kb(stage))   # written 0755 on purpose
+
+    out = os.path.join(BUILD, "%s_%s_all.deb" % (PKG, version))
+    subprocess.run(["dpkg-deb", "--root-owner-group", "--build", stage, out],
+                   check=True, stdout=subprocess.DEVNULL)
+    if "--keep" not in args:
+        shutil.rmtree(stage)
+
+    print("\n%s  (%.1f MB)" % (out, os.path.getsize(out) / 1e6))
+    print("\nInstall it with:\n    sudo apt install %s" % out)
+    if LICENSE == "UNSET":
+        print("\nnote: there is no LICENSE file, so the package's copyright "
+              "says so.\n      Add one and set LICENSE in this script before "
+              "handing the .deb out.")
+
+
+if __name__ == "__main__":
+    main()

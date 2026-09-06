@@ -84,7 +84,7 @@ import argparse, json, os, random, re, select, shutil, signal, socket
 import subprocess, sys, time, zipfile
 
 AUDIO = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
-HOME_MUSIC = os.path.expanduser("~/Music")          # the default music folder
+HOME_MUSIC = os.path.expanduser("~/Music")          # where playlists once sat
 CONF = os.path.expanduser("~/.config/simplmusik")  # the simplmusik folder
 CONFIG = os.path.join(CONF, "config.json")
 HOMELESS = os.path.join(CONF, "playlists")          # where they waited, once
@@ -99,6 +99,11 @@ CACHE = os.path.expanduser("~/.cache/simplmusik.json")
 NULL = subprocess.DEVNULL
 
 CONF_DOT = ".simplmusik"            # the hidden folder playlists sit in
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
+YTDLP_USER = os.path.expanduser("~/.local/share/simplmusik/yt-dlp")
+YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 
 # ---------------------------------------------------------------- state file
 # The one source of truth for what is playing. Only the player process writes
@@ -257,15 +262,55 @@ def choose_folder():
 # and the first subfolder holding a name wins, so the same name twice is one
 # song rather than an ambiguity to settle again at every turn.
 
+def xdg_music():
+    """Where this desktop keeps music, or None if it doesn't say.
+
+    ~/Music is only the answer on an English machine - a German one says
+    ~/Musik, and somebody who moved theirs onto another disk says that here
+    too. The file is one shell assignment a line, so it is read rather than
+    shelled out to `xdg-user-dir`: this is asked before every command.
+
+    $HOME on its own is how the file says "no music folder", and taking it at
+    its word would make the library the whole of your home directory - so that
+    one answer is declined."""
+    home = os.path.expanduser("~")
+    conf = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    try:
+        with open(os.path.join(conf, "user-dirs.dirs")) as f:
+            for line in f:
+                m = re.match(r'\s*XDG_MUSIC_DIR\s*=\s*"(.*)"\s*$', line)
+                if m:
+                    d = os.path.abspath(m.group(1).replace("$HOME", home))
+                    return d if d != home else None
+    except OSError:
+        pass                        # no file, no desktop, nothing to go on
+    return None
+
+def default_folder():
+    """The music folder for somebody who has never chosen one.
+
+    The desktop's own answer comes first, because a folder that already holds
+    your music is a better default than a name we made up - and the best
+    folder picker is the one nobody ever has to open. It gives way to ~/Music
+    in one case: simplmusik already living there, which is somebody upgrading,
+    and moving a library out from under them is not a default's job. Where
+    neither folder is on the disk yet, ~/Music is the name to make."""
+    home = os.path.expanduser("~/Music")
+    xdg = xdg_music()
+    if not xdg or xdg == home or os.path.isdir(os.path.join(home, CONF_DOT)):
+        return home
+    return xdg if os.path.isdir(xdg) else home
+
 def folder():
     """Your music folder: the one place a song can be, and where new ones
-    land. There is always one - never having chosen means ~/Music - so nothing
-    downstream has to have an answer for having none."""
+    land. There is always one - never having chosen means whatever this
+    desktop calls its music folder - so nothing downstream has to have an
+    answer for having none."""
     c = load_json(CONFIG, {})
     d = c.get("folder")
     if not d and isinstance(c.get("folders"), list) and c["folders"]:
         d = c["folders"][0]         # a config from when this was a list
-    return os.path.abspath(os.path.expanduser(str(d or HOME_MUSIC)))
+    return os.path.abspath(os.path.expanduser(str(d or default_folder())))
 
 def setting(key, default):
     """One setting from the config file, or what it is when nobody has said."""
@@ -531,7 +576,7 @@ def migrate():
     if "folders" in c:
         dirs = c.pop("folders")
         c.setdefault("folder", dirs[0] if isinstance(dirs, list) and dirs
-                     else HOME_MUSIC)
+                     else default_folder())
         save_json(CONFIG, c, indent=2)
     now = playlists_dir()           # asked after the collapse, not before
     if os.path.isdir(now):
@@ -1060,10 +1105,15 @@ def landed(st, timeout=1.0):
 # -------------------------------------------------------------------- youtube
 # Searching and downloading both go through yt-dlp, imported rather than run as
 # a program: importing it costs about a second, starting the executable costs
-# several. It is commonly installed twice on one machine - a current zipapp in
-# ~/.local/bin beside a stale copy from the distro - and only the newer
-# extractor still works against YouTube, so we look at both and import whichever
-# that is. Versions are dates, `2026.08.19`, so they compare as plain strings.
+# several.
+#
+# It is commonly on one machine more than once - the copy shipped beside this
+# app, a current zipapp in ~/.local/bin, a stale one from the distro - and
+# YouTube changes how it hands out audio often enough that only the newest
+# extractor still reaches any: an old one can search, and then finds nothing
+# but storyboard thumbnails where the audio should be. So every copy is looked
+# at and the newest is the one imported. Versions are dates, `2026.08.19`, so
+# they compare as plain strings.
 
 YTDLP_MIN = "2025"          # older extractors can still search, but not download
 CACHE_WAIT = 600            # seconds `download` will wait on a cache already
@@ -1071,7 +1121,7 @@ CACHE_WAIT = 600            # seconds `download` will wait on a cache already
 RESOLVE_TTL = 3600          # how long a looked-up stream URL is trusted for.
                             # YouTube's own last about six hours; an hour is
                             # short enough that a stale one is never played
-YTDLP_GONE = "yt-dlp isn't installed - `pip install --user -U yt-dlp`"
+YTDLP_GONE = "yt-dlp isn't installed - run `simplmusik update`"
 SEARCH_N = 8                # results a search comes back with
 SEARCH_MAX = 40             # ...and the most it will, however many you ask for
 
@@ -1090,19 +1140,28 @@ def zipapp_version(path):
 _ytdlp = []                 # one-slot cache: [] not looked yet, [None] not there
 
 def ytdlp():
-    """The newest yt-dlp on this machine, imported, or None if there is none."""
+    """The newest yt-dlp on this machine, imported, or None if there is none.
+
+    Four places one can be: installed as a package, on the PATH, fetched by
+    `update` into your own folder, or shipped beside the app. The last two are
+    what let this work with nothing installed at all - and they are separate
+    because the shipped copy may belong to root, which `update` cannot write."""
     if _ytdlp:
         return _ytdlp[0]
     try:
         import yt_dlp as mod
     except ImportError:
         mod = None
-    exe = shutil.which("yt-dlp")
-    zv = zipapp_version(exe) if exe else None
-    if zv and (mod is None or zv > mod.version.__version__):
+    best = None
+    newest = mod.version.__version__ if mod else None
+    for path in (shutil.which("yt-dlp"), YTDLP_USER, YTDLP_BUNDLED):
+        zv = zipapp_version(path) if path else None
+        if zv and (newest is None or zv > newest):
+            best, newest = path, zv
+    if best:
         # A zipapp is a zip of the package itself, so the path to it is a path
         # the import machinery can read a package out of.
-        sys.path.insert(0, exe)
+        sys.path.insert(0, best)
         for name in [n for n in sys.modules if n.split(".")[0] == "yt_dlp"]:
             del sys.modules[name]
         try:
@@ -1707,7 +1766,7 @@ def cmd_download(args):
         return fail(args.json, YTDLP_GONE, 1)
     if m.version.__version__ < YTDLP_MIN:
         return fail(args.json, "yt-dlp %s is too old to download from YouTube - "
-                    "update it with `pip install --user -U yt-dlp`"
+                    "update it with `simplmusik update`"
                     % m.version.__version__, 1)
     if not shutil.which("ffmpeg"):
         return fail(args.json, "ffmpeg isn't installed - it's what writes the mp3", 1)
@@ -1941,7 +2000,7 @@ def cmd_stream(args):
         return fail(args.json, YTDLP_GONE, 1)
     if m.version.__version__ < YTDLP_MIN:
         return fail(args.json, "yt-dlp %s is too old to stream from YouTube - "
-                    "update it with `pip install --user -U yt-dlp`"
+                    "update it with `simplmusik update`"
                     % m.version.__version__, 1)
     if not shutil.which("mpv"):
         return fail(args.json, "mpv not found - install mpv", 1)
@@ -1990,6 +2049,48 @@ def cmd_stream(args):
     return emit(args.json, {"song": song, "id": vid, "streaming": live},
                 ("streaming " if live else "playing ") + song) or 0
 
+# ------------------------------------------------------------------ updating
+# The one part of this that goes stale on its own. Everything else here is
+# finished once it works; yt-dlp is in a race with YouTube, and the copy that
+# played a song last month is the one that finds nothing but thumbnails today.
+
+def cmd_update(args):
+    """Fetch the newest yt-dlp.
+
+    It lands in your own folder rather than beside the app, which is what lets
+    this work the same whether simplmusik was unpacked into a folder you own
+    or installed as a package owned by root. `ytdlp` prefers whichever copy is
+    newest, so the fetched one simply wins from here on."""
+    import urllib.request                # only this command ever needs it
+    was = zipapp_version(YTDLP_USER) or zipapp_version(YTDLP_BUNDLED)
+    try:
+        with urllib.request.urlopen(YTDLP_URL, timeout=180) as r:
+            blob = r.read()
+    except Exception as e:               # urllib raises a wide family of these
+        return fail(args.json, "couldn't fetch yt-dlp: %s" % e, 1)
+
+    os.makedirs(os.path.dirname(YTDLP_USER), exist_ok=True)
+    tmp = YTDLP_USER + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(blob)
+        got = zipapp_version(tmp)
+        if not got:
+            # A captive portal or a proxy answers every request with something.
+            # Checking that what came back is a yt-dlp is what keeps that
+            # something from being written over a working one.
+            os.remove(tmp)
+            return fail(args.json, "what came back isn't a yt-dlp - check the network", 1)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, YTDLP_USER)      # atomic: no half file is ever run
+    except OSError as e:
+        return fail(args.json, "couldn't write %s: %s" % (YTDLP_USER, e), 1)
+
+    _ytdlp[:] = []                       # decided already, and now out of date
+    return emit(args.json, {"version": got, "was": was, "path": YTDLP_USER},
+                "yt-dlp is now %s%s" % (got, "" if was in (None, got)
+                                        else " (was %s)" % was)) or 0
+
 # ---------------------------------------------------------------------- main
 # name: (help, positional args, optional flag). "?" = optional, "+" = one or more.
 
@@ -2018,6 +2119,7 @@ COMMANDS = [
     ("back",    "go back to the previous song",                   "",                None),
     ("seek",    "jump within the song (1:23, 83, +30, -10)",      "time",            None),
     ("stop",    "stop playback",                                  "",                None),
+    ("update",  "fetch the newest yt-dlp, which YouTube keeps needing", "",       None),
     ("help",    "show this help, or help for one command",        "topic?",          None),
 ]
 
@@ -2031,7 +2133,8 @@ CMDS = {"status": cmd_status, "songs": cmd_songs, "list": cmd_list,
         "seek": cmd_seek, "stop": cmd_stop, "pause": cmd_pause,
         "resume": lambda args: cmd_pause(args, want=False),
         "skip": lambda args: cmd_move(args, "skip"),
-        "back": lambda args: cmd_move(args, "back")}
+        "back": lambda args: cmd_move(args, "back"),
+        "update": cmd_update}
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv

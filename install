@@ -10,7 +10,7 @@ Nothing is installed system-wide; it all lands under ~/.local/share.
     ./install --uninstall
 """
 
-import os, subprocess, sys
+import math, os, shutil, struct, subprocess, sys, zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.expanduser("~/.local/share")
@@ -33,48 +33,189 @@ def rgb(hex_):
         sys.exit("not a colour: %s (want something like '#ff7139')" % hex_)
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
+# ------------------------------------------------------------------- drawing
+# The icons are drawn here rather than by an imaging library, because the whole
+# job is one rounded tile, one mask and a shrink - and asking somebody to
+# install Pillow before they can put a music player in their menu is a worse
+# trade than the hundred lines below. Nothing here is imported that Python
+# doesn't already ship with.
+
+TILE = (46, 46, 51)     # the dark tile the mark sits on
+SS = 4                  # subsamples down a pixel, where the only curve is
+
+def png_alpha(path):
+    """The alpha channel of an 8-bit RGBA PNG, as width, height and one byte a
+    pixel. Only the shape of the mark is wanted - its colours are thrown away
+    and replaced with the accent - so the other three channels are dropped."""
+    d = open(path, "rb").read()
+    if d[:8] != b"\x89PNG\r\n\x1a\n":
+        sys.exit("%s isn't a PNG" % path)
+    i, idat, hdr = 8, [], None
+    while i + 8 <= len(d):
+        ln, typ = struct.unpack(">I4s", d[i:i + 8])
+        if typ == b"IHDR":
+            hdr = struct.unpack(">IIBBBBB", d[i + 8:i + 21])
+        elif typ == b"IDAT":
+            idat.append(d[i + 8:i + 8 + ln])
+        elif typ == b"IEND":
+            break
+        i += 12 + ln
+    w, h, depth, colour, _, _, interlace = hdr
+    if (depth, colour, interlace) != (8, 6, 0):
+        sys.exit("%s must be an 8-bit RGBA PNG, not interlaced" % path)
+
+    # Undo the per-row filters. Every row is predicted from the one before it
+    # and the pixel to its left, so they can only be walked in order.
+    raw = zlib.decompress(b"".join(idat))
+    stride, bpp = w * 4, 4
+    alpha = bytearray(w * h)
+    prev, pos = bytearray(stride), 0
+    for y in range(h):
+        f = raw[pos]
+        line = bytearray(raw[pos + 1:pos + 1 + stride])
+        pos += 1 + stride
+        if f == 1:                                          # sub
+            for x in range(bpp, stride):
+                line[x] = (line[x] + line[x - bpp]) & 255
+        elif f == 2:                                        # up
+            for x in range(stride):
+                line[x] = (line[x] + prev[x]) & 255
+        elif f == 3:                                        # average
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                line[x] = (line[x] + ((a + prev[x]) >> 1)) & 255
+        elif f == 4:                                        # paeth
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                c = prev[x - bpp] if x >= bpp else 0
+                b = prev[x]
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc
+                                      else b if pb <= pc else c)) & 255
+        elif f:
+            sys.exit("%s uses PNG filter %d, which this doesn't read" % (path, f))
+        alpha[y * w:(y + 1) * w] = line[3::4]
+        prev = line
+    return w, h, alpha
+
+def resample(src, w, h, nw, nh):
+    """One channel, shrunk by exact area average - every source pixel counted
+    for as much of it as lands in the target one. For shrinking a mask that is
+    the whole of what a good filter has to do, and it needs no window."""
+    sx, sy = w / nw, h / nh
+    out = bytearray(nw * nh)
+    for ny in range(nh):
+        y0, y1 = ny * sy, (ny + 1) * sy
+        acc = [0.0] * w                             # the rows this one spans
+        for y in range(int(y0), min(h, math.ceil(y1))):
+            f, base = min(y + 1, y1) - max(y, y0), y * w
+            for x in range(w):
+                acc[x] += src[base + x] * f
+        for nx in range(nw):                        # then across them
+            x0, x1 = nx * sx, (nx + 1) * sx
+            t = 0.0
+            for x in range(int(x0), min(w, math.ceil(x1))):
+                t += acc[x] * (min(x + 1, x1) - max(x, x0))
+            out[ny * nw + nx] = min(255, int(t / (sx * sy) + 0.5))
+    return out
+
+def rounded(size, radius):
+    """How much of each pixel a rounded square covers, 0-255.
+
+    A row of one is a single unbroken span, so the coverage across it is exact
+    arithmetic rather than sampling; only going down the row is there a curve
+    to sample, and %d steps of it is enough to leave no stair visible.""" % SS
+    S, R = size * SS, radius * SS
+    cov = [0.0] * (size * size)
+    for ys in range(S):
+        yc = ys + 0.5
+        if yc < R:                                  # into the top corners
+            dx = R - math.sqrt(max(0.0, R * R - (R - yc) ** 2))
+        elif yc > S - R:                            # into the bottom ones
+            dx = R - math.sqrt(max(0.0, R * R - (yc - (S - R)) ** 2))
+        else:
+            dx = 0.0                                # the straight middle
+        lo, hi, row = dx, S - dx, (ys // SS) * size
+        for c in range(int(lo // SS), min(size, math.ceil(hi / SS))):
+            a, b = c * SS, c * SS + SS
+            cov[row + c] += (min(b, hi) - max(a, lo)) / (SS * SS)
+    return bytearray(min(255, int(v * 255 + 0.5)) for v in cov)
+
+def png_write(path, size, rgba):
+    """An 8-bit RGBA PNG. The rows go unfiltered: these are small, flat images
+    and zlib alone gets them smaller than Pillow was managing."""
+    def chunk(typ, data):
+        return (struct.pack(">I", len(data)) + typ + data
+                + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)
+        raw += rgba[y * size * 4:(y + 1) * size * 4]
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n")
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)))
+        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 9)))
+        f.write(chunk(b"IEND", b""))
+
+def draw_icon(size, accent, mw, mh, mask):
+    """One icon: the mark in the accent, over the dark tile, over nothing."""
+    cov = rounded(size, size * 0.22)
+    aw = max(1, round(size * 0.62))                 # the mark, inset in the tile
+    ah = max(1, round(aw * mh / mw))
+    art = resample(mask, mw, mh, aw, ah)
+    ox, oy = (size - aw) // 2, (size - ah) // 2
+    out = bytearray(size * size * 4)
+    for y in range(size):
+        inside = oy <= y < oy + ah
+        for x in range(size):
+            c = cov[y * size + x] / 255.0
+            a = (art[(y - oy) * aw + (x - ox)] / 255.0
+                 if inside and ox <= x < ox + aw else 0.0)
+            oa = a + c * (1 - a)                    # mark over tile
+            if oa <= 0.0:
+                continue                            # already transparent black
+            k, i = c * (1 - a), (y * size + x) * 4
+            for ch in range(3):
+                out[i + ch] = int((accent[ch] * a + TILE[ch] * k) / oa + 0.5)
+            out[i + 3] = int(oa * 255 + 0.5)
+    return out
+
 def draw_icons(accent):
     """The logo art is an alpha mask, so the mark can be painted any colour -
     here on a dark rounded tile, which is what reads as an app icon in a menu."""
-    from PIL import Image, ImageDraw
-    mark = Image.open(os.path.join(HERE, "web", "logo.png")).convert("RGBA")
-
+    mw, mh, mask = png_alpha(os.path.join(HERE, "web", "logo.png"))
     for size in SIZES:
-        S = size * 4                                  # draw big, shrink smooth
-        tile = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-        ImageDraw.Draw(tile).rounded_rectangle(
-            (0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=(46, 46, 51, 255))
-
-        w = int(S * 0.62)                             # the mark, inset in the tile
-        h = max(1, round(w * mark.height / mark.width))
-        art = mark.resize((w, h), Image.LANCZOS)
-        paint = Image.new("RGBA", art.size, accent + (255,))
-        paint.putalpha(art.getchannel("A"))
-        tile.alpha_composite(paint, ((S - w) // 2, (S - h) // 2))
-
         out = icon_path(size)
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        tile.resize((size, size), Image.LANCZOS).save(out, optimize=True)
+        png_write(out, size, draw_icon(size, accent, mw, mh, mask))
     return len(SIZES)
 
-def write_desktop():
-    entry = """[Desktop Entry]
+def desktop_entry(exec_path, working_dir=None):
+    """The menu entry, as text.
+
+    Built here rather than kept as a file because the two ways simplmusik is
+    installed disagree about exactly one line: run from a checkout it needs a
+    Path= to find its own web assets, and installed as a package it is on the
+    PATH and needs none. `build-deb` asks for the second."""
+    return """[Desktop Entry]
 Type=Application
 Name=simplmusik
 GenericName=Music Player
 Comment=Play your music library
-Exec={exec} %U
-Path={here}
-Icon=simplmusik
+Exec=%s %%U
+%sIcon=simplmusik
 Terminal=false
 Categories=AudioVideo;Audio;Player;
 Keywords=music;audio;player;playlist;song;
 StartupNotify=true
 StartupWMClass=simplmusik
-""".format(exec=os.path.join(HERE, "simplmusik-ui"), here=HERE)
+""" % (exec_path, "Path=%s\n" % working_dir if working_dir else "")
+
+def write_desktop():
     os.makedirs(APPS, exist_ok=True)
     with open(DESKTOP, "w") as f:
-        f.write(entry)
+        f.write(desktop_entry(os.path.join(HERE, "simplmusik-ui"), HERE))
     os.chmod(DESKTOP, 0o755)
 
 def refresh():
@@ -85,6 +226,78 @@ def refresh():
             subprocess.run(cmd, capture_output=True)
         except OSError:
             pass                                      # not fatal, just slower to appear
+
+# ------------------------------------------------------------------- checking
+# What the app needs that isn't in this folder. Everything here except yt-dlp
+# is in apt on every release still supported, so the check prints one command
+# to fix the lot rather than making somebody find the package names.
+
+APT = [("mpv",         "mpv",               "playing anything"),
+       ("ffmpeg",      "ffmpeg",            "levelling, and writing mp3s"),
+       ("python3-mutagen", None,            "titles, artists and cover art"),
+       ("python3-gi",  None,                "the app window"),
+       ("gir1.2-webkit2-4.1", None,         "the app window")]
+
+def have(pkg, exe):
+    if exe:
+        return shutil.which(exe) is not None
+    if pkg == "python3-mutagen":
+        return importable("mutagen")
+    if pkg == "python3-gi":
+        return importable("gi")
+    try:                                    # the typelib, not just the binding
+        import gi
+        gi.require_version("WebKit2", "4.1")
+        return True
+    except Exception:
+        return False
+
+def importable(name):
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+def load_cli(path):
+    """The CLI, imported so its own answer about yt-dlp is the one shown - it
+    has no .py on the end of it, so it is loaded by path."""
+    import importlib.machinery, importlib.util
+    try:
+        loader = importlib.machinery.SourceFileLoader("simplmusik_cli_check", path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+def check():
+    """Say what's missing, and the one line that fixes it."""
+    missing = [(pkg, why) for pkg, exe, why in APT if not have(pkg, exe)]
+    for pkg, exe, why in APT:
+        print("  %s %-22s %s" % ("\u2713" if not any(p == pkg for p, _ in missing)
+                                 else "\u2717", pkg, why))
+
+    # Asked of the CLI rather than by searching for something: a version is a
+    # local question, and an installer that reports yt-dlp missing because the
+    # machine is offline has answered a different one.
+    cli = os.path.join(HERE, "simplmusik")
+    mod = load_cli(cli)
+    got = mod.ytdlp() if mod else None
+    version = got.version.__version__ if got else None
+    ok = bool(version) and version >= mod.YTDLP_MIN
+    print("  %s %-22s %s" % ("\u2713" if ok else "\u2717", "yt-dlp",
+                             ("searching and downloading" if ok else
+                              "%s is too old" % version if version else
+                              "searching and downloading")))
+    if missing:
+        print("\n  install the missing ones with:\n    sudo apt install %s"
+              % " ".join(p for p, _ in missing))
+    if not ok:
+        print("\n  yt-dlp is missing or too old. Fetch the current one with:"
+              "\n    %s update" % cli)
+    return not missing and ok
 
 def uninstall():
     """Take the menu entry and its icons back out again."""
@@ -113,9 +326,10 @@ def main():
     write_desktop()
     refresh()
     print("installed simplmusik: %d icon sizes in %s" % (n, accent))
-    print("  %s" % DESKTOP)
-    print("\nPress Super and type 'music' - it should be there.")
-    print("To change the icon colour later:  ./install --accent '#0c75de'")
+    print("  %s\n" % DESKTOP)
+    if check():
+        print("\nPress Super and type 'music' - it should be there.")
+    print("\nTo change the icon colour later:  ./install --accent '#0c75de'")
 
 if __name__ == "__main__":
     main()

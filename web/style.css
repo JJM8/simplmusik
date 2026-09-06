@@ -484,6 +484,23 @@ input  { font: inherit; }
 }
 .empty strong { color: var(--dim); font-weight: 500; }
 
+/* An empty library is the one screen that asks where your music is, so the
+   answer sits in the middle of it: the button under the line naming the folder
+   we looked in, and the "or..." quieter than both. Where the desktop has no
+   folder dialog to open, a path field takes the button's place and is given
+   room to hold one. */
+.empty .act { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.empty .act input[type=text] {
+  width: 260px; height: 30px; padding: 0 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text); outline: none;
+}
+.empty .act input[type=text]::placeholder { color: var(--faint); }
+.empty .act input[type=text]:focus { border-color: var(--accent); }
+.empty .also { font-size: 12px; }
+
 /* --------------------------------------------------------- what search found */
 /* YouTube results sit under the library ones in the same grid, so the two
    lists line up and the eye reads them as one column. They are not songs yet

@@ -4,17 +4,45 @@ A CLI music player and a desktop UI for it, on Linux Mint.
 
 ## Install
 
-Playback is **mpv**, and the loudness measuring is **ffmpeg**:
-
 ```sh
-sudo apt install mpv ffmpeg
+./build-deb                                        # a package of the lot
+sudo apt install ./build/simplmusik_0.1.0_all.deb
 ```
+
+Playback is **mpv** and the loudness measuring is **ffmpeg**; tags and cover
+art are **mutagen**, and the window is **GTK** and **WebKit**. All of those are
+in the archive, so the package just depends on them.
+
+**yt-dlp is the exception, and it is bundled.** It cannot be a dependency:
+YouTube retires the interfaces it uses within months, and a distro freezes
+package versions at release. The copy in Ubuntu 24.04 is `2024.04.09`, and
+asked for a song today it finds four storyboard thumbnails where the audio
+should be - it can still search, and then reach nothing. So the package carries
+a current yt-dlp zipapp, one self-contained file, and `simplmusik update`
+replaces it when YouTube moves again.
+
+That is also why `ytdlp()` looks in four places - installed as a package, on
+the PATH, fetched by `update`, shipped beside the app - and imports whichever
+is newest rather than the first it finds. On a machine with the distro's copy
+installed, the first it finds is the broken one.
+
+Nothing needed a path change to be packaged: all three scripts already locate
+each other and the web assets relative to their own file, so the whole folder
+drops into `/usr/lib/simplmusik` as it is.
+
+### From a checkout instead
 
 ```sh
 ./install                     # adds it to the applications menu
 ./install --accent '#0c75de'  # ...with the icon in a different colour
 ./install --uninstall
 ```
+
+`./install` also reports what's missing. It draws the icons itself, out of
+`zlib` and `struct` - decoding the logo's alpha, area-averaging it down, and
+writing the PNGs - rather than depending on an imaging library, because asking
+somebody to install Pillow before they can put a music player in their menu is
+a worse trade than a hundred lines.
 
 Then press **Super**, type `music`, and it's there. Nothing goes anywhere
 system-wide - just a `.desktop` entry and icons under `~/.local/share`, both
@@ -106,8 +134,25 @@ one are the same single command, and closing the dialog without picking
 changes nothing and says so. On a machine with no dialog to open - over SSH,
 say - the button is a text field instead.
 
-There is one folder and no way to have none: never having chosen means
-`~/Music`. Choosing a different one never touches a file - your music stays
+There is one folder and no way to have none. Never having chosen means the
+folder this desktop already calls your music folder, read out of
+`user-dirs.dirs` - which is `~/Music` on an English machine and `~/Musik` on a
+German one, and somewhere else entirely for anybody who moved theirs onto
+another disk. The best folder picker is the one nobody ever has to open, and
+most people's music is already sitting where their desktop says it is. It
+gives way to `~/Music` in the one case where simplmusik is already living
+there, which is somebody upgrading: a default's job is not to move a library
+out from under them.
+
+When that guess is wrong the library comes up empty, and an empty library is
+the one screen where somebody actually needs to know where their music comes
+from - so that is where the question gets asked, rather than in a setting they
+would have to go and find. It names the folder it looked in, because "no
+songs" and "no songs *there*" are different things to be told, and puts
+**Choose your music folder** underneath. A folder with music in it never shows
+any of this.
+
+Choosing a different one never touches a file - your music stays
 where it is, and only your playlists follow, since they live inside the folder.
 It is also where new songs land: what `add` imports, and what `download`
 fetches. The same filename in two subfolders is one song, so a filename means

@@ -674,6 +674,26 @@ function songRow(s, i) {
   return row;
 }
 
+/* An empty library is the one moment somebody needs to know where their music
+   comes from, so it is the one place the question is really asked - a folder
+   full of music never shows this at all. The folder we are looking in is named
+   rather than assumed, because "no songs" and "no songs *there*" are different
+   things to be told, and choosing another one is a button under it rather than
+   a setting to go and find. */
+
+function emptyLibrary(e) {
+  const root = state.lib.root || '~/Music';
+  const gone = state.lib.root_exists === false;
+  e.append(el('strong', '', 'No songs yet'),
+           el('div', '', gone ? 'There is no folder at ' + root
+                              : 'Nothing in ' + root));
+  const act = el('div', 'act');
+  act.append(...folderPicker('Choose your music folder'));
+  e.append(act);
+  if (!gone)
+    e.append(el('div', 'also', 'or copy some music files in there'));
+}
+
 function renderList() {
   const list = $('#list');
   closeMenu();          // the button it hangs off is about to be replaced
@@ -685,10 +705,12 @@ function renderList() {
   // or an empty playlist.
   if (!songs.length && !state.query) {
     const e = el('div', 'empty');
-    const empty = state.view ? 'This playlist is empty' : 'No songs yet';
-    const hint  = state.view ? 'Pick songs from your library below'
-                             : 'Copy some music files into ' + (state.lib.root || '~/Music');
-    e.append(el('strong', '', empty), el('div', '', hint));
+    if (state.view) {
+      e.append(el('strong', '', 'This playlist is empty'),
+               el('div', '', 'Pick songs from your library below'));
+    } else {
+      emptyLibrary(e);
+    }
     list.append(e);
     renderAdder(list);
     return;
@@ -885,6 +907,42 @@ paintTheme();
    music folder is `folder set` - so the window and a terminal can't drift
    apart on where your music is. */
 
+/* Choosing your music folder, wherever you are standing when you need to.
+
+   `folder set` with nothing after it opens the desktop's own folder dialog,
+   so picking one is the same single CLI call that typing a path would be -
+   and this is built once because two places offer it: the settings page, and
+   an empty library, which is where somebody actually is the first time the
+   question comes up. The text field is only for a machine with no dialog to
+   open. What comes back is a list of nodes, so each caller can lay them out
+   the way its own row wants. */
+
+function typedFolder() { return state.lib.picker === false; }
+
+function folderPicker(cta) {
+  const chose = async (r, dir) => {
+    if (!r.ok || (r.data && !r.data.changed)) return;
+    await loadLibrary();
+    toast('Music folder is now ' + ((r.data && r.data.folder) || dir));
+  };
+  if (!typedFolder()) {
+    const pick = el('button', 'btn primary small', cta || 'Choose\u2026');
+    pick.onclick = async () => chose(await run('folder', 'set'));
+    return [pick];
+  }
+  const path = el('input');
+  path.type = 'text'; path.id = 'set-folder'; path.placeholder = '/home/you/Music';
+  path.autocomplete = 'off';
+  const set = el('button', 'btn primary small', 'Use this folder');
+  const go = async () => {
+    const dir = path.value.trim();
+    if (dir) chose(await run('folder', 'set', dir), dir);
+  };
+  path.onkeydown = e => { if (e.key === 'Enter') go(); };
+  set.onclick = go;
+  return [path, set];
+}
+
 function setRow(...kids) {
   const row = el('div', 'set-row');
   row.append(...kids);
@@ -1015,32 +1073,12 @@ function renderSettings() {
   box.append(setRow(ico, label(root, plural(here, 'song'))));
 
   // There is one folder, so the only thing to do is point it somewhere else.
-  // `folder set` with nothing after it opens the desktop's own folder dialog,
-  // so picking one is the same single CLI call that typing a path would be.
-  // The text field is only for a machine with no dialog to open.
-  const chose = async (r, dir) => {
-    if (!r.ok || (r.data && !r.data.changed)) return;
-    await loadLibrary();
-    toast('Music folder is now ' + ((r.data && r.data.folder) || dir));
-  };
-
-  if (state.lib.picker !== false) {
-    const pick = el('button', 'btn primary small', 'Change\u2026');
-    pick.onclick = async () => chose(await run('folder', 'set'));
-    box.append(setRow(label('Use a different folder',
-                            'Pick one from your desktop'), pick));
+  if (typedFolder()) {
+    box.append(setRow(...folderPicker()));
   } else {
-    const path = el('input');
-    path.type = 'text'; path.id = 'set-folder'; path.placeholder = '/home/you/Music';
-    path.autocomplete = 'off';
-    const set = el('button', 'btn primary small', 'Use this folder');
-    const go = async () => {
-      const dir = path.value.trim();
-      if (dir) chose(await run('folder', 'set', dir), dir);
-    };
-    path.onkeydown = e => { if (e.key === 'Enter') go(); };
-    set.onclick = go;
-    box.append(setRow(path, set));
+    box.append(setRow(label('Use a different folder',
+                            'Pick one from your desktop'),
+                      ...folderPicker('Change\u2026')));
   }
   page.append(box, el('div', 'hint',
     'Everything inside the folder counts, however deep it sits — subfolders are '
@@ -1489,7 +1527,7 @@ async function loadLibrary() {
   renderPlaylists();
   // The library reloads on a timer; don't yank the page out from under someone
   // half way through typing into it - a folder, or a song to add.
-  if (/^(add-folder|add-q|rename-input|set-target)$/.test(document.activeElement?.id || '')) return;
+  if (/^(set-folder|add-q|rename-input|set-target)$/.test(document.activeElement?.id || '')) return;
   render();
 }
 
