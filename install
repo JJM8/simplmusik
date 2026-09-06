@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Put simplmusik in the applications menu.
+
+Renders the app icon from the logo art in whatever accent you like, writes a
+.desktop entry pointing at this checkout, and refreshes the menu database.
+Nothing is installed system-wide; it all lands under ~/.local/share.
+
+    ./install                        # install with the default orange
+    ./install --accent '#0c75de'     # ...or any colour you fancy
+    ./install --uninstall
+"""
+
+import os, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.expanduser("~/.local/share")
+APPS = os.path.join(DATA, "applications")
+DESKTOP = os.path.join(APPS, "simplmusik.desktop")
+SIZES = (32, 48, 64, 128, 256)
+DEFAULT_ACCENT = "#ff7139"
+
+def icon_path(size):
+    return os.path.join(DATA, "icons", "hicolor", "%dx%d" % (size, size),
+                        "apps", "simplmusik.png")
+
+def installed():
+    """Every file the install puts in your menu."""
+    return [DESKTOP] + [icon_path(s) for s in SIZES]
+
+def rgb(hex_):
+    h = hex_.lstrip("#")
+    if len(h) != 6 or any(c not in "0123456789abcdefABCDEF" for c in h):
+        sys.exit("not a colour: %s (want something like '#ff7139')" % hex_)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+def draw_icons(accent):
+    """The logo art is an alpha mask, so the mark can be painted any colour -
+    here on a dark rounded tile, which is what reads as an app icon in a menu."""
+    from PIL import Image, ImageDraw
+    mark = Image.open(os.path.join(HERE, "web", "logo.png")).convert("RGBA")
+
+    for size in SIZES:
+        S = size * 4                                  # draw big, shrink smooth
+        tile = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+        ImageDraw.Draw(tile).rounded_rectangle(
+            (0, 0, S - 1, S - 1), radius=int(S * 0.22), fill=(46, 46, 51, 255))
+
+        w = int(S * 0.62)                             # the mark, inset in the tile
+        h = max(1, round(w * mark.height / mark.width))
+        art = mark.resize((w, h), Image.LANCZOS)
+        paint = Image.new("RGBA", art.size, accent + (255,))
+        paint.putalpha(art.getchannel("A"))
+        tile.alpha_composite(paint, ((S - w) // 2, (S - h) // 2))
+
+        out = icon_path(size)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tile.resize((size, size), Image.LANCZOS).save(out, optimize=True)
+    return len(SIZES)
+
+def write_desktop():
+    entry = """[Desktop Entry]
+Type=Application
+Name=simplmusik
+GenericName=Music Player
+Comment=Play your music library
+Exec={exec} %U
+Path={here}
+Icon=simplmusik
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;audio;player;playlist;song;
+StartupNotify=true
+StartupWMClass=simplmusik
+""".format(exec=os.path.join(HERE, "simplmusik-ui"), here=HERE)
+    os.makedirs(APPS, exist_ok=True)
+    with open(DESKTOP, "w") as f:
+        f.write(entry)
+    os.chmod(DESKTOP, 0o755)
+
+def refresh():
+    for cmd in (["update-desktop-database", APPS],
+                ["gtk-update-icon-cache", "-f", "-t",
+                 os.path.join(DATA, "icons", "hicolor")]):
+        try:
+            subprocess.run(cmd, capture_output=True)
+        except OSError:
+            pass                                      # not fatal, just slower to appear
+
+def uninstall():
+    """Take the menu entry and its icons back out again."""
+    gone = 0
+    for p in installed():
+        try:
+            os.remove(p)
+            gone += 1
+        except OSError:
+            pass
+    refresh()
+    print("removed %d file(s). simplmusik is out of your menu." % gone)
+
+def main():
+    args = sys.argv[1:]
+    if "--uninstall" in args:
+        return uninstall()
+    accent = DEFAULT_ACCENT
+    if "--accent" in args:
+        i = args.index("--accent")
+        if i + 1 >= len(args):
+            sys.exit("--accent needs a colour, e.g. --accent '#0c75de'")
+        accent = args[i + 1]
+
+    n = draw_icons(rgb(accent))
+    write_desktop()
+    refresh()
+    print("installed simplmusik: %d icon sizes in %s" % (n, accent))
+    print("  %s" % DESKTOP)
+    print("\nPress Super and type 'music' - it should be there.")
+    print("To change the icon colour later:  ./install --accent '#0c75de'")
+
+if __name__ == "__main__":
+    main()

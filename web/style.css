@@ -1,0 +1,870 @@
+/* simplmusik - Mint-Y. One accent variable drives every highlight, so changing
+   --accent restyles the whole app.
+
+   There are two palettes and one set of names. Everything below this block
+   paints with the names, never with a colour, so light and dark are the same
+   app with a different sheet of paint. Which sheet is on is said by data-theme
+   on <html>: the page sets it before it paints, from your choice in Settings,
+   or from the desktop's own light-or-dark decision when that choice is
+   'system'. Dark lives on :root so a window no script has reached yet is
+   still the app rather than a white flash. */
+
+:root {
+  /* The one knob: Mint-Y-Dark-Orange. Change it here and the whole app
+     follows. Both palettes wear it - it is the accent in Mint's light theme
+     just as much as in its dark one. */
+  --accent: #ff7139;
+  /* Text and marks sitting on top of the accent. White on that orange either
+     way: the accent doesn't change between palettes, so neither does what
+     reads on it. */
+  --on-accent: #fff;
+
+  --bg:        #202023;
+  --sidebar:   #1a1a1d;
+  --bar:       #26262a;
+  --surface:   #2e2e33;
+  --hover:     #35353b;
+  --border:    #2c2c31;
+  --text:      #dbdbdb;
+  --dim:       #8e8e97;
+  --faint:     #63636b;
+  /* Deliberately not the accent: deleting shouldn't wear the
+     same colour as the button that plays your music. */
+  --danger:    #c0413b;
+  /* A song a playlist names that isn't on any disk right now. Not danger -
+     nothing has gone wrong that you can't undo by plugging a drive back in. */
+  --gone:      #d1756b;
+
+  /* The tile a song we can't find wears in place of cover art, and the
+     scrollbar. Furniture rather than paint, but both are a shade of the window
+     they sit in, so both belong to the palette. */
+  --miss-a:    #45454c;
+  --miss-b:    #313136;
+  --scroll:    #3a3a41;
+  --scroll-on: #4a4a53;
+
+  /* What dims the page behind a dialog, and what something floating above the
+     page drops on it. A light window needs a fainter shadow than a dark one to
+     read as the same height. */
+  --scrim:     rgba(0,0,0,.5);
+  --shade:     rgba(0,0,0,.5);
+  --shade-sm:  rgba(0,0,0,.45);
+
+  --radius: 6px;
+  --row: 46px;
+  --sidebar-w: 248px;
+  --player-h: 78px;
+
+  color-scheme: dark;
+}
+
+/* Mint-Y light: the same roles read the other way up. The sidebar is a step
+   darker than the page beside it, where in the dark palette it is a step
+   darker still. */
+:root[data-theme="light"] {
+  --bg:        #fbfbfb;
+  --sidebar:   #f0f0f1;
+  --bar:       #f6f6f7;
+  --surface:   #ebebec;
+  --hover:     #e0e0e2;
+  --border:    #d7d7db;
+  --text:      #2b2b2e;
+  --dim:       #62626a;
+  --faint:     #7b7b84;
+  --danger:    #b8352f;
+  --gone:      #b0514a;
+
+  --miss-a:    #dcdce1;
+  --miss-b:    #c9c9d1;
+  --scroll:    #c6c6cc;
+  --scroll-on: #adadb6;
+
+  --scrim:     rgba(0,0,0,.32);
+  --shade:     rgba(0,0,0,.18);
+  --shade-sm:  rgba(0,0,0,.14);
+
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font: 400 14px/1.45 Ubuntu, system-ui, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+input  { font: inherit; }
+::selection { background: var(--accent); color: var(--on-accent); }
+
+/* ------------------------------------------------------------- app shell */
+
+#app {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  grid-template-rows: 1fr var(--player-h);
+  height: 100vh;
+}
+
+/* ---------------------------------------------------------------- sidebar */
+
+#sidebar {
+  grid-row: 1 / 3;
+  background: var(--sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.brand {
+  display: flex; align-items: center; gap: 9px;
+  padding: 18px 18px 14px;
+  font-size: 15px; font-weight: 500; letter-spacing: .2px;
+}
+/* The mark is the logo art used as an alpha mask, so the shape itself is
+   painted with --accent. */
+.brand .mark {
+  width: 22px; height: 14px;
+  flex: none;
+  background: var(--accent);
+  -webkit-mask: url(/logo.png) center / contain no-repeat;
+  mask: url(/logo.png) center / contain no-repeat;
+}
+
+.section {
+  padding: 10px 18px 6px;
+  font-size: 11px; font-weight: 500; letter-spacing: .8px;
+  text-transform: uppercase; color: var(--faint);
+}
+
+#playlists { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+
+.pl {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%;
+  padding: 0 10px;
+  height: 38px;
+  border-radius: var(--radius);
+  color: var(--dim);
+  text-align: left;
+  transition: background .12s, color .12s;
+}
+.pl:hover { background: var(--hover); color: var(--text); }
+.pl.active { background: var(--accent); color: var(--on-accent); }
+.pl.active .count { color: rgba(255,255,255,.72); }
+.pl .name  { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pl .count { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+/* The icon is padded out to the width of a cover so that "All songs" and the
+   playlists under it start their names on the same line. */
+.pl .ico   { width: 16px; height: 16px; flex: none; opacity: .85; margin: 0 3px; }
+
+/* A playlist wears its own cover here, shrunk - the same picture the header
+   shows. The surface underneath is what you see for the moment before the
+   image decodes, so it's never a hole in the row. */
+.pl .thumb {
+  width: 22px; height: 22px; flex: none;
+  border-radius: 3px; overflow: hidden;
+  background: var(--surface);
+}
+
+.side-foot { border-top: 1px solid var(--border); padding: 10px; }
+
+.linkbtn {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; padding: 0 10px; height: 34px;
+  border-radius: var(--radius);
+  color: var(--dim); font-size: 13px;
+}
+.linkbtn:hover { background: var(--hover); color: var(--text); }
+.linkbtn.on { background: var(--hover); color: var(--text); }
+
+/* ------------------------------------------------------------------- main */
+
+#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+#topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.search {
+  position: relative;
+  flex: 1; max-width: 420px;
+}
+.search svg {
+  position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+  width: 15px; height: 15px; color: var(--faint); pointer-events: none;
+}
+.search input {
+  width: 100%; height: 34px;
+  padding: 0 30px 0 34px;
+  background: var(--surface);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: var(--text);
+  outline: none;
+  transition: border-color .12s, background .12s;
+}
+.search input::placeholder { color: var(--faint); }
+.search input:focus { border-color: var(--accent); background: var(--bg); }
+/* Both boxes are `type=text` on purpose. A `type=search` input draws a clear
+   widget of its own - in the GTK window, the edit-clear icon, which reads as a
+   backspace key - and it would sit beside the × below saying the same thing
+   twice. Ours is the one that stays. */
+.search .clear {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  width: 22px; height: 22px; border-radius: 50%;
+  color: var(--faint); line-height: 1;
+}
+.search .clear:hover { background: var(--hover); color: var(--text); }
+
+/* volume, top right - the same rail as the progress bar, because it is the
+   same gesture, and sized so it reads as a setting rather than a transport
+   control. `margin-left: auto` is what puts it at the far right. */
+
+#vol {
+  display: flex; align-items: center; gap: 9px;
+  margin-left: auto;
+  flex: none;
+}
+#vol #vol-icon {
+  width: 16px; height: 16px; color: var(--faint);
+  flex: none;
+  transition: color .12s;
+}
+#vol:hover #vol-icon { color: var(--text); }
+
+#vol .vol-bar {
+  /* 4px of line and 7px either side you can still grab, which is what makes
+     it hittable with a mouse. The height is the whole 18px rather than the
+     4px of line, because `box-sizing: border-box` is on everything here: at
+     4px the padding would eat the content box entirely and `content-box`
+     would have nothing left to paint, which is how you lose the track and
+     keep only the fill. */
+  width: 92px; height: 18px; border-radius: 2px;
+  background: var(--surface);
+  padding: 7px 0; background-clip: content-box;
+  cursor: pointer; touch-action: none;
+}
+/* The filled part is always the accent - the level is worth seeing without
+   having to reach for it. The handle is still only there when it's useful. */
+#vol .fill {
+  position: relative; height: 4px; width: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width .12s;
+}
+#vol .fill::after {                   /* the handle: there whenever it is useful */
+  content: ''; position: absolute; right: -5px; top: -3px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent);
+  opacity: 0; transition: opacity .12s;
+}
+#vol:hover .fill::after, #vol .vol-bar:focus-visible .fill::after,
+#vol .vol-bar.sliding .fill::after { opacity: 1; }
+#vol .vol-bar:focus-visible { outline: none; }
+
+/* header of the current view */
+
+#head {
+  display: flex; align-items: flex-end; gap: 16px;
+  padding: 22px 24px 16px;
+  flex: none;
+}
+#head .art {
+  position: relative;
+  width: 76px; height: 76px; border-radius: var(--radius);
+  flex: none; overflow: hidden;
+}
+#head h1 { font-size: 25px; font-weight: 500; letter-spacing: -.3px; }
+#head .sub { color: var(--dim); font-size: 13px; margin-top: 3px; }
+#head .acts { margin-left: auto; flex: none; display: flex; gap: 8px; align-items: center; }
+
+/* A long name is cut off rather than allowed to push what follows it out of
+   reach - the pen after it, and the buttons on the right. The whole name is
+   still there to hover, and still there in the field when you rename it. */
+#head .titles { min-width: 0; }
+#head .titles h1, #head .titles .sub {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Changing a playlist's name and its picture.
+
+   The name is its own button: one click on it and the title becomes the field
+   you type in, so what you press is what you are editing. It says so by
+   lighting up under the pointer - the padding is cancelled by a matching
+   negative margin, so the title sits in exactly the same place whether it is
+   lit or not, and nothing shifts as the pointer crosses it. Over the picture
+   there is nowhere to put a pen that isn't on top of the picture, so that one
+   waits for the pointer, in the corner, and the artwork dims to say the whole
+   square is the button. */
+
+#head .title-row { display: flex; align-items: center; min-width: 0; }
+#head h1.editable {
+  cursor: text;
+  margin: 0 -8px; padding: 0 8px;
+  border-radius: 5px;
+  outline: none;
+  transition: background .12s, box-shadow .12s;
+}
+#head h1.editable:hover { background: var(--surface); }
+#head h1.editable:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+
+#head input.rename {
+  width: min(440px, 40vw);
+  height: 36px; padding: 0 9px;
+  font-size: 25px; font-weight: 500; letter-spacing: -.3px;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--text);
+  outline: none;
+}
+
+#head .art.editable { cursor: pointer; }
+/* The scrim is painted after the picture and before the buttons, which is what
+   the z-index on them is for. */
+#head .art.editable::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: rgba(0,0,0,.45);
+  opacity: 0;
+  transition: opacity .12s;
+}
+#head .art.editable:hover::after,
+#head .art.dropping::after,
+#head .art:focus-within::after { opacity: 1; }
+#head .art.dropping { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.art-btn {
+  position: absolute; z-index: 1;
+  width: 24px; height: 24px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  background: rgba(20,20,22,.75);
+  color: #fff;
+  opacity: 0;
+  transform: scale(.85);
+  transition: opacity .12s, transform .12s, background .12s;
+}
+.art-btn svg { width: 13px; height: 13px; }
+.art-btn.pen { right: 5px; bottom: 5px; }
+.art-btn.off { right: 5px; top: 5px; }
+.art-btn.off:hover { background: var(--danger); }
+.art-btn.pen:hover { background: var(--accent); }
+#head .art:hover .art-btn,
+#head .art:focus-within .art-btn { opacity: 1; transform: none; }
+
+.btn {
+  display: flex; align-items: center; gap: 7px;
+  height: 34px; padding: 0 15px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  transition: background .12s, filter .12s;
+}
+.btn:hover { background: var(--hover); }
+.btn.primary { background: var(--accent); color: var(--on-accent); font-weight: 500; }
+.btn.primary:hover { filter: brightness(1.1); }
+.btn svg { width: 15px; height: 15px; }
+.btn.danger:hover { background: var(--danger); border-color: var(--danger); color: var(--on-accent); }
+
+/* ------------------------------------------------------------------ list */
+
+#list { flex: 1; overflow-y: auto; padding: 0 12px 20px; min-height: 0; }
+
+.head-row, .track {
+  display: grid;
+  grid-template-columns: 34px 36px minmax(140px, 2.4fr) minmax(0, 1.4fr) 56px 58px;
+  align-items: center;
+  gap: 14px;
+  padding: 0 12px;
+}
+.head-row {
+  height: 30px;
+  font-size: 11px; letter-spacing: .7px; text-transform: uppercase;
+  color: var(--faint);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; background: var(--bg); z-index: 2;
+}
+.head-row .r, .track .dur { text-align: right; }
+
+.track {
+  height: var(--row);
+  border-radius: var(--radius);
+  cursor: default;
+}
+.track:hover { background: var(--surface); }
+.track .num {
+  color: var(--faint); font-size: 13px; text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.track:hover .num .n { display: none; }
+.track .num .play { display: none; }
+.track:hover .num .play { display: block; margin: 0 auto; width: 13px; height: 13px; color: var(--text); }
+
+.track .art { width: 36px; height: 36px; border-radius: 4px; overflow: hidden; flex: none; }
+.track .t   { min-width: 0; }
+.track .t .title {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.track .t .artist {
+  font-size: 12px; color: var(--dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.track .album {
+  font-size: 13px; color: var(--dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.track .dur { font-size: 13px; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+/* Faint until you hover the row, but never hidden outright: a control you
+   can't see is a control you don't know is there. Stays lit while its menu
+   is open, so it's clear which row you're adding. */
+.track .add {
+  width: 26px; height: 26px; padding: 0;
+  display: grid; place-items: center;
+  border: 0; background: none; border-radius: 50%;
+  color: var(--faint); cursor: pointer;
+  opacity: .4; transition: opacity .12s, color .12s, background .12s;
+}
+.track:hover .add, .track .add:focus-visible, .track .add.open { opacity: 1; }
+.track .add:hover, .track .add.open { color: var(--text); background: var(--hover); }
+.track .add svg { width: 14px; height: 14px; }
+
+/* Both row buttons sit in the one cell, right-aligned, so the column keeps a
+   fixed width whether a row carries two of them or one. */
+.row-acts { display: flex; justify-content: flex-end; gap: 2px; }
+.track .rm:hover { color: var(--danger); background: var(--hover); }
+
+/* A song whose file we can't find: it keeps its place and its name, says so
+   underneath, and wears a question mark where its cover would be. */
+.track.gone .t .title { color: var(--dim); }
+.track.gone .t .artist { color: var(--gone); }
+.track.gone .num, .track.gone .dur { opacity: .5; }
+.track.gone:hover .num .play { display: none; }
+.track.gone:hover .num .n { display: block; }
+
+.track.now .t .title, .track.now .num { color: var(--accent); }
+.track.now .t .title { font-weight: 500; }
+
+/* the little playing bars */
+.eq { display: flex; align-items: flex-end; gap: 2px; height: 13px; margin: 0 auto; width: 13px; }
+.eq i { flex: 1; background: var(--accent); animation: eq .9s ease-in-out infinite; }
+.eq i:nth-child(2) { animation-delay: .3s; }
+.eq i:nth-child(3) { animation-delay: .6s; }
+.paused .eq i { animation-play-state: paused; }
+@keyframes eq { 0%,100% { height: 25% } 50% { height: 100% } }
+
+/* cover placeholder: stable colour per song, no image needed */
+.cover { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ph {
+  width: 100%; height: 100%;
+  display: grid; place-items: center;
+  font-weight: 500; color: rgba(255,255,255,.9);
+  background: linear-gradient(140deg, hsl(var(--h) 32% 42%), hsl(var(--h) 34% 26%));
+}
+/* No colour of its own: a song we can't find shouldn't look like a song. */
+.ph.miss {
+  background: linear-gradient(140deg, var(--miss-a), var(--miss-b));
+  color: var(--gone);
+}
+
+.empty {
+  display: grid; place-items: center; gap: 6px;
+  padding: 70px 20px; text-align: center; color: var(--faint);
+}
+.empty strong { color: var(--dim); font-weight: 500; }
+
+/* --------------------------------------------------------- what search found */
+/* YouTube results sit under the library ones in the same grid, so the two
+   lists line up and the eye reads them as one column. They are not songs yet
+   though: nothing to play, no track number, and the download button is always
+   visible rather than waiting for a hover, because it's the only thing the
+   row is for. */
+
+.none { padding: 12px 16px; color: var(--faint); font-size: 13px; }
+
+.found { border-top: 1px solid var(--border); margin-top: 12px; }
+.found-head { display: flex; align-items: baseline; gap: 8px; padding: 13px 14px 5px; }
+.found-head strong { font-size: 13px; color: var(--text); font-weight: 600; }
+.found-head .from { font-size: 12px; color: var(--faint); }
+
+.track.yt .num .n { visibility: hidden; }
+.track.yt:hover { background: var(--surface); }
+
+/* ------------------------------------------------- picking from the library */
+/* The same rows again, under a playlist, for adding rather than playing: no
+   track number, and the plus stays visible instead of waiting for a hover,
+   since it is the only thing these rows are for. */
+
+.adder-search { padding: 6px 14px 10px; }
+.adder-search .search { display: block; max-width: 420px; }
+.adder-search .search input { background: var(--bg); border-color: var(--border); }
+
+.track.pick .num { visibility: hidden; }
+.track.pick:hover { background: var(--surface); }
+.track.pick .add { opacity: .75; }
+.track.pick:hover .add { opacity: 1; }
+.track.pick .add:hover { color: var(--accent); background: var(--hover); }
+
+/* What YouTube has, under what your library has: the same two-part shape the
+   top bar's search makes, one rule further in. */
+.adder .yt-part:not(:empty) { border-top: 1px solid var(--border); margin-top: 10px; }
+
+/* One more handful, on a row of its own under the results. Quiet: it is an
+   offer, not the thing you came here to press. */
+.more { display: grid; place-items: center; padding: 8px 0 4px; }
+.more button {
+  height: 30px; padding: 0 14px;
+  border-radius: var(--radius);
+  background: var(--surface); color: var(--dim);
+  font-size: 13px;
+  transition: background .12s, color .12s;
+}
+.more button:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.more button:disabled { color: var(--faint); cursor: default; }
+
+.track .dl { opacity: .75; }
+.track:hover .dl { opacity: 1; }
+.track .dl:hover { color: var(--accent); background: var(--hover); }
+
+.track .got, .track .dling {
+  width: 26px; height: 26px;
+  display: grid; place-items: center;
+}
+.track .got svg, .track .dling svg { width: 14px; height: 14px; }
+.track .got { color: var(--accent); }
+.track .dling { color: var(--accent); }
+
+/* The download ring. The whole ring turns - fast enough to read as busy,
+   slow enough not to look frantic - while the arc drawn on it is how much of
+   the file has arrived. So it is alive even before yt-dlp knows a total, and
+   the same ring becomes an honest progress bar the moment it does. */
+
+.track .dling .ring { width: 16px; height: 16px; animation: turn .9s linear infinite; }
+.ring circle { fill: none; stroke: var(--accent); stroke-width: 1.7; }
+.ring .rail { opacity: .25; }
+.ring .arc {
+  stroke-linecap: round;
+  stroke-dasharray: 39;             /* one full circumference */
+  stroke-dashoffset: 28;            /* a sliver until we know better */
+  transform: rotate(-90deg);        /* start the arc at twelve o'clock */
+  transform-origin: 50% 50%;
+  transition: stroke-dashoffset .3s linear;
+}
+
+@keyframes turn { to { transform: rotate(360deg); } }
+
+/* A fetch that failed stops turning and goes grey. A ring still going round
+   is the one thing that would say the song is still on its way when it isn't -
+   and the row keeps its caption, which is what says so in words. */
+.track.dl-failed .dling .ring { animation: none; opacity: .55; }
+.track.dl-failed .ring circle { stroke: var(--dim, #888); }
+
+
+@media (prefers-reduced-motion: reduce) {
+  .track .dling .ring { animation-duration: 3s; }
+}
+
+/* -------------------------------------------------------------- settings */
+/* One page of plain rows, label on the left and the control on the right,
+   grouped under small headings - which is what every settings window on this
+   desktop looks like, and the reason there is nothing else to learn here. */
+
+.settings { max-width: 660px; padding: 0 4px 28px; }
+
+.set-sec {
+  padding: 18px 2px 8px;
+  font-size: 11px; font-weight: 500; letter-spacing: .8px;
+  text-transform: uppercase; color: var(--faint);
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.set-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.set-row:last-child { border-bottom: 0; }
+.set-row .ico { width: 16px; height: 16px; flex: none; color: var(--dim); }
+.set-row .lbl { flex: 1; min-width: 0; }
+.set-row .lbl .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.set-row .lbl .sub  { font-size: 12px; color: var(--faint); margin-top: 2px; }
+.set-row .val {
+  color: var(--dim); font-size: 13px; text-align: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.set-row input[type=text] {
+  flex: 1; min-width: 0; height: 32px; padding: 0 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text); outline: none;
+}
+.set-row input[type=text]::placeholder { color: var(--faint); }
+.set-row input[type=text]:focus { border-color: var(--accent); }
+
+.btn.small { height: 30px; padding: 0 13px; font-size: 13px; }
+.btn.small:not(.primary) { border: 1px solid var(--border); }
+
+/* The settings row that is one of a few named choices rather than simply on or
+   off: the choices side by side in one frame, the one in force filled with the
+   accent. Three words read at a glance, where a menu would have to be opened
+   to say which of them is on. */
+
+.seg {
+  display: flex; flex: none; gap: 4px;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.seg button {
+  height: 26px; padding: 0 11px;
+  border-radius: 4px;
+  font-size: 13px; color: var(--dim);
+  transition: background .12s, color .12s;
+}
+.seg button:hover { background: var(--hover); color: var(--text); }
+.seg button.on { background: var(--accent); color: var(--on-accent); font-weight: 500; }
+.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* The switch on a settings row: a Mint-Y pill with the knob sliding across it,
+   filled with the accent when it is on - the same shape Mint's own settings
+   use for anything that is simply on or off. */
+
+.tog {
+  position: relative; flex: none;
+  width: 42px; height: 22px;
+  border-radius: 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  transition: background .15s, border-color .15s;
+}
+.tog::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--dim);
+  transition: transform .15s, background .15s;
+}
+.tog:hover::after { background: var(--text); }
+.tog.on { background: var(--accent); border-color: var(--accent); }
+.tog.on::after { transform: translateX(20px); background: var(--on-accent); }
+.tog:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tog:disabled { opacity: .6; }
+
+/* The settings row that is a number on a range: a 4px rail and a round handle,
+   the same two shapes the volume slider in the player wears, so a slider reads
+   as one control wherever it turns up. The native input is restyled rather
+   than rebuilt out of divs - it is one setting, and this way the arrow keys,
+   the page-up jumps and the screen reader all come for nothing. */
+
+.set-row .slide { display: flex; align-items: center; gap: 12px; flex: none; }
+.set-row .slide .val { width: 46px; }
+
+.set-row input[type=range] {
+  -webkit-appearance: none; appearance: none;
+  width: 148px; height: 18px;             /* grabbable, though the rail is 4px */
+  background: none; cursor: pointer;
+}
+.set-row input[type=range]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px; background: var(--bg);
+}
+.set-row input[type=range]::-moz-range-track {
+  height: 4px; border-radius: 2px; background: var(--bg);
+}
+/* -3px is half the difference between the 10px handle and the 4px rail, which
+   is what centres it on the line rather than hanging it off the top. */
+.set-row input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 10px; height: 10px; margin-top: -3px;
+  border-radius: 50%; background: var(--dim);
+  transition: background .12s;
+}
+.set-row input[type=range]::-moz-range-thumb {
+  width: 10px; height: 10px; border: 0;
+  border-radius: 50%; background: var(--dim);
+  transition: background .12s;
+}
+.set-row input[type=range]:hover::-webkit-slider-thumb,
+.set-row input[type=range]:focus::-webkit-slider-thumb { background: var(--accent); }
+.set-row input[type=range]:hover::-moz-range-thumb,
+.set-row input[type=range]:focus::-moz-range-thumb { background: var(--accent); }
+.set-row input[type=range]:focus { outline: none; }
+.set-row input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+.hint {
+  padding: 9px 3px 0;
+  font-size: 12px; line-height: 1.55; color: var(--faint);
+}
+
+/* ---------------------------------------------------------------- player */
+
+#player {
+  grid-column: 2;
+  background: var(--bar);
+  border-top: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+  padding: 0 20px;
+}
+
+#now { display: flex; align-items: center; gap: 12px; min-width: 0; }
+#now .art { width: 50px; height: 50px; border-radius: 5px; overflow: hidden; flex: none; }
+#now .txt { min-width: 0; }
+#now .title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#now .artist { font-size: 12px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+#controls { display: flex; align-items: center; gap: 6px; }
+.ctl {
+  width: 34px; height: 34px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  color: var(--dim);
+  transition: color .12s, background .12s;
+}
+.ctl:hover { color: var(--text); background: var(--hover); }
+.ctl.on { color: var(--accent); }
+.ctl svg { width: 17px; height: 17px; }
+.ctl.big {
+  width: 40px; height: 40px;
+  background: var(--accent); color: var(--on-accent);
+}
+.ctl.big:hover { background: var(--accent); filter: brightness(1.12); }
+.ctl.big svg { width: 19px; height: 19px; }
+.ctl:disabled { opacity: .35; cursor: default; }
+.ctl:disabled:hover { background: none; color: var(--dim); }
+
+#prog { display: flex; align-items: center; gap: 10px; justify-self: end; width: 100%; max-width: 300px; }
+#prog .time { font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; min-width: 32px; }
+#prog .time.r { text-align: right; }
+#prog .track-bar {
+  /* 4px is the line you see; the padding around it is the part you can hit,
+     which is what makes clicking to seek workable with a mouse. */
+  flex: 1; height: 18px; border-radius: 2px;
+  background: var(--surface);
+  padding: 7px 0; background-clip: content-box;
+  touch-action: none;
+}
+#prog .track-bar.live { cursor: pointer; }
+/* How far in you are is worth seeing at a glance, so the fill is the accent
+   the whole time rather than only under the pointer. */
+#prog .fill {
+  position: relative; height: 4px; width: 0;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width .3s linear;
+}
+#prog .fill::after {              /* the handle: only there when it's useful */
+  content: ''; position: absolute; right: -5px; top: -3px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--accent);
+  opacity: 0; transition: opacity .12s;
+}
+#prog .track-bar.live:hover .fill::after,
+#prog .track-bar.live:focus-visible .fill::after { opacity: 1; }
+/* While dragging, the bar follows the pointer, not the clock. */
+#prog .track-bar.scrubbing .fill { transition: none; }
+#prog .track-bar.scrubbing .fill::after { opacity: 1; }
+
+/* --------------------------------------------------------------- dialog */
+
+dialog {
+  /* WebKit here doesn't centre a modal on its own, so place it explicitly. */
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 20px;
+  width: 320px;
+  box-shadow: 0 14px 40px var(--shade);
+}
+dialog::backdrop { background: var(--scrim); }
+dialog h2 { font-size: 15px; font-weight: 500; margin-bottom: 12px; }
+dialog p  { color: var(--dim); line-height: 1.5; }
+dialog input[type=text] {
+  width: 100%; height: 34px; padding: 0 10px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); outline: none;
+}
+dialog input[type=text]:focus { border-color: var(--accent); }
+dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+/* -------------------------------------------------------------- toasts */
+
+#toast {
+  position: fixed; bottom: calc(var(--player-h) + 16px); left: 50%;
+  transform: translateX(-50%) translateY(8px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 9px 15px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px var(--shade-sm);
+  opacity: 0; pointer-events: none;
+  transition: opacity .18s, transform .18s;
+  z-index: 40;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ----------------------------------------------------------- popup menu */
+/* Fixed, and positioned in JS against the button, so it escapes the scrolling
+   list instead of being clipped by it. */
+.menu {
+  position: fixed;
+  min-width: 200px; max-width: 300px; max-height: 320px; overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 30px var(--shade);
+  padding: 5px;
+  z-index: 50;
+}
+.menu .mt {
+  padding: 6px 9px 7px;
+  font-size: 11px; letter-spacing: .7px; text-transform: uppercase;
+  color: var(--faint);
+}
+.menu button {
+  display: flex; align-items: center; gap: 9px; width: 100%;
+  border: 0; background: none; color: var(--text);
+  font: inherit; text-align: left; cursor: pointer;
+  padding: 7px 9px; border-radius: 4px;
+}
+.menu button:hover, .menu button:focus-visible { background: var(--hover); outline: none; }
+.menu button .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu button .count {
+  margin-left: auto; padding-left: 8px;
+  font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums;
+}
+.menu button .ico { width: 14px; height: 14px; flex: none; opacity: .7; }
+.menu .none { padding: 4px 9px 9px; color: var(--dim); font-size: 13px; line-height: 1.45; }
+
+::-webkit-scrollbar { width: 10px; }
+::-webkit-scrollbar-thumb {
+  background: var(--scroll); border-radius: 5px;
+  border: 3px solid transparent; background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-on); background-clip: content-box; }

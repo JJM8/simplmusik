@@ -1,0 +1,2082 @@
+#!/usr/bin/env python3
+"""simplmusik - a super simple music CLI.
+
+Your library is the one music folder you choose, walked all the way down:
+a subfolder isn't a level you browse, it's just where a file happens to sit.
+Playlists are small JSON files in .simplmusik/playlists inside that folder -
+so syncing it between machines takes your playlists with it - naming a song by
+its filename and where it was last seen:
+
+    {"name": "Road trip",
+     "songs": [{"file": "Killer Queen - Queen.mp3", "dir": "/home/me/Music"}]}
+
+The filename is the identity everywhere; `dir` is only a shortcut. A song that
+has moved is looked for again under your music folder once and the list rewritten
+with where it turned up. One that is nowhere keeps its place, marked not found
+- a drive you haven't plugged in yet is no reason to edit your playlist.
+
+Commands:
+  status                     library + playback summary
+  folder [set] [dir]         show your music folder, or choose another
+                             (`folder set` on its own opens a folder picker)
+  songs                      list every song in the library
+  list [playlist]            list playlists, or the songs in one
+  create <name> [--cover P]  make a new, empty playlist
+  rename <playlist> <name>   give a playlist a different name
+  cover <playlist> [image]   show, set or (--clear) drop its cover art
+  add <playlist> <file...>   add songs to a playlist, importing any that
+                             aren't in the library yet
+  search <query> [--count N] search YouTube for songs
+  download <id>              download a search result into the library
+  remove <playlist> <song>   drop a song from a playlist (the file stays)
+  remove <song>              delete a song: the file, and every list naming it
+  delete <playlist>          delete a playlist (its songs stay)
+  play [playlist] [song]     play a playlist, one song, or the whole library
+  levelling [on|off]         play every song at one loudness (on by default)
+  target [dB]                where that loudness sits (-30 to -12, -20 default)
+  volume [0-100]             how loud, on top of the levelling
+  shuffle [on|off]           play in a random order, until you turn it off
+  pause / resume             hold, and let go
+  skip / back                next / previous song
+  seek <time>                jump within the song (1:23, 83, +30, -10)
+  stop                       stop playback
+Add --json to any command for machine-readable output.
+
+How playback works: `play` starts one detached player process that owns the
+queue and drives one long-lived mpv, telling it a song at a time over mpv's
+JSON IPC socket. It rewrites the state file at
+every song change, so the state file always names the song actually sounding
+- which is what makes `status` correct, including after a skip.
+
+The player keeps two lists. `songs` is the pool it draws from; `order` is what
+it has actually played, grown one song at a time. So `order` is the history,
+which is what `back` walks and what shuffle checks to avoid replaying
+something you just heard - one list doing the work of three.
+
+Shuffle is a setting, not a session. It sits in the config file beside
+levelling, so it stays on until you turn it off and everything played from
+then on - from here or from the window - is shuffled. `play --shuffle` is that
+same switch thrown on the way past. Name a song and a shuffled play still
+starts on it and draws from there on; name none and the opening song is a draw
+too, so a playlist doesn't always open on the same track.
+
+Seeking moves the mpv that is already playing, so a song carries on rather
+than starting again. How far into a song we are is mpv's own `time-pos`, and
+the socket is a file like any other, so anyone can ask it - `seek -10` here,
+and the progress bar in the UI - with no clock kept anywhere to drift.
+
+Every song is levelled to the same loudness. It is measured once - the mean
+of its squared samples, and its loudest single sample - and mpv is handed a
+`volume=NdB` filter to match, so nothing on disk is ever touched. The gain is
+capped at whatever leaves that loudest sample just under full scale, so no song
+can clip. `target` moves where they are all aimed; only the two measurements
+are cached, never a gain, so aiming somewhere else re-measures nothing.
+Measurements are kept in ~/.cache/simplmusik.json.
+
+Control: stop and pause are signals, because they act on the process. Anything
+that moves the queue - skip, back, shuffle, seek - goes through a control file
+the player is nudged to read, because those carry a value and signals can't.
+
+Exit codes: 0 ok, 1 user error, 2 nothing found.
+"""
+
+import argparse, json, os, random, re, select, shutil, signal, socket
+import subprocess, sys, time, zipfile
+
+AUDIO = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
+HOME_MUSIC = os.path.expanduser("~/Music")          # the default music folder
+CONF = os.path.expanduser("~/.config/simplmusik")  # the simplmusik folder
+CONFIG = os.path.join(CONF, "config.json")
+HOMELESS = os.path.join(CONF, "playlists")          # where they waited, once
+WAS = [HOMELESS, os.path.join(HOME_MUSIC, "playlists")]   # where they used to live
+STATE = os.path.expanduser("~/.local/state/simplmusik.json")
+CTL = os.path.expanduser("~/.local/state/simplmusik-ctl.json")
+MPVSOCK = os.path.expanduser("~/.local/state/simplmusik-mpv.sock")
+JOB = os.path.expanduser("~/.local/state/simplmusik-job.json")
+DLDIR = os.path.expanduser("~/.local/state/simplmusik-downloads")
+RESOLVED = os.path.expanduser("~/.local/state/simplmusik-resolved")
+CACHE = os.path.expanduser("~/.cache/simplmusik.json")
+NULL = subprocess.DEVNULL
+
+CONF_DOT = ".simplmusik"            # the hidden folder playlists sit in
+
+# ---------------------------------------------------------------- state file
+# The one source of truth for what is playing. Only the player process writes
+# it; every command reads it. No globals, so a fresh CLI process is never lost.
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+def save_json(path, obj, indent=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(obj, f, indent=indent)
+    os.replace(path + ".tmp", path)    # atomic: no reader sees a half file
+
+def save_state(st):
+    save_json(STATE, st)
+
+def clear_state():
+    # The socket goes with them: mpv leaves it behind when it is killed rather
+    # than asked, and a stale one is a file that looks like a player.
+    for path in (STATE, CTL, MPVSOCK):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def alive(pid):
+    try:
+        os.kill(int(pid or 0), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+def reap(pid):
+    """Kill an mpv left behind by a player that died without cleaning up.
+    Confirms the process really is mpv, so a recycled pid can never take
+    an unrelated process down with it."""
+    try:
+        with open("/proc/%d/comm" % int(pid)) as f:
+            if f.read().strip() == "mpv":
+                os.kill(int(pid), signal.SIGKILL)
+    except (OSError, TypeError, ValueError):
+        pass
+
+def state():
+    """What is playing right now, or {} if nothing is."""
+    st = load_json(STATE, {})
+    if st and alive(st.get("pid")):
+        return st
+    if st:                      # player is gone: tidy up after it
+        reap(st.get("child"))
+        clear_state()
+    return {}
+
+def position(st):
+    """How far into the current song we are, in seconds - mpv's own count of
+    it, which is the only one there is now that nothing here restarts a song
+    to move it. It stands still while paused without being told to, and can
+    read a shade below zero in the moment after a song is handed over, which
+    is what the clamp is for. 0.0 if mpv can't be reached, which only happens
+    when there is nothing playing to ask about."""
+    return max(0.0, ask_mpv("time-pos") or 0.0)
+
+def send(op, **kw):
+    """Ask the running player to move the queue. False if nothing is playing."""
+    st = state()
+    if not st:
+        return False
+    os.makedirs(os.path.dirname(CTL), exist_ok=True)
+    with open(CTL + ".tmp", "w") as f:
+        json.dump(dict(op=op, **kw), f)
+    os.replace(CTL + ".tmp", CTL)
+    try:
+        os.kill(st["pid"], signal.SIGHUP)
+    except OSError:
+        return False
+    return True
+
+# --------------------------------------------------------------------- cache
+# Anything about a song that costs something to work out, kept so it is worked
+# out once. Keyed by filename - a song's identity everywhere here - and stamped
+# with the file's size and mtime, so a song that moves folders keeps what we
+# know about it and one that is re-encoded or replaced quietly loses it. It is
+# only ever a cache: delete the file and the only cost is the work being done
+# again.
+
+def stamp(path):
+    """What makes a file the same file: its size and when it changed."""
+    try:
+        st = os.stat(path)
+        return [st.st_size, int(st.st_mtime)]
+    except OSError:
+        return None
+
+def cached(name, path):
+    """What we know about this song, or {} if the file isn't what it was."""
+    e = load_json(CACHE, {}).get(name) or {}
+    return e if e.get("stamp") == stamp(path) else {}
+
+def remember(name, path, **facts):
+    """Add to what we know about a song. The whole file is rewritten, which
+    costs nothing at library size and keeps the write atomic."""
+    s = stamp(path)
+    if s is None:               # the file went away: nothing worth keeping
+        return
+    c = load_json(CACHE, {})
+    e = c.get(name) or {}
+    if e.get("stamp") != s:     # a different file under the same name
+        e = {"stamp": s}
+    e.update(facts)
+    c[name] = e
+    save_json(CACHE, c)
+
+# --------------------------------------------------------------- the picker
+# Picking a folder is the desktop's job, not ours: `folder set` with nothing
+# after it asks the desktop for one, which is what the button in the window
+# does. What comes back joins the same path a typed one takes, so there is one
+# way the folder is chosen and not two. zenity is what Mint has; kdialog is what a
+# KDE machine has instead. No display means no dialog, so don't offer one.
+
+CHOOSERS = [["zenity", "--file-selection", "--directory",
+             "--title", "Choose a music folder"],
+            ["kdialog", "--getexistingdirectory", os.path.expanduser("~")]]
+
+def chooser():
+    """The command that opens this desktop's folder picker, or None."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    for cmd in CHOOSERS:
+        if shutil.which(cmd[0]):
+            return cmd
+    return None
+
+def choose_folder():
+    """Ask the desktop for a folder: the path, "" if the dialog was closed
+    without one, or None if there is no picker here to open. No timeout - a
+    dialog is open for exactly as long as someone is looking at it."""
+    cmd = chooser()
+    if not cmd:
+        return None
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+# ------------------------------------------------------- library + playlists
+# The library is the one music folder you have chosen, walked all the way
+# down. Subfolders are disregarded as structure: what comes back is one flat
+# list of songs, however they happen to be arranged on disk. A song's filename
+# is its identity everywhere - in a playlist, in the state file, in the UI -
+# and the first subfolder holding a name wins, so the same name twice is one
+# song rather than an ambiguity to settle again at every turn.
+
+def folder():
+    """Your music folder: the one place a song can be, and where new ones
+    land. There is always one - never having chosen means ~/Music - so nothing
+    downstream has to have an answer for having none."""
+    c = load_json(CONFIG, {})
+    d = c.get("folder")
+    if not d and isinstance(c.get("folders"), list) and c["folders"]:
+        d = c["folders"][0]         # a config from when this was a list
+    return os.path.abspath(os.path.expanduser(str(d or HOME_MUSIC)))
+
+def setting(key, default):
+    """One setting from the config file, or what it is when nobody has said."""
+    v = load_json(CONFIG, {}).get(key)
+    return default if v is None else v
+
+def set_setting(key, value):
+    """Change one setting and leave the rest of the file alone - it is yours to
+    edit by hand, so it is written back indented and nothing else moves."""
+    c = load_json(CONFIG, {})
+    c[key] = value
+    save_json(CONFIG, c, indent=2)
+
+def set_folder(path):
+    set_setting("folder", path)
+
+def under(path, root):
+    """Is this path inside the music folder? What a playlist remembers about
+    a song is only a shortcut, and one pointing outside the library is no
+    shortcut at all - a song there is not one of yours, whatever is still on
+    the disk at that address, so it has to be looked up like any other."""
+    path = os.path.abspath(os.path.expanduser(path))
+    return path == root or path.startswith(root + os.sep)
+
+def index():
+    """Every song you have, as {filename: full path}."""
+    out = {}
+    for here, dirs, names in os.walk(folder()):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for n in sorted(names):
+            if os.path.splitext(n)[1].lower() in AUDIO and n not in out:
+                out[n] = os.path.join(here, n)
+    return out
+
+def library():
+    """Every song in the library: one flat, sorted list of filenames."""
+    return sorted(index())
+
+def playlists_dir():
+    """Where playlists are kept: inside your music folder, so syncing that
+    folder between machines carries them along with the music they name.
+    The folder is hidden, which is exactly what keeps it out of the library -
+    `index` walks past dot-directories, so playlists are never mistaken for
+    something to play."""
+    return os.path.join(folder(), CONF_DOT, "playlists")
+
+def cache_dir():
+    """Where a song lands while it is still coming down.
+
+    It sits inside the hidden folder for two reasons. `index` walks past
+    dot-directories, so a half-written song is never a library song - there is
+    no window in which the library contains something that can't be played.
+    And it is inside your music folder rather than off in /tmp, which puts it
+    on the same filesystem as the library: the move that finishes a download
+    is then a rename, which either has happened or hasn't, instead of a copy
+    that can be interrupted halfway."""
+    return os.path.join(folder(), CONF_DOT, "cache")
+
+def remote(path):
+    """Whether this is something mpv fetches rather than a file on disk.
+
+    A stream is handed to mpv exactly the way a path is, so most of the player
+    never learns the difference. The places that do are the ones that want to
+    open the file themselves - and there is no file yet."""
+    return bool(path) and path.startswith(("http://", "https://"))
+
+def sweep_cache(days=1):
+    """Drop cache files nothing is coming back for. A fetch killed partway
+    leaves its part-file behind, and nothing else would ever remove it -
+    the finished ones move out of here the moment they are whole."""
+    cutoff = time.time() - days * 86400
+    try:
+        for n in os.listdir(cache_dir()):
+            f = os.path.join(cache_dir(), n)
+            try:
+                if os.path.isfile(f) and os.path.getmtime(f) < cutoff:
+                    os.remove(f)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def rehome(was):
+    """Follow the music folder. Playlists live inside it, so choosing a
+    different one has to take them with it - otherwise they would be left
+    behind in a folder nothing looks at any more, out of sight."""
+    now = playlists_dir()
+    if os.path.abspath(was) == os.path.abspath(now) or not os.path.isdir(was):
+        return
+    try:
+        os.makedirs(os.path.dirname(now), exist_ok=True)
+        shutil.move(was, now)
+    except OSError:
+        pass                        # the playlists stay where they are
+
+def stems():
+    """Every playlist file, by name. One place decides what counts as one."""
+    d = playlists_dir()
+    return [f for f in (sorted(os.listdir(d)) if os.path.isdir(d) else [])
+            if f.endswith(".json")]
+
+def playlist_file(stem):
+    return os.path.join(playlists_dir(), stem + ".json")
+
+def meta(stem):
+    return load_json(playlist_file(stem), {})
+
+def write_meta(stem, m):
+    os.makedirs(playlists_dir(), exist_ok=True)
+    with open(playlist_file(stem), "w") as f:
+        json.dump(m, f, indent=2)
+
+def entry(e):
+    """One stored song, as (filename, the folder it was last seen in)."""
+    if isinstance(e, dict):
+        return os.path.basename(e.get("file") or ""), (e.get("dir") or "")
+    return os.path.basename(e or ""), ""    # older lists stored a bare name
+
+def store(songs):
+    """Songs on their way back into a playlist file: the name, and where it
+    was found, so looking it up next time is one stat and not a search."""
+    return [{"file": s["file"], "dir": os.path.dirname(s["path"])} if s["path"]
+            else {"file": s["file"]} for s in songs]
+
+def songs_of(stem):
+    """A playlist's songs, each as {"file": name, "path": where it is now}.
+
+    The remembered folder is tried first, so the usual case costs one stat -
+    but only if it is inside your music folder, so that choosing a different
+    one doesn't leave a playlist quietly playing out of the old one. When it
+    misses - the song moved, or the folder did - your music folder is searched
+    and the list is rewritten with where it turned up, so that search happens
+    once rather than once per playback. A song nowhere under it stays
+    in the list with path None: the list is what you made, and a file that is
+    off the disk today may be back tomorrow, so nothing is quietly dropped.
+    Duplicates are, though - shuffle's 'not played lately' check reads the
+    list and one name twice in it would fool that."""
+    m = meta(stem)
+    root, idx, out, seen, moved = folder(), None, [], set(), False
+    for e in m.get("songs") or []:
+        name, was = entry(e)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        path = os.path.join(was, name) if was and under(was, root) else ""
+        if not (path and os.path.isfile(path)):
+            idx = index() if idx is None else idx
+            path, moved = idx.get(name), True
+        out.append({"file": name, "path": path or None})
+    if moved:
+        m["songs"] = store(out)
+        write_meta(stem, m)
+    return out
+
+# ------------------------------------------------------------- cover art
+# A playlist's own picture, kept beside its JSON as <stem>.<kind> - so the
+# folder you sync carries the artwork along with the list, and a playlist
+# deleted takes its picture with it rather than leaving one behind.
+
+COVER_MAX = 8 << 20             # 8 MB: a cover, not a photo library
+
+def image_kind(path):
+    """What kind of image a file holds, read from the first bytes rather than
+    the name on it. An extension is only a claim, and this picture is handed
+    straight back to a browser, so the file itself is what decides."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    if head[:3] == b"\xff\xd8\xff":                     return "jpg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":                return "png"
+    if head[:4] == b"GIF8":                             return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":   return "webp"
+    return None
+
+def cover_path(stem):
+    """Where a playlist's cover art is, or None if it hasn't any. The name in
+    the file is taken as a basename, so a playlist can only ever point at a
+    picture in the playlists folder and never anywhere else on the disk."""
+    name = os.path.basename((meta(stem).get("cover") or "").strip())
+    path = os.path.join(playlists_dir(), name) if name else ""
+    return path if path and os.path.isfile(path) else None
+
+def drop_cover(stem):
+    """Take a playlist's picture off it, and delete the picture. True if there
+    was one. The file is ours - we copied it in - so removing it is not the
+    same as removing something of yours."""
+    path, m = cover_path(stem), meta(stem)
+    had = bool(m.get("cover"))
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass                # gone already, or read-only: the list still lets go
+    if had:
+        m.pop("cover", None)
+        write_meta(stem, m)
+    return had
+
+def set_cover(stem, src):
+    """Give a playlist a picture, copied in beside its list. Returns where it
+    landed, or raises ValueError saying why it couldn't. Copying rather than
+    pointing at where you got it is what makes the artwork survive tidying up
+    your Downloads folder - and travel with the list when the folder syncs."""
+    if not os.path.isfile(src):
+        raise ValueError("no such image: %s" % src)
+    kind = image_kind(src)
+    if not kind:
+        # No name in this: the window hands the picture over as a temporary
+        # file, and its name would mean nothing at all to the person reading.
+        raise ValueError("that isn't a JPEG, PNG, GIF or WebP image")
+    if os.path.getsize(src) > COVER_MAX:
+        raise ValueError("that image is bigger than %d MB" % (COVER_MAX >> 20))
+    dest = os.path.join(playlists_dir(), stem + "." + kind)
+    if os.path.abspath(src) != os.path.abspath(dest):
+        drop_cover(stem)        # the old picture goes, whatever it was called
+        os.makedirs(playlists_dir(), exist_ok=True)
+        # The contents and nothing else. Copying the mode across would leave a
+        # cover picked in the window readable only by you - it arrives here as
+        # a temporary file, and those are private - while the list beside it is
+        # an ordinary file. A playlist and its picture travel together, so they
+        # are written the same way.
+        shutil.copyfile(src, dest)
+    m = meta(stem)
+    m["cover"] = os.path.basename(dest)
+    write_meta(stem, m)
+    return dest
+
+def playlists():
+    out = []
+    for f in stems():
+        stem = f[:-5]
+        m = meta(stem)
+        out.append({"file": stem, "name": m.get("name") or stem,
+                    "cover": cover_path(stem), "songs": songs_of(stem)})
+    return out
+
+def find(name):
+    """A playlist's file stem, by stem or by display name. None if absent.
+    Only the names are read: resolving every song to answer this would walk
+    your whole music folder, and `find` is on the way to nearly every command."""
+    name = os.path.basename((name or "").rstrip("/"))
+    if name.endswith(".json"):
+        name = name[:-5]
+    if name and os.path.isfile(playlist_file(name)):
+        return name
+    for f in stems():
+        if (meta(f[:-5]).get("name") or f[:-5]) == name:
+            return f[:-5]
+    return None
+
+def migrate():
+    """Two things have changed shape. The config kept a list of music folders
+    and now keeps one, so a list is collapsed to its first - which is already
+    where playlists lived and where new songs landed, so nothing moves.
+
+    And playlists themselves have moved twice: out of ~/Music/playlists, which
+    tied them to the one music folder; and then into the music folder itself,
+    so that a folder synced between machines brings its playlists along. Each
+    happens once, the first time anything runs after it."""
+    c = load_json(CONFIG, {})
+    if "folders" in c:
+        dirs = c.pop("folders")
+        c.setdefault("folder", dirs[0] if isinstance(dirs, list) and dirs
+                     else HOME_MUSIC)
+        save_json(CONFIG, c, indent=2)
+    now = playlists_dir()           # asked after the collapse, not before
+    if os.path.isdir(now):
+        return                      # already where they belong
+    for old in WAS:
+        if os.path.isdir(old) and os.path.abspath(old) != os.path.abspath(now):
+            try:
+                os.makedirs(os.path.dirname(now), exist_ok=True)
+                shutil.move(old, now)
+            except OSError:
+                pass                # nothing here is worth failing a command
+            return
+
+def emit(as_json, obj, text):
+    if as_json:
+        print(json.dumps(obj, indent=2))
+    elif text:
+        print(text)
+
+def parse_time(s):
+    """A position in a song: seconds (83), clock time (1:23, 1:02:03), or a
+    jump from where we are (+30, -10). None if it isn't a time at all."""
+    s = (s or "").strip()
+    rel = s[:1] in ("+", "-")
+    sign, body = (-1 if s[:1] == "-" else 1), (s[1:] if rel else s)
+    if not body:
+        return None
+    total = 0.0
+    for part in body.split(":"):
+        try:
+            v = float(part)
+        except ValueError:
+            return None
+        if v < 0:
+            return None
+        total = total * 60 + v      # so 1:02:03 falls out of the same loop
+    return sign * total, rel
+
+def clock(secs):
+    return "%d:%02d" % (int(secs) // 60, int(secs) % 60)
+
+def fail(as_json, msg, code):
+    emit(as_json, {"error": msg}, msg)
+    return code
+
+# ------------------------------------------------------------------ loudness
+# Songs are mastered at wildly different levels - a 16 dB spread across an
+# ordinary library, which is a volume knob you keep having to touch. So every
+# song is measured once and played through mpv's volume filter. Nothing is
+# written to the file: the gain is worked out from the numbers each time, so
+# only the measuring is cached and aiming somewhere else later re-measures
+# nothing.
+#
+# The measure is the mean squared sample in dB, which ffmpeg calls mean_volume,
+# and the target is where every song is aimed - -20 dBFS unless you move it.
+# The catch is that a song quiet on
+# average isn't always a quiet master - some already touch full scale on a peak
+# - and boosting one of those would clip it. So the gain is capped at whatever
+# leaves the loudest sample just under full scale, which is what makes clipping
+# impossible here rather than unlikely: a song that can't reach the target
+# stays a little short instead, and at the default target almost none have to.
+# That is the whole of what moving the target trades: aim louder and the songs
+# with the least headroom start falling short of the rest.
+
+def shuffling():
+    """Shuffle as a setting: on until you turn it off, so it outlives any one
+    playback session and decides what the next `play` does."""
+    return bool(setting("shuffle", False))
+
+def levelling():
+    """Whether songs are levelled to one loudness. On unless turned off."""
+    return bool(setting("levelling", True))
+
+def volume():
+    """How loud, 0-100, and a setting rather than a session - the same kind of
+    switch as levelling and shuffle, so it stays where you left it.
+
+    It multiplies whatever levelling decided rather than arguing with it: one
+    settles the difference between songs, the other how loud the lot of it is.
+    100 is the song exactly as levelling left it, and there is nothing above
+    100 on purpose - the gain is already capped so that no song can clip, and
+    a boost here is the one thing that could undo that.
+
+    The scale is mpv's own, which is cubic: 50 is a quarter of the way up in
+    amplitude, not half. That is what makes a slider feel even to a listener
+    rather than crowding every useful setting into the bottom of its travel."""
+    try:
+        return max(0, min(100, int(setting("volume", 100))))
+    except (TypeError, ValueError):
+        return 100          # a config hand-edited into nonsense still plays
+
+TARGET = -20.0      # dBFS mean square every song is aimed at, until you move it
+TARGET_LO = -30.0   # as quiet as it goes: every song reaches this one
+TARGET_HI = -12.0   # as loud: a fair few songs have to fall short of this one
+CEILING = -0.1      # dBFS the loudest sample may reach once the gain is on
+
+def target():
+    """Where levelling aims, in dBFS mean square - a setting like the volume
+    and the levelling switch itself, so it stays where you left it, and held
+    inside the two ends on the way out, so a config hand-edited past either
+    still plays.
+
+    Moving it costs no measuring. What is cached about a song is its mean and
+    its peak, never a gain, so aiming somewhere else is arithmetic on numbers
+    we already have."""
+    try:
+        return min(TARGET_HI, max(TARGET_LO,
+                                  round(float(setting("target", TARGET)), 1)))
+    except (TypeError, ValueError):
+        return TARGET
+
+def measure(path):
+    """A song's mean square and its peak, both in dBFS, from one decode pass -
+    around two seconds for a three minute song, which is why it happens once.
+    None if the file can't be measured, which plays it as it is."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", path,
+             "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"],
+            stdin=NULL, stdout=NULL, stderr=subprocess.PIPE,
+            timeout=300).stderr.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    mean = re.search(r"mean_volume: *(-?[\d.]+) dB", out)
+    peak = re.search(r"max_volume: *(-?[\d.]+) dB", out)
+    return (float(mean.group(1)), float(peak.group(1))) if mean and peak else None
+
+def gain(name, path):
+    """How many dB to move this song by: what the target asks for, or what the
+    peak allows, whichever is less. 0.0 when there is nothing to go on, so a
+    song we can't measure - or levelling turned off - plays as it did before."""
+    if not levelling() or remote(path):
+        # A stream has no file to measure, and measuring one would mean
+        # fetching the whole song before a note of it played - which is the
+        # one thing streaming is for. It plays as it is, and the copy landing
+        # in the background is measured and levelled the next time it is
+        # played, by which point it is an ordinary library song.
+        return 0.0              # off: hand mpv the song exactly as it is
+    e = cached(name, path)
+    if "rms" not in e:
+        got = measure(path)
+        if not got:
+            return 0.0
+        e = {"rms": got[0], "peak": got[1]}
+        remember(name, path, **e)
+    return round(min(target() - e["rms"], CEILING - e["peak"]), 1)
+
+# ----------------------------------------------------------------------- mpv
+# One mpv plays everything, for the whole session, driven over the JSON IPC
+# socket it opens on request: a line of JSON in, a line of JSON back, and
+# events pushed as they happen. That is the whole of the change from running a
+# player per song - but it is what lets a song be moved, paused and relevelled
+# where it stands, because the process playing it is still there to be asked.
+#
+# It is started with --no-config on purpose. An mpv.conf belongs to the person
+# who wrote it, and a `volume=50` or an `af=` in one would quietly become part
+# of how this app sounds; the levelling here is the only thing that should.
+
+MPV_ARGS = ["--idle=yes",          # outlive every song, waiting for the next
+            "--no-video",          # audio only, cover art included
+            "--no-terminal",       # we are not a terminal it can read keys from
+            "--no-config",         # nobody's mpv.conf, only ours
+            "--keep-open=no"]      # a finished song ends, rather than pausing
+
+def mpv_line(cmd, timeout=0.3):
+    """One command to the running mpv, and its answer. Opens its own
+    connection and drops it: the socket is a file, so `status` in one terminal
+    can ask what is playing without going anywhere near the player process.
+    None if there is no mpv, or it doesn't answer promptly - either way, the
+    caller's answer is that it doesn't know."""
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(timeout)
+        s.connect(MPVSOCK)
+    except OSError:
+        return None
+    try:
+        s.sendall(json.dumps({"command": cmd, "request_id": 1}).encode() + b"\n")
+        buf = b""
+        while True:
+            got = s.recv(65536)
+            if not got:
+                return None
+            buf += got
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                m = json.loads(line)
+                # mpv pushes its events down this socket too, and one can land
+                # between the question and the answer. Ours is the one wearing
+                # the request id; anything else is passed over.
+                if m.get("request_id") == 1:
+                    return m
+    except (OSError, ValueError):
+        return None
+    finally:
+        s.close()
+    return None
+
+def ask_mpv(prop):
+    """One property of whatever is playing, or None."""
+    m = mpv_line(["get_property", prop])
+    return m.get("data") if m and m.get("error") == "success" else None
+
+def volume_filter(db):
+    """The filter chain for a gain in dB - and nothing at all for no gain, so
+    a song that needs no moving is not run through a filter that does none."""
+    return "volume=%.1fdB" % db if db else ""
+
+class Mpv:
+    """The mpv this player is driving.
+
+    Every command is sent and forgotten: each one either takes effect or
+    leaves playback as it was, and the loop is steered by mpv's events rather
+    than by its replies, so there is never an answer worth waiting for.
+    """
+
+    def __init__(self):
+        try:                    # a killed mpv leaves its socket behind, and
+            os.remove(MPVSOCK)  # the next one won't bind over it
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(MPVSOCK), exist_ok=True)
+        self.proc = subprocess.Popen(
+            ["mpv"] + MPV_ARGS + ["--input-ipc-server=" + MPVSOCK],
+            stdin=NULL, stdout=NULL, stderr=NULL)
+        self.buf, self.n, self.dead = b"", 0, False
+        self.sock = None
+        for _ in range(100):    # the socket appears a moment after mpv does
+            try:
+                s = socket.socket(socket.AF_UNIX)
+                s.connect(MPVSOCK)
+                self.sock = s
+                return
+            except OSError:
+                time.sleep(0.05)
+        self.dead = True
+
+    def send(self, *cmd):
+        self.n += 1
+        try:
+            self.sock.sendall(json.dumps({"command": list(cmd),
+                                          "request_id": self.n}).encode() + b"\n")
+        except (OSError, AttributeError):   # gone, or never there to begin with
+            self.dead = True
+
+    def load(self, path, db, vol, start=0.0):
+        """Start a song, at its beginning unless told otherwise. Unpausing
+        first, so the file that lands is playing: pause is mpv's own state and
+        outlives the song it was set on, and so is the volume - it is set here
+        every time so that the two can never drift apart, whatever happened to
+        the song before.
+
+        `start` is where it opens, which is only ever moved by a song being
+        swapped from the stream to the copy that has since landed on the disk.
+        It is set before the file is loaded because that is when mpv reads it,
+        and written every time - "none" when there is nowhere in particular to
+        open - so a position can never be left behind for the next song."""
+        self.send("set_property", "pause", False)
+        self.send("set_property", "volume", vol)
+        self.send("set_property", "af", volume_filter(db))
+        self.send("set_property", "start", str(start) if start else "none")
+        self.send("loadfile", path, "replace")
+
+    def lines(self):
+        """Whole JSON messages, as many as have arrived. An empty read is mpv
+        hanging up, which is the one thing the player can't carry on past."""
+        try:
+            got = self.sock.recv(65536)
+        except OSError:
+            got = b""
+        if not got:
+            self.dead = True
+            return []
+        self.buf += got
+        out = []
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            if line.strip():
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    pass
+        return out
+
+    def until_end(self, wake, drain):
+        """Wait for the song to finish - however it finishes: played out,
+        stopped for a skip, or a file that turned out not to be playable. mpv
+        says which, but the player doesn't need to be told: `step` already
+        holds what to do next, set by whoever asked.
+
+        `wake` is the pipe a signal writes to, so a skip breaks the wait as
+        promptly as an event does, and `drain` is what carries out whatever
+        the handler asked for. Every command mpv gets is sent from here, in
+        the ordinary flow - never from a handler, which could cut in halfway
+        through a line being written and leave mpv something it can't read."""
+        while not self.dead:
+            drain()
+            try:
+                ready = select.select([self.sock, wake], [], [])[0]
+            except OSError:
+                return
+            if wake in ready:
+                try:
+                    os.read(wake, 4096)     # the byte itself says nothing; the
+                except OSError:             # flag the handler set is the point
+                    pass
+            if self.sock in ready:
+                for m in self.lines():
+                    if m.get("event") == "end-file":
+                        return
+
+    def kill(self):
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+
+# -------------------------------------------------------------------- player
+
+def pick(job):
+    """The next song when shuffling: random, but never one of the last few
+    played. The window is half the pool, so a long playlist gets a long memory
+    and a short one still moves. The fallbacks matter only at the very bottom:
+    two songs alternate, and one song repeats rather than ending playback."""
+    songs, order = job["songs"], job["order"]
+    window = max(1, min(len(songs) - 1, len(songs) // 2))
+    recent = set(order[-window:])
+    return random.choice([s for s in songs if s not in recent]
+                         or [s for s in songs if s != order[-1]]
+                         or songs)
+
+def advance(job, step):
+    """Move one song. Going back walks `order`, which is the history, so it
+    replays exactly what you heard; going forward off the end of it appends
+    whatever comes next. Nothing appended means the queue is finished."""
+    job["index"] = max(0, job["index"] + step)   # back at the start replays
+    if job["index"] < len(job["order"]):
+        return
+    if job["shuffle"]:
+        job["order"].append(pick(job))
+    else:
+        i = job["songs"].index(job["order"][-1]) + 1 \
+            if job["order"][-1] in job["songs"] else len(job["songs"])
+        if i < len(job["songs"]):
+            job["order"].append(job["songs"][i])
+
+def local_copy(job, song):
+    """A copy of this song on the disk, or None while the network is still the
+    only way to hear it. The library first, then the cache being filled behind
+    a song being streamed - and that one only once it is whole, which is what
+    the note beside it says. A half-written file is not a copy."""
+    have = index().get(song)
+    if have:
+        return have
+    vid = job.get("vid")
+    if vid and cached_ready(vid) == song:
+        return os.path.join(cache_dir(), song)
+    return None
+
+def player(job):
+    """The detached process that owns playback: play one song, record it,
+    repeat. It owns the mpv too - one, for the whole session - so the loop is
+    "hand mpv a song, wait for it to end" rather than a player per song."""
+    mpv = Mpv()
+    # What a signal has asked for, carried out by `drain` in the loop below.
+    # Handlers only ever leave a note here, because the socket is the loop's
+    # to write to; see `Mpv.until_end`.
+    want = {}
+    # A signal breaks the loop's `select` by writing to this pipe. Without it
+    # a handler would set its flag and then the loop would go straight back to
+    # waiting on mpv, and a skip would not be acted on until the song ended.
+    wake_r, wake_w = os.pipe()
+    for fd in (wake_r, wake_w):
+        os.set_blocking(fd, False)
+    signal.set_wakeup_fd(wake_w)
+
+    def on_stop(*_):
+        # The one handler that does its own work: there is no loop left to
+        # hand it to. No socket is touched - the process is killed outright.
+        mpv.kill()
+        clear_state()
+        os._exit(0)
+
+    def on_pause(*_):
+        job["paused"] = not job["paused"]
+        want["pause"] = job["paused"]
+
+    def on_ctl(*_):
+        """Read one queued command. Skip and back only set the direction and
+        ask for the song to be stopped - the loop below does the moving, so
+        there is a single place that ever changes `index`."""
+        c = load_json(CTL, {})
+        try:
+            os.remove(CTL)
+        except OSError:
+            pass
+        if c.get("op") in ("skip", "back"):
+            job["step"] = 1 if c["op"] == "skip" else -1
+            want["stop"] = True
+        elif c.get("op") == "seek":
+            want["seek"] = max(0.0, float(c.get("pos") or 0))
+        elif c.get("op") == "levelling":
+            want["level"] = True
+        elif c.get("op") == "volume":
+            want["volume"] = True
+        elif c.get("op") == "shuffle":
+            job["shuffle"] = bool(c.get("on"))
+            del job["order"][job["index"] + 1:]   # drop the redo history, so
+            save_state(job)                       # the new mode decides next
+
+    def drain():
+        """Carry out what the handlers asked for. Everything here is a write
+        to the socket, which is why none of it happens in a handler."""
+        if "pause" in want:
+            mpv.send("set_property", "pause", want.pop("pause"))
+            save_state(job)
+        if "seek" in want:
+            at = want.pop("seek")
+            local = local_copy(job, job["song"])
+            if local and remote(job["paths"][job["song"]]):
+                # It finished downloading while you listened. A seek is the one
+                # moment worth changing over on: you have asked for a jump
+                # either way, so the gap it costs is one you were going to hear
+                # anyway. Left alone, a stream plays out as a stream - this is
+                # the only thing that ever swaps a song under itself.
+                job["paths"][job["song"]] = local
+                want["restart"] = at
+                mpv.send("stop")        # the loop below picks the song up again
+            else:
+                # The song carries on from there rather than starting again, so
+                # there is nothing to put back afterwards: no offset to
+                # remember, and a seek while paused is still paused when it
+                # lands.
+                mpv.send("seek", at, "absolute")
+        if want.pop("level", False):
+            # Levelling turned on or off mid-song, or aimed somewhere else:
+            # swap the filter under the song that is playing, so it is heard
+            # now and heard seamlessly. The gain is worked out again from the
+            # cache, so neither of those re-measures anything.
+            job["gain"] = gain(job["song"], job["paths"][job["song"]])
+            mpv.send("set_property", "af", volume_filter(job["gain"]))
+            save_state(job)
+        if want.pop("volume", False):
+            # mpv's own volume, left alone by everything else here, so turning
+            # it down never disturbs the filter levelling is riding on.
+            mpv.send("set_property", "volume", volume())
+        if want.pop("stop", False):
+            mpv.send("stop")
+
+    for sig, handler in ((signal.SIGTERM, on_stop), (signal.SIGINT, on_stop),
+                         (signal.SIGUSR2, on_pause), (signal.SIGHUP, on_ctl)):
+        signal.signal(sig, handler)
+
+    job["pid"] = os.getpid()
+    job["child"] = mpv.proc.pid
+    at, resuming = 0.0, False
+    while not mpv.dead and 0 <= job["index"] < len(job["order"]):
+        job["song"] = job["order"][job["index"]]
+        path = job["paths"][job["song"]]
+        if not resuming:
+            # A song picked back up off the disk keeps the gain it was already
+            # playing at. Measuring the file costs a decode pass, which would
+            # stall the seek that asked for it - and would move the loudness
+            # halfway through a song. It is measured the next time it is
+            # played, by which point it is an ordinary library song.
+            job["gain"] = gain(job["song"], path)
+        job["seq"] += 1         # every start, so a replayed song still counts
+        mpv.load(path, job["gain"], volume(), at)
+        if job["paused"]:       # swapped mid-song while paused: still paused
+            mpv.send("set_property", "pause", True)
+        save_state(job)
+        mpv.until_end(wake_r, drain)
+        # A swap ends the file mpv was playing, which is not the song ending:
+        # the same song goes round again, off the disk, at the point asked for.
+        at = want.pop("restart", None)
+        resuming = at is not None
+        if resuming:
+            continue
+        at = 0.0
+        # Both of these were asked of the song that has just ended, so neither
+        # outlives it: a skip in the gap between two songs is already the move
+        # the loop is making, and a seek into a song nobody is playing is not
+        # a place the next one should open at.
+        want.pop("stop", None)
+        want.pop("seek", None)
+        step, job["step"] = job["step"], 1
+        job["paused"] = False   # a skip while paused lands playing
+        advance(job, step)
+    mpv.kill()
+    clear_state()               # queue finished: nothing is playing any more
+
+def stop_player():
+    """Stop playback. True if something was actually playing."""
+    st = state()
+    if not st:
+        return False
+    try:
+        os.kill(st["pid"], signal.SIGTERM)
+    except OSError:
+        pass
+    for _ in range(40):         # up to 2s for it to tear its mpv down
+        if not alive(st["pid"]):
+            break
+        time.sleep(0.05)
+    reap(st.get("child"))
+    clear_state()
+    return True
+
+def landed(st, timeout=1.0):
+    """What is playing once a skip or back has taken effect. Under shuffle the
+    CLI can't work this out in advance - only the player picks - so read it
+    back instead of guessing. `seq` rather than the song name, so a `back` that
+    restarts the current song still registers."""
+    seq, end = st.get("seq", 0), time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.05)
+        new = state()
+        if not new:
+            return None                     # queue ran out
+        if new.get("seq", 0) != seq:
+            return new.get("song")
+    return (state() or {}).get("song")
+
+# -------------------------------------------------------------------- youtube
+# Searching and downloading both go through yt-dlp, imported rather than run as
+# a program: importing it costs about a second, starting the executable costs
+# several. It is commonly installed twice on one machine - a current zipapp in
+# ~/.local/bin beside a stale copy from the distro - and only the newer
+# extractor still works against YouTube, so we look at both and import whichever
+# that is. Versions are dates, `2026.08.19`, so they compare as plain strings.
+
+YTDLP_MIN = "2025"          # older extractors can still search, but not download
+CACHE_WAIT = 600            # seconds `download` will wait on a cache already
+                            # filling before giving up and fetching it itself
+RESOLVE_TTL = 3600          # how long a looked-up stream URL is trusted for.
+                            # YouTube's own last about six hours; an hour is
+                            # short enough that a stale one is never played
+YTDLP_GONE = "yt-dlp isn't installed - `pip install --user -U yt-dlp`"
+SEARCH_N = 8                # results a search comes back with
+SEARCH_MAX = 40             # ...and the most it will, however many you ask for
+
+def zipapp_version(path):
+    """The version of a yt-dlp zipapp, read without importing it, or None if
+    `path` isn't one."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            for line in z.read("yt_dlp/version.py").decode().splitlines():
+                if line.startswith("__version__"):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        pass
+    return None
+
+_ytdlp = []                 # one-slot cache: [] not looked yet, [None] not there
+
+def ytdlp():
+    """The newest yt-dlp on this machine, imported, or None if there is none."""
+    if _ytdlp:
+        return _ytdlp[0]
+    try:
+        import yt_dlp as mod
+    except ImportError:
+        mod = None
+    exe = shutil.which("yt-dlp")
+    zv = zipapp_version(exe) if exe else None
+    if zv and (mod is None or zv > mod.version.__version__):
+        # A zipapp is a zip of the package itself, so the path to it is a path
+        # the import machinery can read a package out of.
+        sys.path.insert(0, exe)
+        for name in [n for n in sys.modules if n.split(".")[0] == "yt_dlp"]:
+            del sys.modules[name]
+        try:
+            import yt_dlp as mod
+        except ImportError:
+            pass
+    _ytdlp.append(mod)
+    return mod
+
+def video_id(s):
+    """A bare video id, from an id or from any shape of YouTube link."""
+    s = (s or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return s
+    m = re.search(r"(?:v=|/shorts/|/embed/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})", s)
+    return m.group(1) if m else None
+
+# ------------------------------------------------------------------ commands
+
+def cmd_status(args):
+    lib, pls, st, dir_ = library(), playlists(), state(), folder()
+    # Where we are in the playlist, which is not where we are in the session:
+    # `index` counts songs played, and a shuffled stretch runs it on past the
+    # end of the list. Shuffled, there is no last track, so only count played.
+    track = (st["songs"].index(st["song"]) + 1
+             if st and st["song"] in st["songs"] else None)
+    info = {"folder": dir_, "songs": len(lib), "playlists": len(pls),
+            "playing": bool(st), "paused": bool(st.get("paused")),
+            "current_playlist": st.get("playlist"), "current_song": st.get("song"),
+            "track": track, "played": st.get("index", 0) + 1 if st else None,
+            "queue": len(st.get("songs", [])) or None,
+            "shuffle": shuffling(),
+            "playlists_list": [p["name"] for p in pls]}
+    if not st:
+        now = "playing: nothing"
+    else:
+        pos = ("#%d, shuffled" % (st["index"] + 1) if shuffling()
+               else "%d/%d" % (track, len(st["songs"])) if track else "")
+        now = "%s %s  (%s%s)" % ("paused:" if st.get("paused") else "playing:",
+                                 st["song"], st.get("playlist") or "library",
+                                 ", " + pos if pos else "")
+    emit(args.json, info, "folder:      %s\nsongs:       %d\nplaylists:   %d\nnow %s"
+         % (dir_, len(lib), len(pls), now))
+    return 0
+
+def cmd_folder(args):
+    """Your music folder, and choosing a different one. Everything under it
+    comes with it, so there is never a subfolder to name as well; and there is
+    only ever one, so choosing is all there is to do - nothing is ever taken
+    away and left with none. Nothing here ever touches a file."""
+    dir_, action = folder(), (args.action or "").lower()
+    if not action:
+        return emit(args.json, dir_, dir_) or 0
+    if action != "set":
+        return fail(args.json, "say `folder` or `folder set PATH`", 1)
+    if args.path:
+        path = os.path.abspath(os.path.expanduser(args.path))
+    else:
+        picked = choose_folder()
+        if picked is None:
+            return fail(args.json, "no folder picker on this machine - name the "
+                        "folder instead: `simplmusik folder set PATH`", 1)
+        if not picked:
+            # Closing the dialog isn't an error, it's an answer: nothing here
+            # changed, and there is nothing to complain about.
+            return emit(args.json, {"folder": dir_, "changed": False},
+                        "nothing picked") or 0
+        path = os.path.abspath(picked)
+    if not os.path.isdir(path):
+        return fail(args.json, "no such folder: %s" % path, 2)
+    if path == dir_:
+        # Choosing the folder you are already on is not a mistake to report,
+        # it is simply nothing to do.
+        return emit(args.json, {"folder": dir_, "changed": False},
+                    "already your music folder: " + path) or 0
+    was = playlists_dir()       # before the change, so the move can follow it
+    set_folder(path)
+    rehome(was)                 # playlists live in the folder, so they go too
+    return emit(args.json, {"folder": path, "changed": True},
+                "music folder is now " + path) or 0
+
+def cmd_levelling(args):
+    """Levelling on, off, or as it stands. Changing it mid-song swaps the filter
+    under the song that is playing, so the difference is heard at once, in the
+    middle of a bar, with nothing restarted. Songs are measured as they are
+    played, so turning it on doesn't stop to work through your library
+    first."""
+    action = (args.action or "").lower()
+    if action and action not in ("on", "off"):
+        return fail(args.json, "say `levelling`, `levelling on` or "
+                    "`levelling off`", 1)
+    on = levelling()
+    if action:
+        on = action == "on"
+        set_setting("levelling", on)
+        send("levelling")       # take effect in this song, not the next
+    return emit(args.json, {"levelling": on},
+                "levelling " + ("on" if on else "off")) or 0
+
+def cmd_target(args):
+    """Where levelling aims, or a new place to aim it. Like the switch itself,
+    moving it swaps the filter under the song that is playing, so the whole
+    library shifts under you as you move it and nothing is restarted. Nothing
+    is re-measured either - the mean and the peak in the cache are the same two
+    numbers whatever we aim at."""
+    if args.db is None:
+        return emit(args.json, {"target": target()},
+                    "target %g dB" % target()) or 0
+    try:
+        want = round(float(args.db), 1)
+    except ValueError:
+        return fail(args.json, "give a target from %g to %g dB"
+                    % (TARGET_LO, TARGET_HI), 1)
+    if not TARGET_LO <= want <= TARGET_HI:
+        return fail(args.json,
+                    "the target goes from %g to %g dB - full scale is 0, so it "
+                    "is a number below it, and louder than %g leaves too many "
+                    "songs short of it to be level at all"
+                    % (TARGET_LO, TARGET_HI, TARGET_HI), 1)
+    set_setting("target", want)
+    send("levelling")           # re-level where the song stands, as the switch does
+    return emit(args.json, {"target": want}, "target %g dB" % want) or 0
+
+def cmd_volume(args):
+    """Volume, or a new one. Changing it takes effect where the song is: mpv
+    is holding it, so there is nothing to restart and nothing to hear but the
+    volume changing."""
+    if args.level is None:
+        return emit(args.json, {"volume": volume()}, "volume %d" % volume()) or 0
+    try:
+        want = int(args.level)
+    except ValueError:
+        return fail(args.json, "give a volume from 0 to 100", 1)
+    if not 0 <= want <= 100:
+        return fail(args.json, "volume goes from 0 to 100 - 100 is a song at "
+                    "the loudness levelling set it to, and there is no louder", 1)
+    set_setting("volume", want)
+    send("volume")              # nothing playing is nothing to tell
+    return emit(args.json, {"volume": want}, "volume %d" % want) or 0
+
+def cmd_songs(args):
+    lib = library()
+    if not lib:
+        return fail(args.json, "no songs in %s - copy some music in, or choose "
+                    "a different folder with `simplmusik folder set PATH`"
+                    % folder(), 2)
+    return emit(args.json, lib, "\n".join(lib)) or 0
+
+def cmd_list(args):
+    if not args.playlist:
+        pls = playlists()
+        if not pls:
+            return fail(args.json, "no playlists (make one with `simplmusik create NAME`)", 2)
+        return emit(args.json, [p["name"] for p in pls],
+                    "\n".join("%-30s %3d" % (p["name"], len(p["songs"])) for p in pls)) or 0
+    stem = find(args.playlist)
+    if not stem:
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+    songs = songs_of(stem)
+    if not songs:
+        return fail(args.json, "playlist '%s' is empty" % args.playlist, 2)
+    return emit(args.json, [{"file": p["file"], "found": bool(p["path"])} for p in songs],
+                "\n".join(p["file"] + ("" if p["path"] else "   (not found)")
+                          for p in songs)) or 0
+
+def cmd_create(args):
+    stem = os.path.basename(args.name.rstrip("/"))
+    if not stem:
+        return fail(args.json, "give the playlist a name", 1)
+    if find(stem):
+        return fail(args.json, "playlist already exists: %s" % stem, 1)
+    write_meta(stem, {"name": args.name, "songs": []})
+    if args.cover:
+        try:
+            set_cover(stem, args.cover)
+        except (OSError, ValueError) as e:
+            # The playlist is made either way: a picture that wouldn't copy is
+            # no reason to throw away the name you just gave it.
+            return fail(args.json, "created %s, but its cover art didn't: %s"
+                        % (stem, e), 1)
+    return emit(args.json, {"created": stem, "path": playlist_file(stem),
+                            "cover": cover_path(stem)},
+                "created playlist: " + stem) or 0
+
+def cmd_rename(args):
+    """Rename a playlist. Only the name you see changes: the file keeps the
+    stem it was made with, which is what the player, the state file and the
+    window all name a playlist by - so renaming one that is playing can't
+    unhitch it from what is sounding."""
+    stem = find(args.playlist)
+    if not stem:
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+    name = (args.name or "").strip()
+    if not name:
+        return fail(args.json, "give the playlist a name", 1)
+    if "/" in name:
+        return fail(args.json, "a playlist name can't have a '/' in it", 1)
+    other = find(name)
+    if other and other != stem:
+        return fail(args.json, "another playlist is already called '%s'" % name, 1)
+    was = meta(stem).get("name") or stem
+    m = meta(stem)
+    m["name"] = name
+    write_meta(stem, m)
+    return emit(args.json, {"playlist": stem, "was": was, "name": name},
+                "renamed %s to %s" % (was, name)) or 0
+
+def cmd_cover(args):
+    """A playlist's cover art: shown, set from an image, or dropped."""
+    stem = find(args.playlist)
+    if not stem:
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+    if args.clear:
+        had = drop_cover(stem)
+        return emit(args.json, {"playlist": stem, "cover": None},
+                    "cover art removed" if had else "it hadn't any cover art") or 0
+    if not args.image:
+        path = cover_path(stem)
+        if not path:
+            return fail(args.json, "playlist '%s' has no cover art" % stem, 2)
+        return emit(args.json, {"playlist": stem, "cover": path}, path) or 0
+    try:
+        path = set_cover(stem, args.image)
+    except (OSError, ValueError) as e:
+        return fail(args.json, str(e), 1)
+    return emit(args.json, {"playlist": stem, "cover": path},
+                "cover art set: " + path) or 0
+
+def cmd_add(args):
+    """Add songs to a playlist. A name already in the library is just
+    referenced; anything else is a path to import, copied into your music
+    folder first."""
+    stem = find(args.playlist)
+    if not stem:
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+    dest, idx = folder(), index()
+    songs = songs_of(stem)
+    have, added, failed = {p["file"] for p in songs}, [], []
+    for src in args.files:
+        name, path = os.path.basename(src), None
+        if name in idx:
+            path = idx[name]
+            if os.path.isfile(src) and not os.path.samefile(src, path):
+                # One flat namespace: importing over a different song of the
+                # same name would lose it silently, so refuse instead.
+                failed.append("%s (a different song already has that name)" % name)
+                continue
+        else:
+            try:
+                os.makedirs(dest, exist_ok=True)
+                path = os.path.join(dest, name)
+                shutil.copy2(src, path)
+                idx[name] = path
+            except OSError as e:
+                # A bare name that isn't in the library isn't a file to import
+                # either - it's a song that has gone missing since it was listed.
+                failed.append("%s (%s)" % (name, "isn't in your music folder"
+                                           if not os.path.exists(src) else e))
+                continue
+        if name not in have:
+            have.add(name)
+            songs.append({"file": name, "path": path})
+            added.append(name)
+    m = meta(stem)
+    m["songs"] = store(songs)
+    write_meta(stem, m)
+    text = "\n".join(t for t in ("added %d song(s) to %s" % (len(added), stem) if added else "",
+                                 "couldn't add: " + ", ".join(failed) if failed else "") if t)
+    emit(args.json, {"added": added, "failed": failed}, text or "nothing to add")
+    return 0 if added else 1
+
+def cmd_remove(args):
+    """Two removes, told apart by how many names you give. `remove PLAYLIST
+    SONG` only edits that list. `remove SONG` is the library one: it deletes
+    the file, and every list pointing at it goes with it. A song that is only
+    a not-found row - the file is already gone - has nothing to delete, so
+    that one just clears the lists still naming it."""
+    if args.song is None:
+        song = os.path.basename(args.playlist or "")
+        path = index().get(song)
+        holders = [p["file"] for p in playlists()
+                   if any(x["file"] == song for x in p["songs"])]
+        if not path and not holders:
+            return fail(args.json, "no song '%s' in your library (to drop one from "
+                        "a playlist: remove PLAYLIST SONG)" % song, 2)
+        if path:
+            try:
+                os.remove(path)         # the file first: if this fails,
+            except OSError as e:        # nothing has been changed yet
+                return fail(args.json, "couldn't delete %s (%s)" % (song, e), 1)
+        for stem in holders:
+            m = meta(stem)
+            m["songs"] = [e for e in (m.get("songs") or []) if entry(e)[0] != song]
+            write_meta(stem, m)
+        # A song being played as it is deleted stops. mpv holds the file
+        # open and would happily sound a deleted song to the end, which is the
+        # one thing that would make the library and what you hear disagree.
+        # Nothing to move on to either, so the honest answer is nothing playing.
+        st = state()
+        stopped = bool(st and st.get("song") == song)
+        if stopped:
+            stop_player()
+        return emit(args.json, {"deleted": song, "playlists": holders,
+                                "file": bool(path), "stopped": stopped},
+                    "%s %s%s%s" % ("deleted" if path else "dropped missing", song,
+                                   " (was in %s)" % ", ".join(holders)
+                                   if holders else "",
+                                   " - playback stopped" if stopped else "")) or 0
+    stem = find(args.playlist)
+    if not stem:
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+    songs = songs_of(stem)
+    song = os.path.basename(args.song)
+    if not any(p["file"] == song for p in songs):
+        return fail(args.json, "no song '%s' in '%s'" % (song, stem), 2)
+    m = meta(stem)
+    m["songs"] = store([p for p in songs if p["file"] != song])
+    write_meta(stem, m)
+    return emit(args.json, {"removed": song, "playlist": stem},
+                "removed %s from %s (the file stays in your library)" % (song, stem)) or 0
+
+def cmd_delete(args):
+    """Deleting a playlist deletes only the list. Every song in it lives in the
+    library, which isn't touched - so there is nothing here worth confirming."""
+    stem = find(args.playlist)
+    if not stem:
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+    n = len(songs_of(stem))
+    drop_cover(stem)            # its picture is ours, and nothing else's now
+    os.remove(playlist_file(stem))
+    return emit(args.json, {"deleted": stem, "songs_kept": n},
+                "deleted playlist %s (%d song%s still in your library)"
+                % (stem, n, "" if n == 1 else "s")) or 0
+
+def cmd_play(args):
+    st, idx = state(), index()
+    # `--shuffle` throws the one shuffle switch rather than shuffling this
+    # playback only, so it is the same switch the `shuffle` command and the
+    # button in the window throw - and it stays thrown afterwards.
+    if getattr(args, "shuffle", False):
+        set_setting("shuffle", True)
+    shuffle = shuffling()
+    name, song = args.playlist, args.song
+    # A bare song name means the library, starting there - and it means the
+    # library even while a playlist is playing, so `play SONG` never quietly
+    # scopes itself to whatever happened to be on at the time.
+    if name and not song and not find(name) and os.path.basename(name) in idx:
+        name, song = None, name
+    else:
+        name = name or st.get("playlist")
+
+    if name:
+        stem = find(name)
+        if not stem:
+            return fail(args.json, "no playlist '%s'" % name, 2)
+        name, listed = stem, songs_of(stem)
+    else:
+        listed = [{"file": n, "path": idx[n]} for n in sorted(idx)]
+    where = "playlist '%s'" % name if name else "your library"
+    # Only songs we can actually find go in the queue; the not-found ones stay
+    # in the playlist and are simply passed over, the way a gap in a shelf is.
+    songs = [p["file"] for p in listed if p["path"]]
+    paths = {p["file"]: p["path"] for p in listed if p["path"]}
+    if not songs:
+        return fail(args.json, "nothing in %s is in your music folder" % where
+                    if listed else "%s is empty" % where, 2)
+
+    # Shuffled with no song named, the opening song is a draw like every
+    # other one - otherwise a shuffled playlist would always start the same.
+    start = random.choice(songs) if shuffle else songs[0]
+    if song:
+        start = os.path.basename(song)
+        if start not in songs:
+            return fail(args.json,
+                        "'%s' isn't in your music folder" % start
+                        if any(p["file"] == start for p in listed)
+                        else "no song '%s' in %s" % (start, where), 2)
+    if not shutil.which("mpv"):
+        return fail(args.json, "mpv not found - install mpv", 1)
+
+    stop_player()               # never stack two players
+    # `songs` is the pool, `order` is only what has actually been played, so
+    # naming a song starts there and carries on rather than stopping after it.
+    # `paths` is where each one is: worked out once here, so the player never
+    # has to search for a file and the queue can't shift under it mid-song.
+    job = {"playlist": name, "songs": songs, "paths": paths, "order": [start],
+           "index": 0, "song": start, "child": 0, "paused": False,
+           "shuffle": shuffle, "step": 1, "seq": 0}
+    # The queue goes in a file, not on the command line. Linux caps a single
+    # argument at 128 KB, and a library is its own weight in names and paths -
+    # so passing it as an argument made every library past a few hundred songs
+    # fail to play at all. A file has no such ceiling.
+    save_json(JOB, job)
+    job["pid"] = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_player", JOB],
+        start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL).pid
+    save_state(job)             # write it here too, so `status` is right at once
+    return emit(args.json, {"playing": name or "library", "song": start,
+                            "songs": len(songs), "shuffle": shuffle},
+                "playing %s: %s (%d song%s%s)"
+                % (name or "your library", start, len(songs),
+                   "" if len(songs) == 1 else "s", ", shuffled" if shuffle else "")) or 0
+
+def cmd_shuffle(args):
+    """Shuffle on, off, or flipped. It only ever moves the switch: nothing
+    starts playing that wasn't, and anything already playing keeps the song it
+    is on - only what comes after it changes. `play --shuffle` is how you turn
+    it on and start something in the one breath."""
+    action = (args.action or "").lower()
+    if action and action not in ("on", "off"):
+        return fail(args.json, "say `shuffle`, `shuffle on` or `shuffle off`", 1)
+    on = action == "on" if action else not shuffling()
+    set_setting("shuffle", on)
+    send("shuffle", on=on)      # nothing playing is nothing to tell
+    return emit(args.json, {"shuffle": on}, "shuffle " + ("on" if on else "off")) or 0
+
+def cmd_pause(args, want=True):
+    st = state()
+    if not st:
+        return fail(args.json, "nothing playing", 1)
+    if bool(st.get("paused")) != want:
+        os.kill(st["pid"], signal.SIGUSR2)
+    return emit(args.json, {"paused": want, "song": st["song"]},
+                "%s %s" % ("paused" if want else "resumed", st["song"])) or 0
+
+def cmd_move(args, op):
+    st = state()
+    if not st:
+        return fail(args.json, "nothing playing", 1)
+    send(op)
+    now = landed(st)
+    return emit(args.json, {"op": op, "was": st["song"], "now": now},
+                "%s: %s -> %s" % (op, st["song"], now or "end of queue")) or 0
+
+def cmd_seek(args):
+    """Jump within the song that is playing. A relative jump is resolved here,
+    against the state file, so the player is only ever handed one absolute
+    position and needs to know nothing about how it was asked for.
+
+    Seeking past the end isn't clamped: mpv run off the end of a song simply
+    ends it, which moves to the next one - a fair reading of "seek to the
+    end". Callers that do know the length (the UI does) clamp before
+    asking."""
+    st = state()
+    if not st:
+        return fail(args.json, "nothing playing", 1)
+    t = parse_time(args.time)
+    if t is None:
+        return fail(args.json, "give a position like 1:23, 83, +30 or -10", 1)
+    secs, rel = t
+    at = max(0.0, position(st) + secs if rel else secs)
+    if not send("seek", pos=at):
+        return fail(args.json, "nothing playing", 1)
+    return emit(args.json, {"seek": round(at, 1), "song": st["song"]},
+                "%s -> %s" % (st["song"], clock(at))) or 0
+
+def cmd_stop(args):
+    was = stop_player()
+    return emit(args.json, {"stopped": was}, "stopped" if was else "nothing playing") or 0
+
+def cmd_search(args):
+    """Search YouTube for songs. `extract_flat` keeps this to the search page
+    itself - no per-video page is ever fetched - which is the difference
+    between about a second and about ten. `--count` asks for more than the
+    usual handful, which is how the window's 'see more' gets a longer list."""
+    m = ytdlp()
+    if m is None:
+        return fail(args.json, YTDLP_GONE, 1)
+    query = " ".join(args.query).strip()
+    if not query:
+        return fail(args.json, "give me something to search for", 1)
+    n = max(1, min(int(args.count or SEARCH_N), SEARCH_MAX))
+    try:
+        with m.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True,
+                          "skip_download": True, "ignoreerrors": True}) as y:
+            found = y.extract_info("ytsearch%d:%s" % (n, query), download=False)
+    except Exception as e:                  # yt-dlp raises a wide family of these
+        return fail(args.json, "search failed: %s" % e, 1)
+    out = []
+    for e in (found or {}).get("entries") or []:
+        if e and e.get("id"):
+            out.append({"id": e["id"], "title": e.get("title") or e["id"],
+                        "channel": e.get("channel") or e.get("uploader") or "",
+                        "duration": e.get("duration")})
+    if not out:
+        return fail(args.json, "nothing found for '%s'" % query, 2)
+    text = "\n".join("%2d. %-52.52s %7s  %s" % (i + 1, s["title"],
+                                                clock(s["duration"] or 0), s["id"])
+                     for i, s in enumerate(out))
+    return emit(args.json, out, text) or 0
+
+# A download is the one command that takes minutes, so it says how far along
+# it is while it runs. Each download process writes its own small file named
+# after the video, which the UI reads and the process removes when it's done:
+# no shared file for two downloads to race over, and a process killed halfway
+# leaves an entry that readers discard the moment they check its pid.
+
+def dl_report(vid, stage, percent=None):
+    path = os.path.join(DLDIR, vid + ".json")
+    try:
+        os.makedirs(DLDIR, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump({"id": vid, "pid": os.getpid(), "stage": stage,
+                       "percent": percent, "updated": time.time()}, f)
+        os.replace(path + ".tmp", path)     # atomic: no reader sees half a file
+    except OSError:
+        pass                                # progress is a nicety, never fatal
+
+def dl_done(vid):
+    for path in (os.path.join(DLDIR, vid + ".json"),
+                 os.path.join(DLDIR, vid + ".json.tmp")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def dl_fail(vid, why=""):
+    """Leave a failure where the UI can find it.
+
+    `dl_done` clears the progress file when a fetch is over, which would make
+    one that died look exactly like one nobody ever asked for - and a stream
+    whose download failed would then sit in the library looking as though it
+    were still on its way. This entry names no live pid on purpose: the reader
+    keeps a failed one rather than tidying it away with the abandoned ones,
+    and asking for the song again is what clears it."""
+    path = os.path.join(DLDIR, vid + ".json")
+    try:
+        os.makedirs(DLDIR, exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump({"id": vid, "pid": 0, "stage": "failed",
+                       "error": str(why)[:200], "updated": time.time()}, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+def dl_live(vid):
+    """Whether a fetch for this song is already running.
+
+    Asking to stream something that is already coming down is an ordinary
+    thing to do - you clicked download, then decided not to wait - and two
+    fetches would pull the same file twice and race each other to move it into
+    place. A failed entry names no live process and is not one of these."""
+    try:
+        with open(os.path.join(DLDIR, vid + ".json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if d.get("stage") == "failed":
+        return False
+    try:
+        os.kill(int(d.get("pid") or 0), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+def dl_opts(dest):
+    """The options a download runs under.
+
+    Shared by the fetch and by the resolve that works out what its file will
+    be called, because the name is only right if both ask the same question:
+    `prepare_filename` answers for the template it is given, so a resolve
+    under different options would name a file the download never writes."""
+    return {"quiet": True, "no_warnings": True, "noprogress": True,
+            "format": "bestaudio/best", "writethumbnail": True,
+            "outtmpl": {"default": os.path.join(dest, "%(title)s.%(ext)s")},
+            "postprocessors": [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                 "preferredquality": "0"},
+                {"key": "FFmpegMetadata"},
+                {"key": "EmbedThumbnail"}]}
+
+def dl_hook(vid):
+    """yt-dlp's progress callback, thinned to a few writes a second - it fires
+    per chunk, and nothing reads this faster than twice a second anyway.
+
+    Only the fetch has a percentage. The re-encode that follows is ffmpeg
+    working through a file with no total to measure against, so it is reported
+    as its own stage rather than a number invented to fill the gap."""
+    last = [0.0]
+    def hook(d):
+        status = d.get("status")
+        if status == "downloading":
+            now = time.time()
+            if now - last[0] < 0.25:
+                return
+            last[0] = now
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            got = d.get("downloaded_bytes") or 0
+            dl_report(vid, "downloading",
+                      round(min(100.0, 100.0 * got / total), 1) if total else None)
+        elif status == "finished":
+            last[0] = 0.0                   # the next file starts its own clock
+            dl_report(vid, "converting")
+    return hook
+
+def cmd_download(args):
+    """Download a search result into the library. The library is one flat
+    folder, so the file lands beside every other song and joins no playlist -
+    `add` is still the only thing that puts a song in one."""
+    m = ytdlp()
+    if m is None:
+        return fail(args.json, YTDLP_GONE, 1)
+    if m.version.__version__ < YTDLP_MIN:
+        return fail(args.json, "yt-dlp %s is too old to download from YouTube - "
+                    "update it with `pip install --user -U yt-dlp`"
+                    % m.version.__version__, 1)
+    if not shutil.which("ffmpeg"):
+        return fail(args.json, "ffmpeg isn't installed - it's what writes the mp3", 1)
+    vid = video_id(args.id)
+    if not vid:
+        return fail(args.json, "not a YouTube video id or link: %s" % args.id, 1)
+    dest = folder()             # new songs land in your music folder
+
+    # Played a moment ago? Then the song is already on the disk and this is a
+    # rename, with no network in it at all - which is the whole reason playing
+    # one fills the cache behind it. And if the cache is still filling, waiting
+    # for that beats pulling the same song down a second time alongside it.
+    ready = cached_ready(vid)
+    if not ready and dl_live(vid):
+        waited = 0.0
+        while dl_live(vid) and not cached_ready(vid) and waited < CACHE_WAIT:
+            time.sleep(0.25)
+            waited += 0.25
+        ready = cached_ready(vid)
+    if ready:
+        if ready in index():    # it arrived by some other route in the meantime
+            try:
+                os.remove(os.path.join(cache_dir(), ready))
+                os.remove(os.path.join(cache_dir(), vid + ".json"))
+            except OSError:
+                pass
+            return emit(args.json, {"song": ready, "id": vid, "downloaded": False},
+                        "already in the library: " + ready) or 0
+        promote(vid, ready)
+        return emit(args.json, {"song": ready, "id": vid, "downloaded": True,
+                                "cached": True}, "added " + ready) or 0
+
+    url = "https://www.youtube.com/watch?v=" + vid
+    # Audio only, re-encoded to mp3 to match the rest of the library, with the
+    # tags and the thumbnail written into the file - which is exactly where the
+    # UI reads a song's title, artist and cover art from.
+    opts = dict(dl_opts(dest), progress_hooks=[dl_hook(vid)])
+    os.makedirs(dest, exist_ok=True)
+    dl_report(vid, "starting")
+    try:
+        with m.YoutubeDL(opts) as y:
+            info = y.extract_info(url, download=False)
+            # What the file will be called once it is an mp3. Knowing that
+            # before fetching anything is what lets a song already in the
+            # library cost a second instead of a minute.
+            song = os.path.basename(os.path.splitext(y.prepare_filename(info))[0]) + ".mp3"
+            if song in index():
+                return emit(args.json, {"song": song, "id": vid, "downloaded": False},
+                            "already in the library: " + song) or 0
+            # Fetch what we just looked up rather than looking it up again.
+            # Asking YouTube a second time costs as much as the first ask did
+            # - about a second and a half of the eleven this used to take -
+            # and it can only ever answer with what we are already holding.
+            y.process_ie_result(dict(info), download=True)
+    except Exception as e:
+        return fail(args.json, "download failed: %s" % e, 1)
+    finally:
+        dl_done(vid)            # nothing is running now, whichever way we left
+    if not os.path.isfile(os.path.join(dest, song)):
+        return fail(args.json, "download finished but %s isn't there" % song, 1)
+    return emit(args.json, {"song": song, "id": vid, "downloaded": True},
+                "downloaded " + song) or 0
+
+
+# ------------------------------------------------------------------ streaming
+# Downloading a song takes about eleven seconds, and nearly all of it is ffmpeg
+# re-encoding a file that has already landed. None of that has to happen before
+# you hear anything: YouTube serves the audio at a URL, and mpv is handed a URL
+# exactly the way it is handed a path. So `stream` plays from that URL now and
+# fetches the song in the background, and the only wait left is the one ask
+# YouTube cannot be talked out of - about a second and a half to look the song
+# up. What comes down goes into the cache folder and moves into the library
+# once it is whole, so the next time you play it there is no wait at all.
+
+def resolved_get(vid):
+    """A lookup from a moment ago, or None if there is none worth trusting."""
+    try:
+        with open(os.path.join(RESOLVED, vid + ".json")) as f:
+            got = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not got.get("url") or time.time() - (got.get("at") or 0) > RESOLVE_TTL:
+        return None
+    return got
+
+def resolved_put(vid, url, song):
+    """Keep a lookup for a little while.
+
+    In this machine's own state folder, and not in your music folder with the
+    songs and the playlists. A stream URL is tied to the address that asked
+    for it and goes stale within hours, so it is the one thing here that must
+    not be carried to another machine along with the music."""
+    if not url:
+        return
+    try:
+        os.makedirs(RESOLVED, exist_ok=True)
+        path = os.path.join(RESOLVED, vid + ".json")
+        with open(path + ".tmp", "w") as f:
+            json.dump({"id": vid, "url": url, "song": song, "at": time.time()}, f)
+        os.replace(path + ".tmp", path)     # atomic: no reader sees half a file
+        sweep_resolved()
+    except OSError:
+        pass
+
+def sweep_resolved():
+    """Drop lookups nothing could use any more. They are small and few, so
+    this rides along on writing one rather than needing a moment of its own."""
+    now = time.time()
+    try:
+        for n in os.listdir(RESOLVED):
+            f = os.path.join(RESOLVED, n)
+            try:
+                if now - os.path.getmtime(f) > RESOLVE_TTL:
+                    os.remove(f)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+def resolve(vid):
+    """Look a song up: where to stream it from, and what its file will be
+    called when it lands.
+
+    Both answers come out of the same extraction on purpose. The name is
+    `prepare_filename` reading the template it was given, so it is only the
+    name the download will really write if the two ask under the same
+    options - which is what `dl_opts` is for.
+
+    A lookup made a moment ago is used again rather than made again, and that
+    is the whole of what makes a streamed song start at once rather than a
+    second and a half later: the window has the server look the first result
+    up while you are still reading the list, so by the time you press play
+    there is nothing left to ask anybody."""
+    got = resolved_get(vid)
+    if got:
+        return None, got["url"], got["song"]
+    m = ytdlp()
+    opts = dict(dl_opts(folder()))
+    opts["skip_download"] = True
+    with m.YoutubeDL(opts) as y:
+        info = y.extract_info("https://www.youtube.com/watch?v=" + vid,
+                              download=False)
+        song = os.path.basename(os.path.splitext(y.prepare_filename(info))[0]) + ".mp3"
+    resolved_put(vid, info.get("url"), song)
+    return info, info.get("url"), song
+
+def fetch(vid, song):
+    """The detached process that fills the cache behind a song being played.
+
+    Nobody asked for this download, so it says nothing while it runs: playing
+    a song is playing a song, and a progress ring on a row you only wanted to
+    hear would be reporting work you never asked to wait for. It writes into
+    the cache and stops there. Moving it into the library is `download`'s job,
+    and by then there is nothing left to fetch - which is the point of it.
+
+    The stage it reports is one the UI passes over. It is written all the same,
+    so that `download` can tell a song already on its way from one nobody has
+    started, and wait for it instead of pulling the same bytes twice."""
+    m = ytdlp()
+    if m is None:
+        return 1
+    cache = cache_dir()
+    if os.path.isfile(os.path.join(folder(), song)):
+        dl_done(vid)            # already a library song: nothing worth caching
+        return 0
+    got = os.path.join(cache, song)
+    dl_report(vid, "caching")
+    try:
+        os.makedirs(cache, exist_ok=True)
+        with m.YoutubeDL(dl_opts(cache)) as y:
+            info = y.extract_info("https://www.youtube.com/watch?v=" + vid,
+                                  download=False)
+            y.process_ie_result(dict(info), download=True)
+        if not os.path.isfile(got):
+            raise OSError("the fetch finished but %s isn't there" % song)
+        # The name is written beside the file because working it out again
+        # means asking YouTube, and a cache you have to make a network call to
+        # use is not the thing that makes `download` quick.
+        with open(os.path.join(cache, vid + ".json"), "w") as f:
+            json.dump({"song": song, "cached": time.time()}, f)
+    except Exception:
+        # Silent in, silent out. Nobody is waiting on this, and a song that
+        # failed to cache simply costs a download later, the way it always did.
+        for junk in (got, os.path.join(cache, vid + ".json")):
+            try:
+                os.remove(junk)
+            except OSError:
+                pass
+        dl_done(vid)
+        return 1
+    dl_done(vid)
+    return 0
+
+def cached_ready(vid):
+    """The song this video is cached as, if a whole copy is sitting there
+    waiting to be claimed. None while it is still coming down: the name is
+    only written once the file is complete, so a half-fetched song can never
+    be mistaken for one ready to move."""
+    try:
+        with open(os.path.join(cache_dir(), vid + ".json")) as f:
+            song = json.load(f).get("song")
+    except (OSError, ValueError):
+        return None
+    return song if song and os.path.isfile(os.path.join(cache_dir(), song)) else None
+
+def promote(vid, song):
+    """Move a cached song into the library.
+
+    A rename on one filesystem - the cache is inside your music folder for
+    exactly this - so the song is in the cache or in the library and never
+    halfway between either. The note naming it goes too: the file it pointed
+    at has left, and a note pointing at nothing would have `download` offer a
+    song it can no longer produce."""
+    dest = folder()
+    os.makedirs(dest, exist_ok=True)
+    final = os.path.join(dest, song)
+    os.replace(os.path.join(cache_dir(), song), final)
+    try:
+        os.remove(os.path.join(cache_dir(), vid + ".json"))
+    except OSError:
+        pass
+    return final
+
+def cmd_stream(args):
+    """Play a search result now, and fetch it while it plays.
+
+    A song already in the library is played from the disk instead - the stream
+    would be slower and worse, and there is nothing left to download."""
+    m = ytdlp()
+    if m is None:
+        return fail(args.json, YTDLP_GONE, 1)
+    if m.version.__version__ < YTDLP_MIN:
+        return fail(args.json, "yt-dlp %s is too old to stream from YouTube - "
+                    "update it with `pip install --user -U yt-dlp`"
+                    % m.version.__version__, 1)
+    if not shutil.which("mpv"):
+        return fail(args.json, "mpv not found - install mpv", 1)
+    vid = video_id(args.id)
+    if not vid:
+        return fail(args.json, "not a YouTube video id or link: %s" % args.id, 1)
+    sweep_cache()
+    running = dl_live(vid)      # already coming down: stream it, don't re-fetch
+    if not running:
+        dl_done(vid)            # asking again clears what last time left behind
+    try:
+        info, url, song = resolve(vid)
+    except Exception as e:      # yt-dlp raises a wide family of these
+        return fail(args.json, "couldn't start that song: %s" % e, 1)
+    if not url:
+        return fail(args.json, "no audio stream for that song", 2)
+
+    # Three places the song might already be, in the order worth trying: the
+    # library, then the cache from having played it before, then YouTube. Only
+    # the last of them is a stream, and only the last is worth caching.
+    source = index().get(song)
+    if not source and cached_ready(vid) == song:
+        source = os.path.join(cache_dir(), song)
+    live = not source               # nothing local: play it off the network
+    if live:
+        source = url
+    if live and not running:
+        if not shutil.which("ffmpeg"):
+            return fail(args.json, "ffmpeg isn't installed - it's what writes the mp3", 1)
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_fetch", vid, song],
+            start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+
+    stop_player()               # never stack two players
+    # One song, and the queue is the same shape `play` builds - the player
+    # loop can't tell this job from any other, and doesn't need to.
+    job = {"playlist": None, "songs": [song], "paths": {song: source},
+           "order": [song], "index": 0, "song": song, "child": 0,
+           "paused": False, "shuffle": False, "step": 1, "seq": 0,
+           "vid": vid}        # what to look for in the cache, if it lands
+    save_json(JOB, job)
+    job["pid"] = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_player", JOB],
+        start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL).pid
+    save_state(job)
+    return emit(args.json, {"song": song, "id": vid, "streaming": live},
+                ("streaming " if live else "playing ") + song) or 0
+
+# ---------------------------------------------------------------------- main
+# name: (help, positional args, optional flag). "?" = optional, "+" = one or more.
+
+COMMANDS = [
+    ("status",  "library + playback summary",                     "",                None),
+    ("folder",  "show your music folder, or choose another",      "action? path?",   None),
+    ("songs",   "list every song in the library",                 "",                None),
+    ("list",    "list playlists, or the songs in one",            "playlist?",       None),
+    ("create",  "make a new, empty playlist",                     "name",            "cover"),
+    ("rename",  "give a playlist a different name",               "playlist name",   None),
+    ("cover",   "show, set or clear a playlist's cover art",      "playlist image?", "clear"),
+    ("add",     "add songs to a playlist, importing new ones",    "playlist files+", None),
+    ("search",  "search YouTube for songs",                       "query+",          "count"),
+    ("download","download a search result into the library",      "id",              None),
+    ("stream",  "play a search result now, and fetch it as it plays", "id",          None),
+    ("remove",  "drop a song from a playlist, or delete it",      "playlist song?",  None),
+    ("delete",  "delete a playlist (its songs stay)",             "playlist",        None),
+    ("play",    "play a playlist, one song, or the library",      "playlist? song?", "shuffle"),
+    ("shuffle", "play in a random order, until you turn it off",   "action?",         None),
+    ("levelling","play every song at one loudness",               "action?",         None),
+    ("target",  "the loudness levelling aims for, in dB",          "db?",             None),
+    ("volume",  "how loud, 0-100 (100 is as levelled)",            "level?",          None),
+    ("pause",   "pause playback",                                 "",                None),
+    ("resume",  "resume playback",                                "",                None),
+    ("skip",    "skip to the next song",                          "",                None),
+    ("back",    "go back to the previous song",                   "",                None),
+    ("seek",    "jump within the song (1:23, 83, +30, -10)",      "time",            None),
+    ("stop",    "stop playback",                                  "",                None),
+    ("help",    "show this help, or help for one command",        "topic?",          None),
+]
+
+CMDS = {"status": cmd_status, "songs": cmd_songs, "list": cmd_list,
+        "folder": cmd_folder, "levelling": cmd_levelling, "volume": cmd_volume,
+        "target": cmd_target,
+        "create": cmd_create, "add": cmd_add, "remove": cmd_remove,
+        "rename": cmd_rename, "cover": cmd_cover,
+        "search": cmd_search, "download": cmd_download, "stream": cmd_stream,
+        "delete": cmd_delete, "play": cmd_play, "shuffle": cmd_shuffle,
+        "seek": cmd_seek, "stop": cmd_stop, "pause": cmd_pause,
+        "resume": lambda args: cmd_pause(args, want=False),
+        "skip": lambda args: cmd_move(args, "skip"),
+        "back": lambda args: cmd_move(args, "back")}
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_player"]:         # internal: the detached player process
+        job = load_json(argv[1], None)  # cmd_play left this for us, and for no
+        try:                            # one else, so it goes as soon as it is
+            os.remove(argv[1])          # read - nothing stale is left behind
+        except OSError:
+            pass
+        if not job:                 # no queue to run: nothing to play
+            return 1
+        return player(job) or 0
+    if argv[:1] == ["_fetch"]:          # internal: the detached download that
+        return fetch(argv[1], argv[2])  # runs behind a song being streamed
+    migrate()                           # playlists moved folder once, long ago
+    ap = argparse.ArgumentParser(prog="simplmusik", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name, help_, positional, flag in COMMANDS:
+        p = sub.add_parser(name, help=help_)
+        for spec in positional.split():
+            p.add_argument(spec.rstrip("?+"),
+                           nargs={"?": "?", "+": "+"}.get(spec[-1]))
+        if flag == "cover":
+            p.add_argument("--cover", help="an image to use as its cover art")
+        elif flag == "clear":
+            p.add_argument("--clear", action="store_true",
+                           help="take the cover art off again")
+        elif flag == "shuffle":
+            p.add_argument("--shuffle", action="store_true",
+                           help="turn shuffle on, and play shuffled")
+        elif flag == "count":
+            p.add_argument("--count", type=int, default=SEARCH_N,
+                           help="how many results to bring back (up to %d)" % SEARCH_MAX)
+
+    args = ap.parse_args(argv)
+    if args.cmd == "help":
+        if not args.topic:
+            return ap.print_help() or 0
+        if args.topic not in sub.choices:
+            print("no such command: " + args.topic, file=sys.stderr)
+            return 1
+        return sub.choices[args.topic].print_help() or 0
+    return CMDS[args.cmd](args)
+
+if __name__ == "__main__":
+    sys.exit(main())

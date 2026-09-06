@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Launch simplmusik as a desktop window.
+
+Starts the backend on a free loopback port and shows it in a WebKit window,
+so it behaves like an app rather than a browser tab. Launching it a second
+time - from the menu, say - raises the window that's already open instead of
+starting a second copy. With --browser (or if WebKit isn't installed) it just
+serves and opens your default browser.
+
+Light or dark isn't decided here: the desktop's own preference is read and
+handed to the page, and the page hands back whichever palette it ended up
+wearing - your choice in Settings, when you have made one - so the titlebar and
+the window behind the page never disagree with it.
+"""
+
+import os, socket, sys, threading, webbrowser
+import server
+
+APP_ID = "org.simplmusik.Player"
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+def start_backend():
+    """Serve on a port nobody else is using, and hand back its URL."""
+    port = free_port()
+    httpd = server.serve(port)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, "http://127.0.0.1:%d/" % port
+
+def message_text(result):
+    """The body of a postMessage from the page. Older WebKit hands over a
+    JSValue and newer ones the value itself, so accept either."""
+    value = result.get_js_value() if hasattr(result, "get_js_value") else result
+    return value.to_string()
+
+def main():
+    if "--browser" not in sys.argv:
+        try:
+            return app_window()
+        except (ImportError, ValueError):
+            print("WebKit not available - opening in your browser instead")
+
+    httpd, url = start_backend()
+    print("simplmusik ui on " + url)
+    webbrowser.open(url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+# The setting every desktop agrees on, asked for through the portal: 0 is no
+# preference, 1 prefer dark, 2 prefer light.
+PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/Desktop",
+          "org.freedesktop.portal.Settings")
+APPEARANCE = ("org.freedesktop.appearance", "color-scheme")
+
+# What the window paints behind the page until the page has painted itself:
+# the two --bg colours out of style.css, so there is no flash of the palette
+# you didn't ask for.
+BACKDROP = {True: (0.125, 0.125, 0.137), False: (0.984, 0.984, 0.984)}
+
+def portal_settings(Gio):
+    """The portal's Settings interface, or None where nothing answers - a
+    session with no portal running is normal, not an error. A proxy is handed
+    out for a name nobody owns as happily as for one somebody does, so the
+    owner is what is checked rather than the proxy."""
+    try:
+        proxy = Gio.DBusProxy.new_for_bus_sync(
+            Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+            PORTAL[0], PORTAL[1], PORTAL[2], None)
+        return proxy if proxy.get_name_owner() else None
+    except Exception:
+        return None
+
+def portal_dark(proxy, Gio, GLib):
+    """Whether the desktop asks for dark, or None if it says nothing. ReadOne
+    is the current call and Read the one older portals answer, so try both
+    before giving up on the portal entirely."""
+    if proxy is None:
+        return None
+    for method in ("ReadOne", "Read"):
+        try:
+            r = proxy.call_sync(method, GLib.Variant("(ss)", APPEARANCE),
+                                Gio.DBusCallFlags.NONE, 400, None)
+        except Exception:
+            continue
+        scheme = r.unpack()[0]
+        if scheme == 1:
+            return True
+        if scheme == 2:
+            return False
+        return None            # 0: the desktop has no preference either way
+    return None
+
+def theme_dark(Gtk):
+    """The fallback for a desktop with no portal: Mint names its dark themes
+    with the word in them, so the name of the theme in force is the answer.
+    The prefer-dark flag is no use here - past the first read it is ours, set
+    by the window itself."""
+    name = Gtk.Settings.get_default().get_property("gtk-theme-name") or ""
+    return "dark" in name.lower()
+
+def app_window():
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("WebKit2", "4.1")
+    from gi.repository import Gtk, WebKit2, Gdk, Gio, GLib
+
+    app = Gtk.Application(application_id=APP_ID,
+                          flags=Gio.ApplicationFlags.FLAGS_NONE)
+
+    def activate(_app):
+        # Only the first instance gets here; a later launch just re-presents
+        # this window, which is what you want from a menu entry.
+        if app.get_windows():
+            win = app.get_windows()[0]
+            win.deiconify()          # launching it again should restore it,
+            win.present()            # not leave it minimised in the tray
+            return
+
+        # Names the window for the desktop so the launcher's StartupWMClass
+        # matches and the panel groups it under the right icon. It has to
+        # happen here: Gtk.Application overwrites prgname during run(), and
+        # WM_CLASS is only read when the window is realised.
+        GLib.set_prgname("simplmusik")
+        Gdk.set_program_class("simplmusik")
+
+        _httpd, url = start_backend()
+
+        win = Gtk.ApplicationWindow(application=app, title="simplmusik")
+        win.set_default_size(1080, 720)
+        win.set_size_request(720, 480)
+        win.set_icon_name("simplmusik")            # the installed icon
+        try:                                        # ...or the file, uninstalled
+            if not Gtk.IconTheme.get_default().has_icon("simplmusik"):
+                win.set_icon_from_file(os.path.join(server.WEB, "favicon.png"))
+        except Exception:
+            pass
+
+        # The page talks back through this, so it is made here and handed to
+        # the view: a view left to make its own has none to register on.
+        content = WebKit2.UserContentManager()
+        view = WebKit2.WebView(user_content_manager=content)
+
+        def wear(dark):
+            """Put the window in one palette or the other: the decoration
+            through GTK, and the space behind the page - which is what shows
+            while it loads - to match."""
+            Gtk.Settings.get_default().set_property(
+                "gtk-application-prefer-dark-theme", dark)
+            view.set_background_color(Gdk.RGBA(*BACKDROP[dark], 1.0))
+
+        # Seed it from the desktop before anything loads. WebKit reads this
+        # same GTK setting to answer prefers-color-scheme, so this is also how
+        # the page comes to know what the desktop wants. The flag is read
+        # before wear() ever writes it: after that it says what this window
+        # asked for, not what the desktop did.
+        was_dark = Gtk.Settings.get_default().get_property(
+            "gtk-application-prefer-dark-theme")
+        portal = portal_settings(Gio)
+
+        def desktop_dark():
+            asked = portal_dark(portal, Gio, GLib)
+            return theme_dark(Gtk) if asked is None else asked
+
+        asked = portal_dark(portal, Gio, GLib)
+        if asked is None:                  # nobody asked, so take the hints:
+            asked = theme_dark(Gtk) or bool(was_dark)   # the theme, then GTK's
+        wear(asked)
+
+        # A desktop that turns dark in the evening should take the window with
+        # it while it is open. Setting GTK's flag moves WebKit's media query,
+        # so the page hears about it too and repaints itself. Both ways in are
+        # watched: the portal where there is one, and the theme itself, which
+        # is how a desktop with no portal says the same thing.
+        def portal_changed(_proxy, _sender, signal, params):
+            if signal != "SettingChanged":
+                return
+            namespace, key, value = params.unpack()
+            if (namespace, key) == APPEARANCE and value in (1, 2):
+                wear(value == 1)
+        if portal is not None:
+            portal.connect("g-signal", portal_changed)
+        Gtk.Settings.get_default().connect(
+            "notify::gtk-theme-name", lambda *_a: wear(desktop_dark()))
+
+        # ...and the page has the last word, because the choice in Settings is
+        # made there: it posts the palette it settled on, whether that was the
+        # desktop's answer or your own, and the frame around it follows.
+        content.connect(
+            "script-message-received::theme",
+            lambda _cm, result: wear(message_text(result) == "dark"))
+        content.register_script_message_handler("theme")
+
+        view.load_uri(url)
+        win.add(view)
+        win.show_all()
+
+    app.connect("activate", activate)
+    app.run([])           # our own flags are handled above, not by GTK
+
+if __name__ == "__main__":
+    main()

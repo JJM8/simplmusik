@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simplmusik</title>
+<link rel="icon" href="/favicon.png">
+<link rel="stylesheet" href="/style.css">
+<!-- Which palette to wear, decided before the first paint rather than after
+     app.js loads - a window that starts in the wrong one and corrects itself
+     is a flash you can see. Your choice is kept here in the browser, since it
+     is about this window and not about your library; with no choice made, or
+     with 'system' chosen, the desktop's own decision is the one that counts.
+     app.js keeps this in step from here on (see 'theme'). -->
+<script>
+(function () {
+  var pick;
+  try { pick = localStorage.getItem('simplmusik.theme'); } catch (e) {}
+  if (pick !== 'light' && pick !== 'dark')
+    pick = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  document.documentElement.dataset.theme = pick;
+})();
+</script>
+</head>
+<body>
+
+<!-- icons, defined once and referenced with <use> -->
+<svg style="display:none">
+  <symbol id="i-play" viewBox="0 0 16 16"><path fill="currentColor" d="M4.5 2.6v10.8c0 .5.5.8 1 .6l8.2-5.4c.4-.3.4-.9 0-1.2L5.5 2c-.5-.3-1 0-1 .6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 16 16"><path fill="currentColor" d="M4 2.5h3v11H4zM9 2.5h3v11H9z"/></symbol>
+  <symbol id="i-skip" viewBox="0 0 16 16"><path fill="currentColor" d="M3 3.2v9.6c0 .5.5.8.9.5l6.4-4.8c.3-.2.3-.7 0-.9L3.9 2.7c-.4-.3-.9 0-.9.5zM11.8 2.5h1.7v11h-1.7z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 16 16"><path fill="currentColor" d="M13 3.2v9.6c0 .5-.5.8-.9.5L5.7 8.5c-.3-.2-.3-.7 0-.9l6.4-4.9c.4-.3.9 0 .9.5zM2.5 2.5h1.7v11H2.5z"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M2.6 4.2h10.8M6.4 4.2V2.8h3.2v1.4M4 4.2l.6 8.4c0 .5.5.9 1 .9h4.8c.5 0 1-.4 1-.9l.6-8.4"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><rect fill="currentColor" x="3.2" y="3.2" width="9.6" height="9.6" rx="1.4"/></symbol>
+  <symbol id="i-shuffle" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M1.8 3.6h2.6c.9 0 1.7.4 2.2 1.2l2.8 4.4c.5.8 1.3 1.2 2.2 1.2h2.6M1.8 12.4h2.6c.9 0 1.7-.4 2.2-1.2l.7-1.1M9.4 6l.2-.4c.5-.8 1.3-1.2 2.2-1.2h2.4"/><path fill="currentColor" d="M12.6 2.2 15.4 4.4l-2.8 2.2zM12.6 8.2l2.8 2.2-2.8 2.2z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M7 1.9a5.1 5.1 0 1 0 0 10.2A5.1 5.1 0 0 0 7 1.9zM10.8 10.8l3.3 3.3"/></symbol>
+  <symbol id="i-list" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M2.2 4h11.6M2.2 8h11.6M2.2 12h7"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M8 3.2v9.6M3.2 8h9.6"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M3.2 8h9.6"/></symbol>
+  <symbol id="i-dl" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M8 2.6v7.6M4.9 7.3 8 10.4l3.1-3.1M3 13.2h10"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M3.4 8.5 6.5 11.6l6.1-7"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.4" d="M8 10.1a2.1 2.1 0 1 0 0-4.2 2.1 2.1 0 0 0 0 4.2z"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" d="M12.9 8c0-.4 0-.7-.1-1.1l1.3-1-1.4-2.4-1.5.6a4.9 4.9 0 0 0-1.9-1.1l-.2-1.6H6.9l-.2 1.6c-.7.2-1.3.6-1.9 1.1l-1.5-.6-1.4 2.4 1.3 1a5.7 5.7 0 0 0 0 2.2l-1.3 1 1.4 2.4 1.5-.6c.6.5 1.2.9 1.9 1.1l.2 1.6h2.2l.2-1.6c.7-.2 1.3-.6 1.9-1.1l1.5.6 1.4-2.4-1.3-1c.1-.4.1-.7.1-1.1z"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" d="M1.9 12.6V3.9c0-.3.2-.5.5-.5h3.3l1.4 1.7h6.5c.3 0 .5.2.5.5v7c0 .3-.2.5-.5.5H2.4a.5.5 0 0 1-.5-.5z"/></symbol>
+  <symbol id="i-pen" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M11.3 1.9 14.1 4.7 5.5 13.3l-3.5.7.7-3.5zM9.6 3.6l2.8 2.8"/></symbol>
+  <symbol id="i-vol" viewBox="0 0 16 16"><path fill="currentColor" d="M7.4 2.2 4.2 5H2.3a.9.9 0 0 0-.9.9v4.2a.9.9 0 0 0 .9.9h1.9l3.2 2.8a.6.6 0 0 0 1-.45V2.65a.6.6 0 0 0-1-.45z"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M10.6 6.1a2.6 2.6 0 0 1 0 3.8"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M12.7 4.1a5.5 5.5 0 0 1 0 7.8"/></symbol>
+  <symbol id="i-vol-off" viewBox="0 0 16 16"><path fill="currentColor" d="M7.4 2.2 4.2 5H2.3a.9.9 0 0 0-.9.9v4.2a.9.9 0 0 0 .9.9h1.9l3.2 2.8a.6.6 0 0 0 1-.45V2.65a.6.6 0 0 0-1-.45z"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M10.8 6.2l3.4 3.6M14.2 6.2l-3.4 3.6"/></symbol>
+  <symbol id="i-note" viewBox="0 0 16 16"><path fill="currentColor" d="M13 1.6 5.6 3.3v7.4a2.4 2.4 0 1 0 1.2 2V6.1l5-1.2v4.5a2.4 2.4 0 1 0 1.2 2z"/></symbol>
+</svg>
+
+<div id="app">
+
+  <aside id="sidebar">
+    <div class="brand"><span class="mark"></span>simplmusik</div>
+
+    <nav id="lib-nav"></nav>
+
+    <div class="section">Playlists</div>
+    <nav id="playlists"></nav>
+
+    <div class="side-foot">
+      <button class="linkbtn" id="new-pl">
+        <svg class="ico" width="15" height="15"><use href="#i-plus"/></svg> New playlist
+      </button>
+      <button class="linkbtn" id="settings-btn">
+        <svg class="ico" width="15" height="15"><use href="#i-gear"/></svg> Settings
+      </button>
+    </div>
+  </aside>
+
+  <main id="main">
+    <div id="topbar">
+      <label class="search">
+        <svg><use href="#i-search"/></svg>
+        <input id="q" type="text" placeholder="Search music" autocomplete="off" spellcheck="false">
+        <button class="clear" id="clear-q" hidden>&times;</button>
+      </label>
+
+      <div id="vol" title="Volume">
+        <svg id="vol-icon"><use href="#i-vol"/></svg>
+        <div class="vol-bar" id="vol-bar" role="slider" tabindex="0"
+             aria-label="Volume" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="100"><div class="fill" id="vol-fill"></div></div>
+      </div>
+    </div>
+
+    <header id="head"></header>
+    <div id="list"></div>
+  </main>
+
+  <footer id="player">
+    <div id="now">
+      <div class="art" id="now-art"></div>
+      <div class="txt">
+        <div class="title" id="now-title">Nothing playing</div>
+        <div class="artist" id="now-artist">Pick a song to start</div>
+      </div>
+    </div>
+
+    <div id="controls">
+      <button class="ctl" id="c-shuffle" title="Shuffle: off (s)"><svg><use href="#i-shuffle"/></svg></button>
+      <button class="ctl" id="c-back" title="Previous track (p)"><svg><use href="#i-back"/></svg></button>
+      <button class="ctl big" id="c-play" title="Play / pause (Space)"><svg><use href="#i-play"/></svg></button>
+      <button class="ctl" id="c-skip" title="Next track"><svg><use href="#i-skip"/></svg></button>
+      <button class="ctl" id="c-stop" title="Stop"><svg><use href="#i-stop"/></svg></button>
+    </div>
+
+    <div id="prog">
+      <span class="time" id="t-now">0:00</span>
+      <div class="track-bar" id="t-bar" title="Click to seek"><div class="fill" id="t-fill"></div></div>
+      <span class="time r" id="t-end">0:00</span>
+    </div>
+  </footer>
+</div>
+
+<dialog id="dlg">
+  <h2>New playlist</h2>
+  <input type="text" id="dlg-name" placeholder="Playlist name" autocomplete="off">
+  <div class="row">
+    <button class="btn" id="dlg-cancel">Cancel</button>
+    <button class="btn primary" id="dlg-ok">Create</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-del">
+  <h2 id="del-title">Delete playlist?</h2>
+  <p id="del-msg"></p>
+  <div class="row">
+    <button class="btn" id="del-cancel">Cancel</button>
+    <button class="btn danger" id="del-ok">Delete</button>
+  </div>
+</dialog>
+
+<!-- One picker, used by whichever playlist's cover art is being changed. -->
+<input type="file" id="cover-file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
