@@ -20,6 +20,10 @@ A local music player. Written in Python, native to Linux.
 
 ![The library](screenshots/library.png)
 
+Playlists sit beside it, with whatever's playing along the bottom.
+
+![A playlist](screenshots/playlist.png)
+
 Search for something you haven't got and it offers to pull it down into the
 playlist you're looking at.
 
