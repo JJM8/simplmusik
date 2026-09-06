@@ -1,0 +1,191 @@
+# simplmusik as a flatpak - the build that doesn't care which distro you run.
+#
+# The GNOME runtime already carries most of what this app needs: GTK 3, the
+# WebKit 4.1 the window asks for by name, Python 3.13, and ffmpeg and ffprobe,
+# which is what writes the mp3s. Two things it has no answer for, so they are
+# built here: mpv, which is the whole player, and mutagen, which reads the
+# titles and cover art off your files.
+#
+# mpv is built audio-only. It is driven over a socket and started --no-video,
+# so every video output, and the GPU and windowing stacks under them, are
+# switched off - what is left compiles in a couple of minutes rather than
+# pulling in a display server's worth of dependencies. libplacebo and libass
+# are here only because mpv refuses to configure without them, and they are
+# cut down to match.
+#
+# `./build-flatpak` fetches yt-dlp and draws the icons into build/flatpak
+# before running this. Build it by hand with that script, not flatpak-builder
+# on its own, or those files won't be there.
+
+app-id: org.simplmusik.Player
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: simplmusik-ui
+
+finish-args:
+  # The window, and the machine's screen and GPU under it.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # mpv has to reach the sound server, and yt-dlp the network.
+  - --socket=pulseaudio
+  - --share=network
+  # Your music, and the app's own settings and playlists, are addressed by
+  # absolute path - ~/Music, ~/.config/simplmusik, ~/.local/state - so home is
+  # what makes them the same files the .deb and the checkout use. Anything
+  # narrower gives the flatpak a private empty home and its own second library.
+  - --filesystem=home
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/man
+  - /share/doc
+  - '*.a'
+  - '*.la'
+
+modules:
+  # Required by mpv's build whether or not anything draws. Every GPU backend
+  # is off, which leaves the colour and frame handling mpv links against.
+  - name: libplacebo
+    buildsystem: meson
+    config-opts:
+      - -Dvulkan=disabled
+      - -Dopengl=disabled
+      - -Dd3d11=disabled
+      - -Dglslang=disabled
+      - -Dshaderc=disabled
+      - -Dlcms=disabled
+      - -Ddovi=disabled
+      - -Dlibdovi=disabled
+      - -Ddemos=false
+      - -Dtests=false
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/libplacebo.git
+        tag: v7.360.1
+        commit: cee9b076f2c63104ccfd497fa79c39a867293ec4
+
+  # Subtitle rendering, which an audio player never asks for - but mpv will
+  # not configure without it. The runtime already has the fonts underneath.
+  - name: libass
+    buildsystem: meson
+    config-opts:
+      - -Dfontconfig=enabled
+      - -Dlibunibreak=disabled
+      - -Dtest=disabled
+      - -Dcompare=disabled
+      - -Dprofile=disabled
+      - -Dfuzz=disabled
+      - -Dcheckasm=disabled
+    sources:
+      - type: archive
+        url: https://github.com/libass/libass/releases/download/0.17.5/libass-0.17.5.tar.gz
+        sha256: caab4b993dd7be6187c55623b789ed75dddefea6e65938af134637c732fe094a
+
+  # The player. Audio outputs on, everything that draws a pixel off.
+  - name: mpv
+    buildsystem: meson
+    config-opts:
+      - -Dlibmpv=false
+      - -Dcplayer=true
+      - -Dbuild-date=false
+      - -Dtests=false
+      - -Dpulse=enabled
+      - -Dpipewire=enabled
+      - -Dalsa=enabled
+      - -Dzlib=enabled
+      - -Diconv=enabled
+      - -Dgl=disabled
+      - -Dplain-gl=disabled
+      - -Degl=disabled
+      - -Dgbm=disabled
+      - -Dvulkan=disabled
+      - -Dshaderc=disabled
+      - -Dspirv-cross=disabled
+      - -Dd3d11=disabled
+      - -Dx11=disabled
+      - -Dxv=disabled
+      - -Dwayland=disabled
+      - -Ddmabuf-wayland=disabled
+      - -Ddrm=disabled
+      - -Dvaapi=disabled
+      - -Dvdpau=disabled
+      - -Dsdl2-video=disabled
+      - -Dsdl2-gamepad=disabled
+      - -Dcaca=disabled
+      - -Dsixel=disabled
+      - -Djpeg=disabled
+      - -Dlcms2=disabled
+      - -Dlua=disabled
+      - -Djavascript=disabled
+      - -Dlibarchive=disabled
+      - -Dlibbluray=disabled
+      - -Dlibavdevice=disabled
+      - -Dcdda=disabled
+      - -Ddvbin=disabled
+      - -Ddvdnav=disabled
+      - -Duchardet=disabled
+      - -Dvapoursynth=disabled
+      - -Drubberband=disabled
+      - -Dzimg=disabled
+      - -Dmanpage-build=disabled
+      - -Dhtml-build=disabled
+      - -Dpdf-build=disabled
+    sources:
+      - type: archive
+        url: https://github.com/mpv-player/mpv/archive/refs/tags/v0.41.0.tar.gz
+        sha256: ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209
+
+  # Titles, artists and cover art. Pure Python, so this is a copy, not a build.
+  - name: python-mutagen
+    buildsystem: simple
+    build-commands:
+      - pip3 install --prefix=/app --no-deps --no-build-isolation .
+    sources:
+      - type: archive
+        url: https://files.pythonhosted.org/packages/source/m/mutagen/mutagen-1.48.1.tar.gz
+        sha256: 8f95637ab9f6f305cec6bd1294e197debe207998e3e068596563c74f86b0a173
+
+  # The app itself. One folder holding the lot, and two symlinks on the PATH -
+  # the same layout the .deb uses, because the scripts find each other and
+  # their web assets relative to where they really sit.
+  - name: simplmusik
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 -t /app/lib/simplmusik simplmusik server.py simplmusik-ui
+      - install -Dm755 yt-dlp /app/lib/simplmusik/yt-dlp
+      - cp -r web /app/lib/simplmusik/web
+      - install -d /app/bin
+      - ln -s ../lib/simplmusik/simplmusik /app/bin/simplmusik
+      - ln -s ../lib/simplmusik/simplmusik-ui /app/bin/simplmusik-ui
+      - install -Dm644 -t /app/share/applications org.simplmusik.Player.desktop
+      - for s in 32 48 64 128 256; do install -Dm644 icon-$s.png
+        /app/share/icons/hicolor/${s}x${s}/apps/org.simplmusik.Player.png; done
+    sources:
+      - type: file
+        path: simplmusik
+      - type: file
+        path: server.py
+      - type: file
+        path: simplmusik-ui
+      - type: dir
+        path: web
+        dest: web
+      - type: file
+        path: build/flatpak/yt-dlp
+      - type: file
+        path: build/flatpak/org.simplmusik.Player.desktop
+      - type: file
+        path: build/flatpak/icon-32.png
+      - type: file
+        path: build/flatpak/icon-48.png
+      - type: file
+        path: build/flatpak/icon-64.png
+      - type: file
+        path: build/flatpak/icon-128.png
+      - type: file
+        path: build/flatpak/icon-256.png

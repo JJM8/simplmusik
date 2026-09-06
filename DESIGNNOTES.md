@@ -9,6 +9,11 @@ A CLI music player and a desktop UI for it, on Linux Mint.
 sudo apt install ./build/simplmusik_0.1.0_all.deb
 ```
 
+```sh
+./build-flatpak                                    # the same, for any distro
+flatpak install --user ./build/simplmusik_0.1.0.flatpak
+```
+
 Playback is **mpv** and the loudness measuring is **ffmpeg**; tags and cover
 art are **mutagen**, and the window is **GTK** and **WebKit**. All of those are
 in the archive, so the package just depends on them.
@@ -26,9 +31,40 @@ the PATH, fetched by `update`, shipped beside the app - and imports whichever
 is newest rather than the first it finds. On a machine with the distro's copy
 installed, the first it finds is the broken one.
 
-Nothing needed a path change to be packaged: all three scripts already locate
-each other and the web assets relative to their own file, so the whole folder
-drops into `/usr/lib/simplmusik` as it is.
+Almost nothing needed a path change to be packaged: all three scripts already
+locate each other and the web assets relative to their own file, so the whole
+folder drops into `/usr/lib/simplmusik` as it is. The one thing that did is
+`HERE`, which reads `realpath` rather than `abspath` - installed, the command
+you run is a symlink on the PATH, and only the resolved path leads back to what
+ships beside it. With `abspath` the CLI looked for its bundled yt-dlp in
+`/usr/bin` and quietly fell back to whatever else it could find.
+
+### The same app, packaged twice
+
+The .deb depends on the archive for mpv, ffmpeg, mutagen, GTK and WebKit. The
+flatpak cannot: it has to hold everything, on a machine whose package manager
+it knows nothing about. The GNOME runtime turns out to cover most of it -
+WebKit 4.1 by the name the window asks for, GTK 3, Python, and ffmpeg - so
+`org.simplmusik.Player.yml` builds only what is genuinely missing, which is
+mpv and mutagen.
+
+mpv is built audio-only, and that is the difference between a couple of minutes
+and a display server's worth of dependencies. It is started `--no-video` and
+driven over a socket, so every video output is switched off; libplacebo and
+libass are in the manifest only because mpv will not configure without them.
+
+The sandbox is opened up to the whole home directory, which is broader than a
+flatpak likes to be. It is what the app already is: your music, your playlists
+and your settings are addressed as `~/Music`, `~/.config/simplmusik` and
+`~/.local/state`, and anything narrower hands the flatpak a private empty home
+and a second library to go with it. Opened up this way it reads and writes the
+same files the .deb does, so the two are the same install.
+
+What the sandbox does cost is the CLI. `play` starts a background player and
+returns, and flatpak takes the sandbox down with the command that exits, so a
+`play` run from outside the window leaves mpv going with nothing left holding
+it. Queries and control of a player already running are fine, because those
+reach it through files and a socket that both sides can see.
 
 ### From a checkout instead
 
@@ -331,6 +367,8 @@ Both search boxes work this way, the top bar's and a playlist's.
     server.py       the backend
     simplmusik-ui  the desktop window
     install         menu entry and icons
+    build-deb       the .deb, for apt-based distributions
+    build-flatpak   the .flatpak, for every other one
     simplmusik     the CLI - the only thing that touches playback, your
                     library or your settings
 

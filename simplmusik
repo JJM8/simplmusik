@@ -100,7 +100,10 @@ NULL = subprocess.DEVNULL
 
 CONF_DOT = ".simplmusik"            # the hidden folder playlists sit in
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath, not abspath: installed, this file is a symlink on the PATH into
+# the folder holding the rest of us, and only the resolved path leads back to
+# what ships alongside - the bundled yt-dlp included.
+HERE = os.path.dirname(os.path.realpath(__file__))
 YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
 YTDLP_USER = os.path.expanduser("~/.local/share/simplmusik/yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"

@@ -191,26 +191,28 @@ def draw_icons(accent):
         png_write(out, size, draw_icon(size, accent, mw, mh, mask))
     return len(SIZES)
 
-def desktop_entry(exec_path, working_dir=None):
+def desktop_entry(exec_path, working_dir=None, icon="simplmusik"):
     """The menu entry, as text.
 
-    Built here rather than kept as a file because the two ways simplmusik is
-    installed disagree about exactly one line: run from a checkout it needs a
+    Built here rather than kept as a file because the three ways simplmusik is
+    installed each disagree about a line of it: run from a checkout it needs a
     Path= to find its own web assets, and installed as a package it is on the
-    PATH and needs none. `build-deb` asks for the second."""
+    PATH and needs none - that is what `build-deb` asks for. A flatpak wants
+    the second as well, but has to name its icon after the app id, because
+    everything a flatpak exports to the desktop is named that way."""
     return """[Desktop Entry]
 Type=Application
 Name=simplmusik
 GenericName=Music Player
 Comment=Play your music library
 Exec=%s %%U
-%sIcon=simplmusik
+%sIcon=%s
 Terminal=false
 Categories=AudioVideo;Audio;Player;
 Keywords=music;audio;player;playlist;song;
 StartupNotify=true
 StartupWMClass=simplmusik
-""" % (exec_path, "Path=%s\n" % working_dir if working_dir else "")
+""" % (exec_path, "Path=%s\n" % working_dir if working_dir else "", icon)
 
 def write_desktop():
     os.makedirs(APPS, exist_ok=True)
