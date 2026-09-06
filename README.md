@@ -104,6 +104,8 @@ where it is (or re-run `./install` after moving it).
 
 ## CLI
 
+Meant for agents as much as for people.
+
 ```sh
 simplmusik status
 simplmusik list
@@ -112,9 +114,8 @@ simplmusik search wonderwall
 simplmusik create "Road trip"
 ```
 
-Put `--json` before the command and you get JSON back, which is the point of
-it: an assistant can read what came back without parsing text meant for a
-person.
+Put `--json` before the command and you get JSON back, so an agent can read
+the result without parsing text meant for a person.
 
 ```sh
 simplmusik --json status
