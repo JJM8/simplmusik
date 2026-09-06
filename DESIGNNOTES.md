@@ -246,15 +246,13 @@ and an image reloaded each time would blink its placeholder on every one.
 
 Older versions kept a folder per playlist, each with its own copies of the
 songs; playlists then moved to `~/Music/playlists`, and then to
-`~/.config/simplmusik/playlists`. Every one of those is handled: the later
-layouts move themselves into your music folder the first time you run
-anything, and `./migrate` converts the oldest.
+`~/.config/simplmusik/playlists`. The later layouts move themselves into your
+music folder the first time you run anything.
 
-`./migrate` doesn't move a single song - a folder per playlist is just a
-folder now, and your music folder is walked all the way down - it only reads each
-`playlist.json` and writes the list out to its new home. `./migrate --dry-run`
-shows what it would do first. Once it says *nothing in the old layout*, you can
-delete the script.
+The oldest needed a one-shot script, `./migrate`, which read each folder's
+`playlist.json` and wrote the list out to its new home. It never moved a song -
+a folder per playlist is just a folder now, and your music folder is walked all
+the way down - and it has since done its work and been removed.
 
 ## Getting songs from YouTube
 
@@ -333,7 +331,6 @@ Both search boxes work this way, the top bar's and a playlist's.
     server.py       the backend
     simplmusik-ui  the desktop window
     install         menu entry and icons
-    migrate         one-shot upgrade from the old folder-per-playlist layout
     simplmusik     the CLI - the only thing that touches playback, your
                     library or your settings
 
