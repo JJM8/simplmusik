@@ -18,6 +18,35 @@ import server
 
 APP_ID = "org.simplmusik.Player"
 
+# Flatpak exports one launcher per app, named after the app id and pointed at
+# whatever the manifest's `command:` is - the window. The CLI ships in the same
+# sandbox but has no name of its own out on the host, so this writes it one:
+# three lines in ~/.local/bin handing the arguments back to the same binary.
+CLI_WRAPPER = ('#!/bin/sh\n'
+               'exec flatpak run --command=simplmusik %s "$@"\n' % APP_ID)
+
+def export_cli():
+    """Give the CLI a name on the PATH of the machine outside the sandbox.
+
+    Answers True only when ~/.local/bin had to be made, because that is the one
+    case where the wrapper isn't usable yet: the line in ~/.profile that puts
+    the folder on PATH tests that it exists, and it is read at login."""
+    if not os.path.exists("/.flatpak-info"):
+        return False              # not sandboxed - the CLI is already on PATH
+    bin_dir = os.path.expanduser("~/.local/bin")
+    path = os.path.join(bin_dir, "simplmusik")
+    try:
+        if os.path.exists(path) and open(path).read() != CLI_WRAPPER:
+            return False          # somebody else's simplmusik - leave it alone
+        fresh = not os.path.isdir(bin_dir)
+        os.makedirs(bin_dir, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(CLI_WRAPPER)
+        os.chmod(path, 0o755)
+        return fresh
+    except OSError:
+        return False              # a home we cannot write to is not worth dying over
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -39,9 +68,10 @@ def message_text(result):
     return value.to_string()
 
 def main():
+    fresh = export_cli()
     if "--browser" not in sys.argv:
         try:
-            return app_window()
+            return app_window(fresh)
         except (ImportError, ValueError):
             print("WebKit not available - opening in your browser instead")
 
@@ -105,7 +135,53 @@ def theme_dark(Gtk):
     name = Gtk.Settings.get_default().get_property("gtk-theme-name") or ""
     return "dark" in name.lower()
 
-def app_window():
+# A line that says its piece over the page and then takes itself away. There
+# is nothing to press: it fades in once the page has painted, sits for a few
+# seconds and goes. Clicks fall straight through to the page underneath, so it
+# never gets between you and the app - it is only ever shown for the one thing
+# that cannot be said any other way, a PATH that isn't right until next login.
+TOAST_CSS = b"""
+.toast {
+  background-color: rgba(28, 28, 35, 0.92);
+  color: #f2f2f2;
+  border-radius: 999px;
+  padding: 9px 18px;
+}
+"""
+
+def toast(Gtk, Gdk, GLib, overlay, text, seconds=5):
+    css = Gtk.CssProvider()
+    css.load_from_data(TOAST_CSS)
+    Gtk.StyleContext.add_provider_for_screen(
+        Gdk.Screen.get_default(), css,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    label = Gtk.Label(label=text)
+    label.get_style_context().add_class("toast")
+    rev = Gtk.Revealer()
+    rev.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+    rev.set_transition_duration(450)
+    rev.set_halign(Gtk.Align.CENTER)
+    rev.set_valign(Gtk.Align.END)
+    rev.set_margin_bottom(92)          # clear of the player bar along the bottom
+    rev.add(label)
+    overlay.add_overlay(rev)
+    overlay.set_overlay_pass_through(rev, True)   # the page still gets the click
+    rev.show_all()
+
+    def leave():
+        rev.set_reveal_child(False)
+        GLib.timeout_add(600, lambda: rev.destroy() or False)   # after the fade
+        return False
+
+    def arrive():
+        rev.set_reveal_child(True)
+        GLib.timeout_add_seconds(seconds, leave)
+        return False
+
+    GLib.timeout_add(900, arrive)      # let the page paint before saying anything
+
+def app_window(fresh_path=False):
     import gi
     gi.require_version("Gtk", "3.0")
     gi.require_version("WebKit2", "4.1")
@@ -198,8 +274,16 @@ def app_window():
         content.register_script_message_handler("theme")
 
         view.load_uri(url)
-        win.add(view)
+        overlay = Gtk.Overlay()
+        overlay.add(view)
+        win.add(overlay)
         win.show_all()
+
+        # Only ever on the launch that made ~/.local/bin: from then on the
+        # folder is there at login and the command simply works.
+        if fresh_path:
+            toast(Gtk, Gdk, GLib, overlay,
+                  "the simplmusik command works after your next login")
 
     app.connect("activate", activate)
     app.run([])           # our own flags are handled above, not by GTK
