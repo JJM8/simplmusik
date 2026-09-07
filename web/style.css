@@ -10,78 +10,120 @@
    still the app rather than a white flash. */
 
 :root {
-  /* The one knob: Mint-Y-Dark-Orange. Change it here and the whole app
-     follows. Both palettes wear it - it is the accent in Mint's light theme
-     just as much as in its dark one. */
-  --accent: #ff7139;
-  /* Text and marks sitting on top of the accent. White on that orange either
-     way: the accent doesn't change between palettes, so neither does what
-     reads on it. */
-  --on-accent: #fff;
+  /* Mint-Y-Dark-Orange's own #ff7139, read straight off the theme this window
+     sits in - the same value the desktop hands GTK as selected_bg_color, so
+     the app and the window frame around it are the one colour.
 
-  --bg:        #202023;
-  --sidebar:   #1a1a1d;
-  --bar:       #26262a;
-  --surface:   #2e2e33;
-  --hover:     #35353b;
-  --border:    #2c2c31;
-  --text:      #dbdbdb;
-  --dim:       #8e8e97;
-  --faint:     #63636b;
-  /* Deliberately not the accent: deleting shouldn't wear the
-     same colour as the button that plays your music. */
-  --danger:    #c0413b;
+     It does two jobs. --accent is a fill: the Play button, the active
+     playlist, a primary button. --accent-ink is the same orange used as a mark
+     on the page instead - the playing row's title, the equalizer bars, a focus
+     ring, the progress fill. On a near-black page one orange serves both, so
+     here they are the same; the light palette has to part them. */
+  --accent:     #ff7139;
+  --accent-ink: #ff7139;
+  /* White on the orange, the way the desktop does it - GTK puts white on this
+     same value. It is 2.7:1, under what small text normally wants: matching
+     the theme is the thing being chosen here, not the ratio. */
+  --on-accent:  #ffffff;
+
+  /* One near-black plane, from the sidebar's left edge to the bottom of the
+     player bar. The big sections are the page rather than furniture standing
+     on it, and what parts them is a seam rather than a change of colour.
+     --surface and --hover still step up out of it, so the thing that looks
+     raised is the row under the pointer or the field being typed in, never
+     the panel around it. */
+  --bg:         #0b0b0d;
+  --sidebar:    #0b0b0d;
+  --bar:        #0b0b0d;
+  --surface:    #282831;
+  --hover:      #363642;
+  --border:     #434350;
+  /* The rule the column headings sit on - a hairline barely off the page,
+     for a divide inside a section rather than between two of them. */
+  --seam:       #24242e;
+  /* What the joins *between* sections are painted with, in one place because
+     it is the one thing being tried out: --border is the app's own divider
+     grey, var(--accent-ink) makes every seam an orange rule instead. Both
+     palettes follow whichever is named here, since both names are already
+     per-palette. */
+  --rule:       var(--border);
+  /* Ink. Three weights, and all three are meant to be read - so the quiet two
+     sit much closer to the white than a grey normally would. --faint is the
+     track number and the column headings, and it earns 11:1 on the page here
+     rather than the 3:1 that made it decoration; --dim, the artist under every
+     title, 13.9:1. They stay a step apart from each other and from --text, so
+     the hierarchy survives being this bright. */
+  --text:       #ffffff;
+  --dim:        #d8d8e2;
+  --faint:      #c2c2ce;
+  /* Deliberately not the accent: deleting shouldn't wear the same colour as
+     the button that plays your music. Split the same way the accent is - the
+     fill carries white on the Delete button, the ink is the minus on a row. */
+  --danger:     #c23a32;
+  --danger-ink: #ff7d74;
   /* A song a playlist names that isn't on any disk right now. Not danger -
      nothing has gone wrong that you can't undo by plugging a drive back in. */
-  --gone:      #d1756b;
+  --gone:       #ffa48f;
 
   /* The tile a song we can't find wears in place of cover art, and the
      scrollbar. Furniture rather than paint, but both are a shade of the window
      they sit in, so both belong to the palette. */
-  --miss-a:    #45454c;
-  --miss-b:    #313136;
-  --scroll:    #3a3a41;
-  --scroll-on: #4a4a53;
+  --miss-a:     #2f2f3a;
+  --miss-b:     #22222a;
+  --scroll:     #3d3d4a;
+  --scroll-on:  #57576a;
 
   /* What dims the page behind a dialog, and what something floating above the
      page drops on it. A light window needs a fainter shadow than a dark one to
      read as the same height. */
-  --scrim:     rgba(0,0,0,.5);
-  --shade:     rgba(0,0,0,.5);
-  --shade-sm:  rgba(0,0,0,.45);
+  --scrim:      rgba(0,0,0,.68);
+  --shade:      rgba(0,0,0,.62);
+  --shade-sm:   rgba(0,0,0,.5);
 
-  --radius: 6px;
-  --row: 46px;
-  --sidebar-w: 248px;
-  --player-h: 78px;
+  --radius:     6px;
+  --row:        46px;
+  --sidebar-w:  248px;
+  --player-h:   78px;
 
   color-scheme: dark;
 }
 
-/* Mint-Y light: the same roles read the other way up. The sidebar is a step
-   darker than the page beside it, where in the dark palette it is a step
-   darker still. */
+/* Mint-Y light: the same roles read the other way up. The page is white, the
+   sidebar and the player bar are that same white, and --surface steps *down*
+   into grey where the dark palette steps up. The seam goes the same way: a
+   hairline just off white, lit at its start by the accent.
+
+   The accent is the one thing that cannot come straight from the theme. Mint's
+   #ff7139 is 2.6:1 on white whichever way round you use it - as a fill under
+   white text or as ink on the page - so the light palette wears a deeper burnt
+   orange, and parts the fill from the ink to keep both readable. */
 :root[data-theme="light"] {
-  --bg:        #fbfbfb;
-  --sidebar:   #f0f0f1;
-  --bar:       #f6f6f7;
-  --surface:   #ebebec;
-  --hover:     #e0e0e2;
-  --border:    #d7d7db;
-  --text:      #2b2b2e;
-  --dim:       #62626a;
-  --faint:     #7b7b84;
-  --danger:    #b8352f;
-  --gone:      #b0514a;
+  --accent:     #c2410c;
+  --accent-ink: #a83607;
+  --on-accent:  #ffffff;
 
-  --miss-a:    #dcdce1;
-  --miss-b:    #c9c9d1;
-  --scroll:    #c6c6cc;
-  --scroll-on: #adadb6;
+  --bg:         #ffffff;
+  --sidebar:    #ffffff;
+  --bar:        #ffffff;
+  --surface:    #e8e8ee;
+  --hover:      #dadae3;
+  --border:     #bfbfcc;
+  --seam:       #e4e4ec;
+  --text:       #0d0d11;
+  --dim:        #33333c;
+  --faint:      #4a4a58;
+  --danger:     #b3261e;
+  --danger-ink: #b3261e;
+  --gone:       #9a463c;
 
-  --scrim:     rgba(0,0,0,.32);
-  --shade:     rgba(0,0,0,.18);
-  --shade-sm:  rgba(0,0,0,.14);
+  --miss-a:     #d5d5df;
+  --miss-b:     #c2c2ce;
+  --scroll:     #b8b8c6;
+  --scroll-on:  #90909f;
+
+  --scrim:      rgba(0,0,0,.42);
+  --shade:      rgba(0,0,0,.22);
+  --shade-sm:   rgba(0,0,0,.16);
 
   color-scheme: light;
 }
@@ -110,12 +152,48 @@ input  { font: inherit; }
   height: 100vh;
 }
 
+/* ------------------------------------------------------------------ seams */
+/* Every big section is the same black now, so nothing says where one ends
+   except this: a one-pixel rule drawn the whole length of the join. What
+   colour it is, is --rule's business and nothing here's - which is what lets
+   the whole window switch between a grey divider and an orange one by
+   editing a single line up in the palette.
+
+   Pseudo-elements rather than borders, so the rule sits inside the section's
+   own box and lands on the same pixel whatever else the layout does.
+   Absolutely positioned, so a seam on a flex or grid section is out of flow
+   and never becomes an item in it. */
+
+#sidebar, #topbar, #player, .side-foot, .found, .adder .yt-part {
+  position: relative;
+}
+
+#topbar::after, #player::before, .side-foot::before,
+.found::before, .adder .yt-part:not(:empty)::before,
+#sidebar::after {
+  content: ''; position: absolute;
+  background: var(--rule);
+}
+
+/* The joins that run across: under the search bar, over the player, and the
+   two inside the list where one set of results gives way to another. */
+#topbar::after, #player::before, .side-foot::before,
+.found::before, .adder .yt-part:not(:empty)::before {
+  left: 0; right: 0; height: 1px;
+}
+#topbar::after { bottom: 0; }
+#player::before, .side-foot::before,
+.found::before, .adder .yt-part:not(:empty)::before { top: 0; }
+
+/* And the one that runs down: the sidebar's edge, the full height of the
+   window. */
+#sidebar::after { top: 0; bottom: 0; right: 0; width: 1px; }
+
 /* ---------------------------------------------------------------- sidebar */
 
 #sidebar {
   grid-row: 1 / 3;
   background: var(--sidebar);
-  border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -131,7 +209,7 @@ input  { font: inherit; }
 .brand .mark {
   width: 22px; height: 14px;
   flex: none;
-  background: var(--accent);
+  background: var(--accent-ink);
   -webkit-mask: url(/logo.png) center / contain no-repeat;
   mask: url(/logo.png) center / contain no-repeat;
 }
@@ -142,6 +220,10 @@ input  { font: inherit; }
   text-transform: uppercase; color: var(--faint);
 }
 
+/* The same 8px gutter either side for both lists, so "All songs" wears a
+   chip the width of a playlist's when it is the one selected, rather than a
+   band running edge to edge. */
+#lib-nav   { padding: 0 8px; }
 #playlists { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
 
 .pl {
@@ -156,7 +238,10 @@ input  { font: inherit; }
 }
 .pl:hover { background: var(--hover); color: var(--text); }
 .pl.active { background: var(--accent); color: var(--on-accent); }
-.pl.active .count { color: rgba(255,255,255,.72); }
+/* The count wears the chip's own ink at full strength rather than a faded
+   white: a translucent white on the orange is 3.4:1, and no amount of opacity
+   clears 4.5 there. Its smaller size is what keeps it quieter than the name. */
+.pl.active .count { color: var(--on-accent); }
 .pl .name  { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pl .count { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
 /* The icon is padded out to the width of a cover so that "All songs" and the
@@ -172,7 +257,7 @@ input  { font: inherit; }
   background: var(--surface);
 }
 
-.side-foot { border-top: 1px solid var(--border); padding: 10px; }
+.side-foot { padding: 10px; }
 
 .linkbtn {
   display: flex; align-items: center; gap: 9px;
@@ -190,7 +275,6 @@ input  { font: inherit; }
 #topbar {
   display: flex; align-items: center; gap: 12px;
   padding: 14px 20px;
-  border-bottom: 1px solid var(--border);
   flex: none;
 }
 
@@ -213,7 +297,7 @@ input  { font: inherit; }
   transition: border-color .12s, background .12s;
 }
 .search input::placeholder { color: var(--faint); }
-.search input:focus { border-color: var(--accent); background: var(--bg); }
+.search input:focus { border-color: var(--accent-ink); background: var(--bg); }
 /* Both boxes are `type=text` on purpose. A `type=search` input draws a clear
    widget of its own - in the GTK window, the edit-clear icon, which reads as a
    backspace key - and it would sit beside the × below saying the same thing
@@ -257,14 +341,14 @@ input  { font: inherit; }
    having to reach for it. The handle is still only there when it's useful. */
 #vol .fill {
   position: relative; height: 4px; width: 100%;
-  background: var(--accent);
+  background: var(--accent-ink);
   border-radius: 2px;
   transition: width .12s;
 }
 #vol .fill::after {                   /* the handle: there whenever it is useful */
   content: ''; position: absolute; right: -5px; top: -3px;
   width: 10px; height: 10px; border-radius: 50%;
-  background: var(--accent);
+  background: var(--accent-ink);
   opacity: 0; transition: opacity .12s;
 }
 #vol:hover .fill::after, #vol .vol-bar:focus-visible .fill::after,
@@ -283,6 +367,13 @@ input  { font: inherit; }
   width: 76px; height: 76px; border-radius: var(--radius);
   flex: none; overflow: hidden;
 }
+/* The library's tile: the sidebar's note on a plain surface, since there is no
+   one cover that stands for everything. */
+#head .art.note {
+  display: grid; place-items: center;
+  background: var(--surface); color: var(--dim);
+}
+#head .art.note svg { width: 38px; height: 38px; }
 #head h1 { font-size: 25px; font-weight: 500; letter-spacing: -.3px; }
 #head .sub { color: var(--dim); font-size: 13px; margin-top: 3px; }
 #head .acts { margin-left: auto; flex: none; display: flex; gap: 8px; align-items: center; }
@@ -315,14 +406,14 @@ input  { font: inherit; }
   transition: background .12s, box-shadow .12s;
 }
 #head h1.editable:hover { background: var(--surface); }
-#head h1.editable:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+#head h1.editable:focus-visible { box-shadow: 0 0 0 2px var(--accent-ink); }
 
 #head input.rename {
   width: min(440px, 40vw);
   height: 36px; padding: 0 9px;
   font-size: 25px; font-weight: 500; letter-spacing: -.3px;
   background: var(--bg);
-  border: 1px solid var(--accent);
+  border: 1px solid var(--accent-ink);
   border-radius: var(--radius);
   color: var(--text);
   outline: none;
@@ -341,7 +432,7 @@ input  { font: inherit; }
 #head .art.editable:hover::after,
 #head .art.dropping::after,
 #head .art:focus-within::after { opacity: 1; }
-#head .art.dropping { outline: 2px solid var(--accent); outline-offset: -2px; }
+#head .art.dropping { outline: 2px solid var(--accent-ink); outline-offset: -2px; }
 
 .art-btn {
   position: absolute; z-index: 1;
@@ -392,7 +483,7 @@ input  { font: inherit; }
   height: 30px;
   font-size: 11px; letter-spacing: .7px; text-transform: uppercase;
   color: var(--faint);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--seam);
   position: sticky; top: 0; background: var(--bg); z-index: 2;
 }
 .head-row .r, .track .dur { text-align: right; }
@@ -443,7 +534,7 @@ input  { font: inherit; }
 /* Both row buttons sit in the one cell, right-aligned, so the column keeps a
    fixed width whether a row carries two of them or one. */
 .row-acts { display: flex; justify-content: flex-end; gap: 2px; }
-.track .rm:hover { color: var(--danger); background: var(--hover); }
+.track .rm:hover { color: var(--danger-ink); background: var(--hover); }
 
 /* A song whose file we can't find: it keeps its place and its name, says so
    underneath, and wears a question mark where its cover would be. */
@@ -453,12 +544,12 @@ input  { font: inherit; }
 .track.gone:hover .num .play { display: none; }
 .track.gone:hover .num .n { display: block; }
 
-.track.now .t .title, .track.now .num { color: var(--accent); }
+.track.now .t .title, .track.now .num { color: var(--accent-ink); }
 .track.now .t .title { font-weight: 500; }
 
 /* the little playing bars */
 .eq { display: flex; align-items: flex-end; gap: 2px; height: 13px; margin: 0 auto; width: 13px; }
-.eq i { flex: 1; background: var(--accent); animation: eq .9s ease-in-out infinite; }
+.eq i { flex: 1; background: var(--accent-ink); animation: eq .9s ease-in-out infinite; }
 .eq i:nth-child(2) { animation-delay: .3s; }
 .eq i:nth-child(3) { animation-delay: .6s; }
 .paused .eq i { animation-play-state: paused; }
@@ -470,7 +561,7 @@ input  { font: inherit; }
   width: 100%; height: 100%;
   display: grid; place-items: center;
   font-weight: 500; color: rgba(255,255,255,.9);
-  background: linear-gradient(140deg, hsl(var(--h) 32% 42%), hsl(var(--h) 34% 26%));
+  background: linear-gradient(140deg, hsl(var(--h) 36% 34%), hsl(var(--h) 38% 20%));
 }
 /* No colour of its own: a song we can't find shouldn't look like a song. */
 .ph.miss {
@@ -498,7 +589,7 @@ input  { font: inherit; }
   color: var(--text); outline: none;
 }
 .empty .act input[type=text]::placeholder { color: var(--faint); }
-.empty .act input[type=text]:focus { border-color: var(--accent); }
+.empty .act input[type=text]:focus { border-color: var(--accent-ink); }
 .empty .also { font-size: 12px; }
 
 /* --------------------------------------------------------- what search found */
@@ -510,10 +601,9 @@ input  { font: inherit; }
 
 .none { padding: 12px 16px; color: var(--faint); font-size: 13px; }
 
-.found { border-top: 1px solid var(--border); margin-top: 12px; }
-.found-head { display: flex; align-items: baseline; gap: 8px; padding: 13px 14px 5px; }
+.found { margin-top: 12px; }
+.found-head { padding: 13px 14px 5px; }
 .found-head strong { font-size: 13px; color: var(--text); font-weight: 600; }
-.found-head .from { font-size: 12px; color: var(--faint); }
 
 .track.yt .num .n { visibility: hidden; }
 .track.yt:hover { background: var(--surface); }
@@ -521,21 +611,23 @@ input  { font: inherit; }
 /* ------------------------------------------------- picking from the library */
 /* The same rows again, under a playlist, for adding rather than playing: no
    track number, and the plus stays visible instead of waiting for a hover,
-   since it is the only thing these rows are for. */
+   since adding is what these rows are mostly for. Only the number goes, not
+   the column it sits in - the play that appears there on a hover is the one
+   a found row shows, so a song can be heard before it is added. */
 
 .adder-search { padding: 6px 14px 10px; }
 .adder-search .search { display: block; max-width: 420px; }
 .adder-search .search input { background: var(--bg); border-color: var(--border); }
 
-.track.pick .num { visibility: hidden; }
+.track.pick .num .n { visibility: hidden; }
 .track.pick:hover { background: var(--surface); }
 .track.pick .add { opacity: .75; }
 .track.pick:hover .add { opacity: 1; }
-.track.pick .add:hover { color: var(--accent); background: var(--hover); }
+.track.pick .add:hover { color: var(--accent-ink); background: var(--hover); }
 
 /* What YouTube has, under what your library has: the same two-part shape the
    top bar's search makes, one rule further in. */
-.adder .yt-part:not(:empty) { border-top: 1px solid var(--border); margin-top: 10px; }
+.adder .yt-part:not(:empty) { margin-top: 10px; }
 
 /* One more handful, on a row of its own under the results. Quiet: it is an
    offer, not the thing you came here to press. */
@@ -552,15 +644,15 @@ input  { font: inherit; }
 
 .track .dl { opacity: .75; }
 .track:hover .dl { opacity: 1; }
-.track .dl:hover { color: var(--accent); background: var(--hover); }
+.track .dl:hover { color: var(--accent-ink); background: var(--hover); }
 
 .track .got, .track .dling {
   width: 26px; height: 26px;
   display: grid; place-items: center;
 }
 .track .got svg, .track .dling svg { width: 14px; height: 14px; }
-.track .got { color: var(--accent); }
-.track .dling { color: var(--accent); }
+.track .got { color: var(--accent-ink); }
+.track .dling { color: var(--accent-ink); }
 
 /* The download ring. The whole ring turns - fast enough to read as busy,
    slow enough not to look frantic - while the arc drawn on it is how much of
@@ -568,7 +660,7 @@ input  { font: inherit; }
    the same ring becomes an honest progress bar the moment it does. */
 
 .track .dling .ring { width: 16px; height: 16px; animation: turn .9s linear infinite; }
-.ring circle { fill: none; stroke: var(--accent); stroke-width: 1.7; }
+.ring circle { fill: none; stroke: var(--accent-ink); stroke-width: 1.7; }
 .ring .rail { opacity: .25; }
 .ring .arc {
   stroke-linecap: round;
@@ -635,7 +727,7 @@ input  { font: inherit; }
   color: var(--text); outline: none;
 }
 .set-row input[type=text]::placeholder { color: var(--faint); }
-.set-row input[type=text]:focus { border-color: var(--accent); }
+.set-row input[type=text]:focus { border-color: var(--accent-ink); }
 
 .btn.small { height: 30px; padding: 0 13px; font-size: 13px; }
 .btn.small:not(.primary) { border: 1px solid var(--border); }
@@ -660,7 +752,7 @@ input  { font: inherit; }
 }
 .seg button:hover { background: var(--hover); color: var(--text); }
 .seg button.on { background: var(--accent); color: var(--on-accent); font-weight: 500; }
-.seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.seg button:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 1px; }
 
 /* The switch on a settings row: a Mint-Y pill with the knob sliding across it,
    filled with the accent when it is on - the same shape Mint's own settings
@@ -683,7 +775,7 @@ input  { font: inherit; }
 .tog:hover::after { background: var(--text); }
 .tog.on { background: var(--accent); border-color: var(--accent); }
 .tog.on::after { transform: translateX(20px); background: var(--on-accent); }
-.tog:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tog:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }
 .tog:disabled { opacity: .6; }
 
 /* The settings row that is a number on a range: a 4px rail and a round handle,
@@ -720,11 +812,11 @@ input  { font: inherit; }
   transition: background .12s;
 }
 .set-row input[type=range]:hover::-webkit-slider-thumb,
-.set-row input[type=range]:focus::-webkit-slider-thumb { background: var(--accent); }
+.set-row input[type=range]:focus::-webkit-slider-thumb { background: var(--accent-ink); }
 .set-row input[type=range]:hover::-moz-range-thumb,
-.set-row input[type=range]:focus::-moz-range-thumb { background: var(--accent); }
+.set-row input[type=range]:focus::-moz-range-thumb { background: var(--accent-ink); }
 .set-row input[type=range]:focus { outline: none; }
-.set-row input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.set-row input[type=range]:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 3px; }
 
 .hint {
   padding: 9px 3px 0;
@@ -736,7 +828,6 @@ input  { font: inherit; }
 #player {
   grid-column: 2;
   background: var(--bar);
-  border-top: 1px solid var(--border);
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
@@ -759,7 +850,7 @@ input  { font: inherit; }
   transition: color .12s, background .12s;
 }
 .ctl:hover { color: var(--text); background: var(--hover); }
-.ctl.on { color: var(--accent); }
+.ctl.on { color: var(--accent-ink); }
 .ctl svg { width: 17px; height: 17px; }
 .ctl.big {
   width: 40px; height: 40px;
@@ -786,14 +877,14 @@ input  { font: inherit; }
    the whole time rather than only under the pointer. */
 #prog .fill {
   position: relative; height: 4px; width: 0;
-  background: var(--accent);
+  background: var(--accent-ink);
   border-radius: 2px;
   transition: width .3s linear;
 }
 #prog .fill::after {              /* the handle: only there when it's useful */
   content: ''; position: absolute; right: -5px; top: -3px;
   width: 10px; height: 10px; border-radius: 50%;
-  background: var(--accent);
+  background: var(--accent-ink);
   opacity: 0; transition: opacity .12s;
 }
 #prog .track-bar.live:hover .fill::after,
@@ -825,7 +916,7 @@ dialog input[type=text] {
   background: var(--bg); border: 1px solid var(--border);
   border-radius: var(--radius); color: var(--text); outline: none;
 }
-dialog input[type=text]:focus { border-color: var(--accent); }
+dialog input[type=text]:focus { border-color: var(--accent-ink); }
 dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
 /* -------------------------------------------------------------- toasts */
@@ -835,7 +926,7 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16
   transform: translateX(-50%) translateY(8px);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
+  border-left: 3px solid var(--accent-ink);
   border-radius: var(--radius);
   padding: 9px 15px;
   font-size: 13px;

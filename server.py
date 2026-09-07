@@ -114,6 +114,25 @@ def restale():
 CHANGES = {"remove", "delete", "create", "add", "rename", "cover", "download",
            "folder"}
 
+# ------------------------------------------------------------------ appearance
+# Light or dark is the one thing the page remembers that isn't about your
+# library, and it is kept here rather than in the browser. The window is served
+# on a free port picked fresh at every launch, and a browser files what a page
+# saved under the address it came from - so a choice left there would be looked
+# for tomorrow at an address that no longer exists, and never found. The config
+# file has no address to go out of date: it is this machine's, beside `shuffle`
+# and `volume`, and no part of the music folder, so a library synced to another
+# machine still carries no screen along with it.
+
+THEMES = ("system", "light", "dark")
+THEME_TOKEN = b"__THEME__"     # what index.html reads before its first paint
+
+def theme():
+    """The palette you chose. 'system' where you never chose, and where the
+    file has been hand-edited into something that isn't one of the three."""
+    v = sm.setting("theme", "system")
+    return v if v in THEMES else "system"
+
 def song_path(name):
     """Where a song the page named is, or None. Only names we found ourselves
     resolve, so nothing sent from the page can reach outside your folder."""
@@ -492,8 +511,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not f.startswith(WEB + os.sep) or not os.path.isfile(f):
             return self.send_json({"error": "not found"}, 404)
         with open(f, "rb") as fh:
-            self.send_blob(fh.read(), mimetypes.guess_type(f)[0] or "text/plain",
-                           cache=False)
+            body = fh.read()
+        if os.path.basename(f) == "index.html":
+            body = body.replace(THEME_TOKEN, theme().encode())
+        return self.send_blob(body, mimetypes.guess_type(f)[0] or "text/plain",
+                              cache=False)
 
     def do_POST(self):
         if not self.guard():
@@ -515,6 +537,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not stem:
                 return self.send_json({"ok": False, "error": "no playlist '%s'" % pl}, 404)
             return self.send_json(take_cover(stem, self.rfile.read(n)))
+
+        # The other request that isn't a command: which palette this window
+        # wears. It is a setting of the screen rather than of the library, so
+        # it stays out of the CLI and is written to the config file here.
+        if u.path == "/api/theme":
+            try:
+                body = json.loads(self.rfile.read(n) or "{}")
+            except ValueError:
+                return self.send_json({"ok": False, "error": "bad request"}, 400)
+            pick = body.get("theme") if isinstance(body, dict) else None
+            if pick not in THEMES:
+                return self.send_json({"ok": False, "error": "no such theme"}, 400)
+            sm.set_setting("theme", pick)
+            return self.send_json({"ok": True, "theme": pick})
 
         if u.path != "/api/cmd":
             return self.send_json({"error": "not found"}, 404)

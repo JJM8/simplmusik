@@ -8,17 +8,19 @@
 <link rel="stylesheet" href="/style.css">
 <!-- Which palette to wear, decided before the first paint rather than after
      app.js loads - a window that starts in the wrong one and corrects itself
-     is a flash you can see. Your choice is kept here in the browser, since it
-     is about this window and not about your library; with no choice made, or
-     with 'system' chosen, the desktop's own decision is the one that counts.
-     app.js keeps this in step from here on (see 'theme'). -->
+     is a flash you can see. The server writes your saved choice into the line
+     below as it hands this file over, so it is known here rather than a fetch
+     away; with no choice made, or with 'system' chosen, the desktop's own
+     decision is the one that counts. app.js reads the choice back off the
+     element and keeps this in step from here on (see 'theme'). -->
 <script>
 (function () {
-  var pick;
-  try { pick = localStorage.getItem('simplmusik.theme'); } catch (e) {}
-  if (pick !== 'light' && pick !== 'dark')
-    pick = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  document.documentElement.dataset.theme = pick;
+  var want = "__THEME__";
+  if (want !== 'light' && want !== 'dark') want = 'system';
+  document.documentElement.dataset.themeWant = want;
+  document.documentElement.dataset.theme =
+    want !== 'system' ? want
+      : matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 })();
 </script>
 </head>
@@ -100,7 +102,7 @@
       <button class="ctl" id="c-shuffle" title="Shuffle: off (s)"><svg><use href="#i-shuffle"/></svg></button>
       <button class="ctl" id="c-back" title="Previous track (p)"><svg><use href="#i-back"/></svg></button>
       <button class="ctl big" id="c-play" title="Play / pause (Space)"><svg><use href="#i-play"/></svg></button>
-      <button class="ctl" id="c-skip" title="Next track"><svg><use href="#i-skip"/></svg></button>
+      <button class="ctl" id="c-skip" title="Next track (n)"><svg><use href="#i-skip"/></svg></button>
       <button class="ctl" id="c-stop" title="Stop"><svg><use href="#i-stop"/></svg></button>
     </div>
 

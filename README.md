@@ -85,6 +85,13 @@ flatpak install --user ./build/simplmusik_0.1.0.flatpak
 sudo apt install ./build/simplmusik_0.1.0_all.deb
 ```
 
+Or both at once, which is what a release is - `--fresh` fetches the newest
+yt-dlp rather than reusing the cached one:
+
+```sh
+./build-all --fresh
+```
+
 ### ...or run it from this folder
 
 ```sh

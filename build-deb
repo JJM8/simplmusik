@@ -18,7 +18,7 @@ import time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
-VERSION = "0.1.0"
+VERSION = "0.1.2"          # what the next build will be; see bump()
 PKG = "simplmusik"
 MAINTAINER = "Josh <john.mcgill@mail.com>"
 
@@ -30,6 +30,26 @@ APP_FILES = ["simplmusik", "server.py", "simplmusik-ui"]
 SIZES = (32, 48, 64, 128, 256)
 
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+
+
+def bump():
+    """Tick the last part of VERSION up by one, in this file, and say what it
+    now reads. Called by build-all once both packages are built, so VERSION
+    above is always the number of the build you are about to cut rather than
+    the last one you cut - two builds never go out wearing the same number.
+
+    To move a whole version, set VERSION by hand - 0.2.0 - and the ticking
+    carries on from there. Nothing else in the tree names a version, so that
+    one line is the whole of it."""
+    head, _, last = VERSION.rpartition(".")
+    nxt = "%s.%d" % (head, int(last) + 1)
+    path = os.path.abspath(__file__)
+    with open(path) as f:
+        src = f.read()
+    with open(path, "w") as f:
+        f.write(src.replace('VERSION = "%s"' % VERSION,
+                            'VERSION = "%s"' % nxt, 1))
+    return nxt
 
 # Everything below is in the archive on every release still supported. yt-dlp
 # is the one name deliberately absent: apt's is too old to reach any audio, so

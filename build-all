@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Build both packages, replacing whatever is in build/.
+
+The .deb and the .flatpak are two halves of the same release, and they have to
+be cut from the same checkout or the download buttons in the README start
+handing out different apps. This runs the two builds back to back so that
+can't drift.
+
+    ./build-all                  # replace build/*.deb and build/*.flatpak
+    ./build-all --version 0.2.0  # ...with a version of your choosing
+
+Every build gets its own number. VERSION in build-deb is the one you are about
+to cut; it ticks up by .1 once both packages are built, so no two builds go out
+alike. Set that line by hand to move a whole version - 0.2.0 - and the ticking
+carries on from there. Naming a version with --version uses it as given and
+leaves the counter where it is.
+    ./build-all --fresh          # ...fetching yt-dlp again first
+    ./build-all --install        # ...and install the flatpak when it's done
+    ./build-all --keep           # leave both build trees for a look
+
+The deb goes first because it takes seconds: anything wrong with the checkout
+surfaces there rather than twenty minutes into compiling mpv.
+
+Use --fresh when cutting a release. The yt-dlp in build/yt-dlp.cache is reused
+between builds, which is what you want while working and not what you want in
+something you hand out - YouTube retires extractors within months, and a
+package is only as current as the copy frozen into it.
+
+Needs whatever the two builds need: dpkg-deb for one, flatpak and
+flatpak-builder for the other. Each says so itself if it's missing.
+"""
+
+import importlib.machinery, importlib.util, os, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BUILD = os.path.join(HERE, "build")
+CACHE = os.path.join(BUILD, "yt-dlp.cache")
+
+
+def load(filename, modname):
+    """Import a sibling script. None of them end in .py, so they are loaded by
+    path rather than found on sys.path."""
+    path = os.path.join(HERE, filename)
+    loader = importlib.machinery.SourceFileLoader(modname, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def run(script, args, label):
+    """One of the two builds, with its output left alone so its own progress
+    still reads the way it does when run directly."""
+    print("\n=== %s ===\n" % label, flush=True)
+    started = time.time()
+    r = subprocess.run([sys.executable, os.path.join(HERE, script)] + args,
+                       cwd=HERE)
+    if r.returncode != 0:
+        sys.exit("\n%s failed - nothing else was built." % script)
+    return time.time() - started
+
+
+def main():
+    args = sys.argv[1:]
+    deb = load("build-deb", "simplmusik_build_all_version")
+    version, pinned = deb.VERSION, "--version" in args
+    if pinned:
+        i = args.index("--version")
+        if i + 1 >= len(args):
+            sys.exit("--version needs a number, e.g. --version 0.2.0")
+        version = args[i + 1]
+
+    # Both builds take these and mean the same thing by them. --install and
+    # --fresh are this script's own: only the flatpak knows how to install
+    # itself, and the cache is shared, so dropping it here does both.
+    passthrough = ["--version", version]
+    if "--keep" in args:
+        passthrough.append("--keep")
+
+    if "--fresh" in args and os.path.isfile(CACHE):
+        os.remove(CACHE)
+        print("dropped the cached yt-dlp - it will be fetched again")
+
+    deb_args = list(passthrough)
+    flatpak_args = list(passthrough)
+    if "--install" in args:
+        flatpak_args.append("--install")
+
+    print("building simplmusik %s - both packages" % version)
+    took = run("build-deb", deb_args, "the Debian package")
+    took += run("build-flatpak", flatpak_args, "the flatpak")
+
+    # Both packages are built, so this number is spent: tick it over so the
+    # next build is a new version rather than a second copy of this one. A
+    # version asked for by hand is yours and is left alone.
+    if not pinned:
+        print("next build will be %s" % deb.bump())
+
+    print("\n=== done in %s ===\n" % human(took))
+    for name in ("simplmusik_%s_all.deb" % version,
+                 "simplmusik_%s.flatpak" % version):
+        p = os.path.join(BUILD, name)
+        if os.path.isfile(p):
+            print("  build/%-32s %6.1f MB" % (name, os.path.getsize(p) / 1e6))
+
+
+def human(seconds):
+    m, s = divmod(int(seconds), 60)
+    return "%dm %ds" % (m, s) if m else "%ds" % s
+
+
+if __name__ == "__main__":
+    main()

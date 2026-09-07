@@ -119,15 +119,15 @@ function moreRow(s) {
 
 function foundRows(box, s, pl) {
   const h = el('div', 'found-head');
-  h.append(el('strong', '', 'Add'),
-           el('span', 'from', s.finding ? 'searching YouTube\u2026'
-                              : pl ? 'from YouTube, into this playlist' : 'from YouTube'));
+  // One heading either way: what is happening, or what these rows are.
+  h.append(el('strong', '', s.finding ? 'Searching YouTube\u2026'
+                                      : 'Add from YouTube'));
   box.append(h);
   if (s.finding) return;
   // A search that failed says so. Reporting it as 'nothing found' would send
   // you off rewording a query when yt-dlp simply isn't installed.
   if (s.error)          return void box.append(el('div', 'none', s.error));
-  if (!s.found.length)  return void box.append(el('div', 'none', 'Nothing on YouTube either.'));
+  if (!s.found.length)  return void box.append(el('div', 'none', 'Nothing on YouTube.'));
   s.found.forEach(r => box.append(foundRow(r, pl)));
   if (s.found.length >= s.n) box.append(moreRow(s));
 }
@@ -265,6 +265,46 @@ function openPlaylist(file) {
   render();
 }
 
+/* Up and down walk the sidebar, from anywhere in the window - the one bit of
+   navigation you never have to click into first. The list they walk is the
+   sidebar exactly as it reads: All songs, then the playlists in their order.
+
+   Moving opens as it goes, rather than dragging a separate highlight around
+   for Enter to confirm. That is affordable because opening a playlist is a
+   local re-render and nothing more, and it means the orange chip is both
+   'where you are' and 'where the keyboard is' - one thing to follow instead
+   of two. It also means each step is one key rather than two.
+
+   Settings is not on the walk. It isn't a view of songs, so stepping onto it
+   would be stepping out of the library entirely; while it is open the arrows
+   do nothing at all, and you leave it the way you came in. */
+
+const sidebarViews = () => [null, ...state.lib.playlists.map(p => p.file)];
+
+/* The scroll only ever needs doing inside #playlists - All songs sits above
+   it in its own strip, and getting back to it means the list is at the top. */
+function revealView(i) {
+  const box = $('#playlists');
+  if (i === 0) box.scrollTop = 0;
+  else box.children[i - 1]?.scrollIntoView({ block: 'nearest' });
+}
+
+function stepSidebar(d) {
+  if (state.view === SETTINGS) return;
+  const views = sidebarViews();
+  // A search spans the whole library, so it sits on no row and there is
+  // nothing to step from: the first arrow enters the list from the end it is
+  // travelling away from, the way a cursor lands when it arrives.
+  const at = state.query ? -1 : views.indexOf(state.view);
+  const to = at < 0 ? (d > 0 ? 0 : views.length - 1)
+                    : Math.min(views.length - 1, Math.max(0, at + d));
+  // Stopping at the ends rather than wrapping: a list you can fall off the
+  // bottom of and reappear at the top of is a list you have to re-read.
+  if (to === at) return;
+  openPlaylist(views[to]);
+  revealView(to);
+}
+
 /* What a search box looks at. Both of them use this one, so the results
    under a playlist match what the top bar would have found. */
 const matches = (s, q) =>
@@ -316,8 +356,15 @@ function playlistArt(pl, songs, name, letterSize) {
    already wearing one gets a second button to take it off again. */
 function headArt(pl, songs, name) {
   const art = el('div', 'art');
+  // The library is not a playlist and has no cover of its own to wear. Borrowing
+  // the top song's art would make it look like one album out of all of them, so
+  // it shows the same note the sidebar gives it.
+  if (!pl) {
+    art.classList.add('note');
+    art.append(svg('i-note'));
+    return art;
+  }
   art.append(playlistArt(pl, songs, name));
-  if (!pl) return art;
 
   art.classList.add('editable');
   art.title = 'Change cover art';
@@ -427,7 +474,7 @@ function renderHead() {
   if (state.query) {
     const t = el('div');
     t.append(el('h1', '', 'Search'),
-             el('div', 'sub', `${plural(songs.length, 'result')} for “${state.query}” in your library`));
+             el('div', 'sub', `${plural(songs.length, 'result')} for “${state.query}”`));
     head.append(t);
     if (songs.length) {
       const acts = el('div', 'acts');
@@ -477,33 +524,31 @@ function renderHead() {
 
 /* In a playlist, a click plays from there and carries on through it. In the
    library or in search results there is no playlist to stay inside, so the
-   bare `play <song>` form starts the whole library at that song. */
+   bare `play <song>` form starts the whole library at that song. A caller
+   looking at a playlist while offering a song from outside it says so by
+   naming the list itself - null, meaning the library. */
 /* The playlist on screen, or null when it's the library. Searching spans the
    whole library, so a search is never inside a playlist. */
 const inPlaylist = () => (!state.query && state.view && state.view !== SETTINGS)
   ? state.view : null;
 
-function play(song) {
+function play(song, inside = inPlaylist()) {
   if (song.missing) return toast('“' + song.title + '” isn’t in your music folder');
-  const inside = inPlaylist();
   // No playlist named is how the CLI is told 'the library, from this song on'.
   // Naming a song still names it under shuffle: it starts there and draws on.
   run('play', ...(inside ? [inside] : []), song.file);
 }
 
 /* Start what is on screen, with no song in mind - the Play button at the top
-   and the one in the bar. A playlist goes by name and the CLI picks the song
-   it opens on, shuffled or not. The library has no name to go by: a bare
-   `play` would carry on with whatever playlist is already going, so a song is
-   named to mean 'the library, from there' - and shuffled, which song that is
-   is a draw, or the library would always open on the same track. */
+   and the one in the bar. Either way the CLI picks the song it opens on,
+   shuffled or not: a playlist goes by name, and the library by `--library`,
+   which is what says 'the library' rather than 'carry on with the playlist
+   that is playing'. Naming a song here would be the window choosing, and a
+   song the window chose is a song you chose - it wouldn't count as a play,
+   and the shuffle would be free to come straight back to it. */
 function playAll() {
-  const songs = currentSongs();
   const inside = inPlaylist();
-  if (inside) return run('play', inside);
-  if (!songs.length) return run('play');    // let the CLI say what's missing
-  const i = state.now.shuffle ? Math.floor(Math.random() * songs.length) : 0;
-  run('play', songs[i].file);
+  run('play', ...(inside ? [inside] : ['--library']));
 }
 
 /* The minus button. Inside a playlist it only edits that list, which is
@@ -707,7 +752,7 @@ function renderList() {
     const e = el('div', 'empty');
     if (state.view) {
       e.append(el('strong', '', 'This playlist is empty'),
-               el('div', '', 'Pick songs from your library below'));
+               el('div', '', 'Add songs below'));
     } else {
       emptyLibrary(e);
     }
@@ -717,7 +762,7 @@ function renderList() {
   }
 
   if (!songs.length) {
-    list.append(el('div', 'none', 'Nothing in your library matched.'));
+    list.append(el('div', 'none', 'Nothing matched.'));
     renderFound(list);
     return;
   }
@@ -764,8 +809,15 @@ function adderRow(song, pl) {
   const row = el('div', 'track pick');
   row.classList.toggle('gone', !!song.missing);
 
+  // Play sits where it sits on every other row - the left-hand column, shown
+  // when the pointer is over the row, in place of the number these rows
+  // haven't got. What is offered here is already a library song, so it is
+  // played exactly as it is played upstairs, and the two feel like one thing.
   const num = el('div', 'num');
   num.append(el('span', 'n', ''));
+  const p = svg('i-play');
+  p.setAttribute('class', 'play');
+  num.append(p);
 
   const art = el('div', 'art');
   art.append(cover(song));
@@ -778,11 +830,19 @@ function adderRow(song, pl) {
   add.append(svg('i-plus'));
   add.title = 'Add to \u201c' + pl.name + '\u201d';
   add.onclick = ev => { ev.stopPropagation(); addTo(pl, song.file); };
+  // The row plays on a double click, so the button keeps its own: a second
+  // click on it is someone adding twice, not asking for the song.
+  add.ondblclick = ev => ev.stopPropagation();
 
   const acts = el('div', 'row-acts');
   acts.append(add);
   row.append(num, art, t, el('div', 'album', song.album || ''),
              el('div', 'dur', time(song.duration)), acts);
+  // The adder only ever offers songs the playlist hasn't got, so there is no
+  // list here to play this one inside: it plays from the library, which is
+  // what a found song already downloaded does from these same rows.
+  row.ondblclick = () => play(song, null);
+  row.onclick = ev => { if (ev.detail === 1) play(song, null); };
   return row;
 }
 
@@ -793,13 +853,13 @@ function renderAdder(list) {
 
   const sec = el('div', 'found adder');
   const head = el('div', 'found-head');
-  head.append(el('strong', '', 'Add songs'), el('span', 'from', 'from your library'));
+  head.append(el('strong', '', 'Add songs'));
 
   const box = el('label', 'search');
   const inp = el('input');
   inp.type = 'text';               // not 'search': see the note in style.css
   inp.id = 'add-q';                 // named so a reload mid-typing leaves it be
-  inp.placeholder = 'Search your library';
+  inp.placeholder = 'Search songs';
   inp.autocomplete = 'off';
   inp.spellcheck = false;
   inp.value = state.addQuery;
@@ -818,9 +878,9 @@ function renderAdder(list) {
     rows.replaceChildren();
     if (options.length) options.forEach(s => rows.append(adderRow(s, pl)));
     else rows.append(el('div', 'none',
-      state.addQuery          ? 'Nothing in your library matched.'
-      : state.lib.songs.length ? 'Every song in your library is already here.'
-                               : 'No songs in your library yet.'));
+      state.addQuery          ? 'Nothing matched.'
+      : state.lib.songs.length ? 'Every song is already here.'
+                               : 'No songs yet.'));
 
     // ...and under that, what YouTube has, exactly as the top bar shows it -
     // the difference being that these land in this playlist.
@@ -856,21 +916,24 @@ function render() {
 /* ------------------------------------------------------------------ theme */
 /* Light or dark - and by default neither, because the desktop has already been
    asked that question and the window's job is to agree with the answer. A
-   choice made here is this window's own: it is kept in the browser rather than
-   in the library, since `simplmusik` in a terminal has no palette to set and a
-   music folder carried to another machine shouldn't carry this machine's
-   screen along with it. The key is the one the script in index.html reads
-   before the first paint, so a reopened window starts in the right palette
+   choice made here is this machine's own: it is kept in the config file beside
+   `shuffle` and `volume`, since `simplmusik` in a terminal has no palette to
+   set and a music folder carried to another machine shouldn't carry this
+   machine's screen along with it. It is not kept in the browser, because the
+   window is served on a free port picked fresh at every launch and a browser
+   files what a page saved under the address it came from - so a choice left
+   there would be looked for at an address that no longer exists, and every
+   launch would start over at 'system'. The server writes the saved choice into
+   index.html, which puts it on the element before the first paint and is where
+   it is read back from here, so a reopened window starts in the right palette
    instead of correcting itself in front of you. */
 
-const THEME_KEY = 'simplmusik.theme';
 const SYS_DARK = matchMedia('(prefers-color-scheme: dark)');
 
-// What was chosen, held here as well as in storage: a browser with storage
-// turned off still gets a window that changes when you click.
+// What was chosen, held here as well as on disk: the window follows the click
+// at once, and goes on working as you left it if the write never lands.
 let themeWant = (() => {
-  let v = null;
-  try { v = localStorage.getItem(THEME_KEY); } catch (e) {}
+  const v = document.documentElement.dataset.themeWant;
   return v === 'light' || v === 'dark' ? v : 'system';
 })();
 
@@ -880,6 +943,7 @@ function paintTheme() {
   const now = themeWant === 'system' ? (SYS_DARK.matches ? 'dark' : 'light')
                                      : themeWant;
   document.documentElement.dataset.theme = now;
+  document.documentElement.dataset.themeWant = themeWant;
   // The desktop window is listening for this, so the titlebar around the page
   // wears what the page wears - a pinned choice is the page's to tell it, and
   // nothing else knows. In a browser tab there is nobody on the other end.
@@ -888,11 +952,14 @@ function paintTheme() {
 
 function setTheme(pick) {
   themeWant = pick;
-  try {
-    if (pick === 'system') localStorage.removeItem(THEME_KEY);
-    else localStorage.setItem(THEME_KEY, pick);
-  } catch (e) {}
-  paintTheme();
+  paintTheme();           // the window changes on the click, not on the answer
+  // ...and the choice goes to the config file, which is where the next launch
+  // looks for it. Nothing waits on this and nothing is put back if it fails:
+  // the palette you clicked for is the one you are looking at either way.
+  fetch('/api/theme', { method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ theme: pick }) })
+    .catch(() => {});
 }
 
 /* Following the desktop means following it while the window is open, not only
@@ -1045,7 +1112,7 @@ function targetRow() {
   const range = state.lib.target_range || [-30, -12];
   const now = state.lib.target === undefined ? -20 : state.lib.target;
   return setRow(
-    label('Target loudness', 'Where every song is aimed, below full scale'),
+    label('Target loudness'),
     slider('set-target', range[0], range[1], 1, now, ' dB',
            v => run('target', String(v))));
 }
@@ -1054,11 +1121,7 @@ function renderSettings() {
   closeMenu();
   const head = $('#head');
   head.replaceChildren();
-  const title = el('div');
-  title.append(el('h1', '', 'Settings'),
-               el('div', 'sub',
-                  'Where your music is, how it sounds, and what is in it'));
-  head.append(title);
+  head.append(el('h1', '', 'Settings'));
 
   const page = el('div', 'settings');
   const root = state.lib.root || '';
@@ -1076,15 +1139,12 @@ function renderSettings() {
   if (typedFolder()) {
     box.append(setRow(...folderPicker()));
   } else {
-    box.append(setRow(label('Use a different folder',
-                            'Pick one from your desktop'),
+    box.append(setRow(label('Use a different folder'),
                       ...folderPicker('Change\u2026')));
   }
   page.append(box, el('div', 'hint',
-    'Everything inside the folder counts, however deep it sits — subfolders are '
-    + 'just where files happen to be, not something to browse. Songs you add or '
-    + 'download land here, and so do your playlists. Choosing a different folder '
-    + 'moves your playlists across with them; not one song is touched.'));
+    'Subfolders count too. Downloads and playlists land here. Changing the '
+    + 'folder moves your playlists across; no song is touched.'));
 
   page.append(el('div', 'set-sec', 'Playback'));
   const sound = el('div', 'panel');
@@ -1094,8 +1154,7 @@ function renderSettings() {
   const aim = targetRow();
   const show = on => on ? sound.append(aim) : aim.remove();
   sound.append(setRow(
-    label('Even loudness',
-          'Play every song at the same loudness, whatever it was mastered at'),
+    label('Even loudness', 'Play every song at the same volume'),
     toggle(levelled, async on => {
       show(on);                 // follow the switch at once, not the round trip
       const r = await run('levelling', on ? 'on' : 'off');
@@ -1105,34 +1164,18 @@ function renderSettings() {
     })));
   show(levelled);
   page.append(sound, el('div', 'hint',
-    'Your music is never written to — each song is measured the first time you '
-    + 'play it, which takes a second or two, and played through a matching '
-    + 'volume change after that. A song is never turned up past the point where '
-    + 'its loudest moment would distort, so it can end up a shade quieter than '
-    + 'the rest, never louder and never clipped. Changing this restarts the song '
-    + "you're on where it is, so you can hear the difference straight away."
-    + ' The target is where all of them are aimed, counted down from the loudest '
-    + 'a sample can be. Aim quieter and every song can reach it; aim louder and '
-    + 'the songs with the least room left start falling short of the rest, which '
-    + 'is the one thing that puts them back out of step. Moving it measures '
-    + 'nothing again - the songs you have played are already measured, and only '
-    + 'the sum changes.'));
+    'Songs are measured the first time you play them. Your files are never '
+    + 'changed, and nothing is ever turned up loud enough to distort.'));
 
   page.append(el('div', 'set-sec', 'Appearance'));
   const look = el('div', 'panel');
   look.append(setRow(
-    label('Theme', 'Light, dark, or whatever your desktop is set to'),
+    label('Theme'),
     segment([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']],
             themePick(), setTheme)));
   page.append(look, el('div', 'hint',
-    'System is the one that needs no maintenance: the window wears whatever '
-    + 'your desktop has been told to wear, and changes with it while it is '
-    + 'open, so a desktop that goes dark in the evening takes the window along. '
-    + 'Light and dark pin it to the one you pick whatever the desktop says. '
-    + 'This is a setting of this window on this machine - your music, your '
-    + 'playlists and everything the terminal does are untouched by it, and a '
-    + 'music folder synced to another machine arrives there wearing that '
-    + "machine's choice."));
+    'System follows your desktop. This is a setting of this window on this '
+    + 'machine only.'));
 
   page.append(el('div', 'set-sec', 'Library'));
   const info = el('div', 'panel');
@@ -1142,12 +1185,13 @@ function renderSettings() {
               setRow(label('Playlists'),
                      el('div', 'val', String(state.lib.playlists.length))),
               setRow(label('Not found',
-                           missing ? 'In a playlist, but not in your music folder' : ''),
+                           missing ? 'In a playlist, not in your folder' : ''),
                      el('div', 'val', String(missing))),
-              setRow(label('Playlists are kept in'),
+              setRow(label('Playlists folder'),
                      el('div', 'val', state.lib.playlists_dir || '')));
   page.append(info);
-
+  page.append(el('div', 'hint',
+    'simplmusik - A JJM8 Production.'));
   $('#list').replaceChildren(page);
 }
 
@@ -1307,7 +1351,7 @@ function foundRow(r, pl) {
   acts.append(act);
   row.append(num, art, t, el('div', 'album', ''),
              el('div', 'dur', time(r.duration)), acts);
-  row.title = r.song ? 'Play' : 'Play now, without downloading it first';
+  row.title = r.song ? 'Play' : 'Play without downloading';
   row.ondblclick = () => playFound(r, pl);
   row.onclick = ev => { if (ev.detail === 1) playFound(r, pl); };
   // A row built mid-download starts where the download actually is, so a
@@ -1541,13 +1585,27 @@ async function poll() {
 
 /* --------------------------------------------------------------- controls */
 
-$('#c-play').onclick = () => {
+/* The transport as functions, with the buttons as one caller of them and the
+   keyboard as another. A shortcut that reached for .click() would be taking
+   the bar's word for what is possible - and the bar disables skip, back and
+   stop while nothing is playing, which is a statement about a button being
+   worth pressing, not about what the key should do.
+
+   So the keys ask the same question the buttons do and get their own answer:
+   asked for the next song with nothing playing, there is still a view on
+   screen and starting it is what 'next' means there. */
+
+function playPause() {
   const n = state.now;
   if (!n.playing) return playAll();
   run(n.paused ? 'resume' : 'pause');
-};
-$('#c-skip').onclick = () => run('skip');
-$('#c-back').onclick = () => run('back');
+}
+const nextTrack = () => state.now.playing ? run('skip') : playAll();
+const prevTrack = () => state.now.playing ? run('back') : playAll();
+
+$('#c-play').onclick = playPause;
+$('#c-skip').onclick = nextTrack;
+$('#c-back').onclick = prevTrack;
 $('#c-stop').onclick = () => run('stop');
 
 /* A switch, not a jump: it never starts anything. On, everything played from
@@ -1654,10 +1712,18 @@ function barTime(e) {
 }
 
 function seekTo(secs) {
-  scrub = Math.max(0, secs);
+  // Held here as well as in `scrub`, because renderPlayer is entitled to drop
+  // the pending position while it paints - a new song clears it, and so does
+  // one that lands near where the server already says we are. That is the
+  // right call about the bar and the wrong one about the command: what was
+  // asked for still has to be sent, and reading it back off `scrub` meant a
+  // seek onto the playhead, or the first one after a track change, threw and
+  // went nowhere.
+  const to = Math.max(0, secs);
+  scrub = to;
   asked = Date.now();
   renderPlayer();
-  run('seek', scrub.toFixed(1));
+  run('seek', to.toFixed(1));
 }
 
 bar.onpointerdown = e => {
@@ -1712,7 +1778,7 @@ $('#dlg-ok').onclick     = async () => {
   if (r.ok) { await loadLibrary(); openPlaylist(r.data?.created || name);
               toast('Created “' + name + '”'); }
 };
-$('#dlg-name').onkeydown = e => { if (e.key === 'Enter') $('#dlg-ok').click(); };
+dlg.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('#dlg-ok').click(); } };
 
 /* delete playlist -------------------------------------------------------- */
 
@@ -1774,10 +1840,16 @@ document.onkeydown = e => {
     if (e.target === q && q.value) $('#clear-q').click();
   }
   else if (typing || modal) return;
-  else if (e.key === ' ') { e.preventDefault(); $('#c-play').click(); }
-  else if (e.key === 'n' && state.now.playing) $('#c-skip').click();
-  else if (e.key === 'p' && state.now.playing) $('#c-back').click();
-  else if (e.key === 's') $('#c-shuffle').click();
+  else if (e.key === ' ') { e.preventDefault(); playPause(); }
+  else if (e.key === 'n') nextTrack();
+  else if (e.key === 'p') prevTrack();
+  else if (e.key === 's') run('shuffle');
+  // Up and down are the sidebar's wherever you are standing. They are taken
+  // before the page can scroll on them, which is the default they replace.
+  else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    stepSidebar(e.key === 'ArrowDown' ? 1 : -1);
+  }
   else if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && state.now.playing) {
     e.preventDefault();
     seekTo((state.now.elapsed || 0) + (e.key === 'ArrowRight' ? 5 : -5));

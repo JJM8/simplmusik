@@ -51,17 +51,56 @@ answers a socket saying what. `status` here, and the window, and a second
 terminal all ask it the same question and get the same answer, because there
 is only one place the answer lives.
 
-The player keeps two lists. `songs` is the pool it draws from; `order` is what
-it has actually played, grown one song at a time. So `order` is the history,
-which is what `back` walks and what shuffle checks to avoid replaying
-something you just heard - one list doing the work of three.
+The player keeps two lists and a tally. `songs` is the pool it draws from;
+`order` is what it has actually played, grown one song at a time, so it is the
+history and what `back` walks. `plays` is how many times each song has been
+played, kept per playlist - your library is a playlist here too, being a pool
+like any other, and the same song sitting in two of them is two separate
+things owed, because it is each list that has to come out even.
 
-Shuffle is a setting, not a session. It sits in the config file beside
+The draw is two rules, in this order. Nothing heard in the last half a
+playlist, ever - which for two songs is the one you are on, so a pair still
+alternates. Then, of what is left, the songs the playlist has played fewest,
+and chance between those. So a playlist comes out even round by round, every
+song once before any song twice, and the window decides how much freedom the
+levelling has within that.
+
+The two cannot deadlock. j songs into a round the fewest-played pool holds
+N-j songs, while the window can bar at most N//2 - j of them, and N-j is
+always the larger. Only a one-song playlist runs out of songs, and then it
+plays the one song there is.
+
+`heard` and `plays` are deliberately not the same list. Everything that comes
+out of the speakers goes in `heard`, whoever chose it - your ears cannot tell
+who picked the song, so neither does the window. Only choices the queue itself
+made go in `plays`: a song the draw chose, and the song a playlist opens on,
+since putting a list on is starting it and the song you start it on is a song
+you have heard, whether you named it or the draw did. Picking a song out of a
+playlist that is already going is the case that counts for nothing - that is
+you moving about inside it, so the shuffle still owes that song what it owed
+before.
+
+Left to the draw, the counts are never more than one apart, because the only
+thing that moves them takes a song from the bottom of the tally to the top.
+Clicking about can put them two apart for a moment: a song you clicked is
+barred by the window but was never counted, so the draw may have to play
+something a second time while the song it owes waits out its half a playlist.
+It comes back level as soon as that song is free again, and the window is the
+rule that gives way to nothing.
+
+A session is playing that never stopped, however you got there. It survives
+skipping, pausing, and putting on another playlist - a queue is swapped under
+the player, but the counts stay with the player, each list's own kept apart
+from the rest. Come back to a playlist mid-session and it is owed what it was
+owed. It ends when the music does: `stop`, or a queue running out, and the
+next play starts everything at nought.
+
+Shuffle itself is a setting, not a session. It sits in the config file beside
 levelling, so it stays on until you turn it off and everything played from
 then on - from here or from the window - is shuffled. `play --shuffle` is that
 same switch thrown on the way past. Name a song and a shuffled play still
 starts on it and draws from there on; name none and the opening song is a draw
-too, so a playlist doesn't always open on the same track.
+like any other, counted like any other.
 
 Seeking moves the mpv that is already playing, so a song carries on rather
 than starting again. How far into a song we are is mpv's own `time-pos`, and
@@ -1006,17 +1045,104 @@ class Mpv:
 
 # -------------------------------------------------------------------- player
 
+def window_of(songs):
+    """How far back "lately" reaches: half the pool. Two songs means one, which
+    is the song you are on - so the other is always fair game, and a pair still
+    alternates instead of seizing up."""
+    return max(1, min(len(songs) - 1, len(songs) // 2))
+
+def draw(songs, plays, heard=()):
+    """The shuffle draw, in two steps that cannot fight each other.
+
+    First the hard rule: nothing heard in the last half a playlist, however it
+    came to be heard. That one is absolute - a song you clicked counts as
+    heard just as much as one the draw chose, because your ears cannot tell
+    the difference and the whole point is not to hear it again so soon.
+
+    Then, of what is left, the songs the playlist has played fewest, and
+    chance between those. So a playlist still comes out even round by round,
+    and the levelling decides the order within what the window allows.
+
+    They cannot deadlock in a real playlist. j songs into a round, the fewest-
+    played pool holds N-j songs while the window can bar at most N//2 - j of
+    them, and N-j is always the larger. Only a one-song playlist runs out, and
+    then the fallbacks hand back the one song there is."""
+    recent = set(heard[-window_of(songs):])
+    fresh = ([s for s in songs if s not in recent]
+             or [s for s in songs if s != (heard[-1] if heard else None)]
+             or list(songs))
+    fewest = min(plays.get(s, 0) for s in fresh)
+    return random.choice([s for s in fresh if plays.get(s, 0) == fewest])
+
+def pool_key(job):
+    """Which tally a queue counts into. A count is a playlist's, not a song's:
+    the same song in two playlists is two different things owed, because it is
+    the playlist that has to come out even. The library is a pool like any
+    other and keeps its own, under a name no playlist can have."""
+    return job.get("playlist") or ""
+
+def tally(job):
+    """This queue's counts: what its playlist has heard so far this session."""
+    return (job.get("plays") or {}).get(pool_key(job)) or {}
+
+def heard_in(job):
+    """What this queue's playlist has heard lately, oldest first."""
+    return (job.get("heard") or {}).get(pool_key(job)) or []
+
+def note_heard(job, song):
+    """Remember that a song has just been heard - every song that starts, and
+    it does not matter at all who chose it.
+
+    This is not the tally beside it. `plays` is what the draw owes each song,
+    so only the queue's own choices move it; `heard` is what came out of the
+    speakers, so everything does. Keeping them apart is what lets a song you
+    clicked be barred from coming round again without also being counted as a
+    play the shuffle owed you.
+
+    A song already in the line moves to the end of it rather than sitting
+    twice, and the line is trimmed to the pool: no window reaches further."""
+    heard, key = job.get("heard") or {}, pool_key(job)
+    line = [s for s in heard_in(job) if s != song] + [song]
+    job["heard"] = dict(heard, **{key: line[-max(1, len(job.get("songs") or [1])):]})
+
+def count_play(job, song):
+    """Count a play into this queue's playlist, and hand the song back.
+
+    What counts is the queue choosing: the draw, and the song a playlist opens
+    on. What doesn't is you choosing mid-playlist - click your way around all
+    evening and the counts do not move, so what the draw owes each song is
+    unchanged when you leave it to the draw again."""
+    plays, key, was = job.get("plays") or {}, pool_key(job), tally(job)
+    counted = dict(was, **{song: was.get(song, 0) + 1})
+    # New dicts rather than changed ones, at both levels: the socket thread
+    # reads this while the playing loop counts, and swapping the whole thing
+    # over means it can only ever see one tally or the next, never one being
+    # written into.
+    job["plays"] = dict(plays, **{key: counted})
+    return song
+
+def credit_start(job):
+    """The song a queue opens on, counted unless it is you moving about inside
+    a playlist that is already going.
+
+    Two ways it counts. It was drawn, which is the shuffle choosing. Or it is
+    the first thing this playlist has played all session - putting a playlist
+    on is starting it, and the song you start it on is a song you have heard,
+    whether you named it or the draw did. What is left is the case that must
+    not count: playlist already running, and you pick a song out of it.
+
+    `play` does the drawing itself, because it is what tells you which song it
+    has started - but the counting belongs here, with the session, which is the
+    only place that knows what a playlist has heard already."""
+    opening = pool_key(job) not in (job.get("plays") or {})
+    if (job.pop("drawn", False) or opening) and job.get("order"):
+        count_play(job, job["order"][0])
+
 def pick(job):
-    """The next song when shuffling: random, but never one of the last few
-    played. The window is half the pool, so a long playlist gets a long memory
-    and a short one still moves. The fallbacks matter only at the very bottom:
-    two songs alternate, and one song repeats rather than ending playback."""
-    songs, order = job["songs"], job["order"]
-    window = max(1, min(len(songs) - 1, len(songs) // 2))
-    recent = set(order[-window:])
-    return random.choice([s for s in songs if s not in recent]
-                         or [s for s in songs if s != order[-1]]
-                         or songs)
+    """The next song when shuffling: the draw, over the pool we are playing,
+    counted because we are the one choosing. The song just finished is the
+    last thing heard, so the window keeps it out without being told to."""
+    return count_play(job, draw(job["songs"], tally(job), heard_in(job)))
 
 def advance(job, step):
     """Move one song. Going back walks `order`, which is the history, so it
@@ -1098,6 +1224,11 @@ def serve_control(job, want, guard, wake_w, finish):
         op = req.get("op")
         if op == "now":
             return snapshot()
+        if op == "plays":               # the session's counts and its recent
+            with guard:                 # songs, for the one caller that needs
+                return {"ok": True,     # them: `play`, drawing what to open on
+                        "plays": dict(job.get("plays") or {}),
+                        "heard": dict(job.get("heard") or {})}
         if op == "play":                # a new queue for the player we already
             new = req.get("job")        # have, rather than a second player
             if not new:
@@ -1112,12 +1243,23 @@ def serve_control(job, want, guard, wake_w, finish):
             nudge(stop=True)
             return {"ok": True}
         if op == "pause":
+            # `job["paused"]` is the whole truth about whether we are paused,
+            # and this is the only place anything outside sets it. The note
+            # left for the loop carries no value of its own - it says "mpv
+            # disagrees with the flag", so the loop reads the flag when it gets
+            # there rather than acting on a copy taken now. It is sent whether
+            # the flag moved or not, which makes it a repair as much as a
+            # command: any disagreement is settled by the next pause either way.
             with guard:
-                job["paused"] = (not job.get("paused") if req.get("want") is None
+                was = bool(job.get("paused"))
+                job["paused"] = (not was if req.get("want") is None
                                  else bool(req["want"]))
-                paused = job["paused"]
-            nudge(pause=paused)
-            return {"ok": True, "paused": paused}
+                paused, song = job["paused"], job.get("song")
+            nudge(pause=True)
+            # `changed` is what lets a caller say "already paused" honestly
+            # instead of claiming an act it didn't perform.
+            return {"ok": True, "paused": paused, "changed": paused != was,
+                    "song": song}
         if op == "seek":
             nudge(seek=max(0.0, float(req.get("pos") or 0)))
             return {"ok": True}
@@ -1229,6 +1371,9 @@ def player(job):
                 pass
         os._exit(code)
 
+    # Counted before anything can ask, because the session starts here: the
+    # song we were handed is the first play of it, if a draw is what chose it.
+    credit_start(job)
     # Answering starts before mpv does, so a `play` that has only just
     # returned is already something `status` and the window can ask about.
     serve_control(job, want, guard, wake_w, finish)
@@ -1248,8 +1393,15 @@ def player(job):
                 (keep if k in ("swap", "restart") else todo)[k] = v
             want.clear()
             want.update(keep)
-        if "pause" in todo:
-            mpv.send("set_property", "pause", todo["pause"])
+        if todo.get("pause"):
+            # Read here, not where the command was taken: a song can end in
+            # between, and ending one lands us playing the next. The flag knows
+            # that and a value carried over from before it would not - which is
+            # how mpv and the flag used to end up disagreeing, leaving playback
+            # silent while everything that asked was told it was playing.
+            with guard:
+                paused = bool(job["paused"])
+            mpv.send("set_property", "pause", paused)
         if "seek" in todo:
             at = todo["seek"]
             local = local_copy(job, job["song"])
@@ -1292,11 +1444,19 @@ def player(job):
         with guard:
             swap = want.pop("swap", None)
             if swap is not None:
-                seq = job.get("seq", 0)
+                seq, plays = job.get("seq", 0), job.get("plays") or {}
+                heard = job.get("heard") or {}
                 job.clear()
                 job.update(swap)
                 job["seq"] = seq        # keeps counting: a caller watching for
                 at, resuming = 0.0, False   # the song to change still sees it
+                # The counts are the session's, not the queue's: press play on
+                # another playlist and this one is still owed what it was owed
+                # if you come back to it before the music stops. What it has
+                # heard lately stays with it for the same reason - a new queue
+                # on the same playlist is not a reason to hear a song again.
+                job["plays"], job["heard"] = plays, heard
+                credit_start(job)
                 # Whatever was asked of the queue we have just put down does
                 # not carry over to the one we are picking up: the stop that
                 # came with the swap is the swap, and a seek was into a song
@@ -1306,6 +1466,10 @@ def player(job):
         if not 0 <= job["index"] < len(job["order"]):
             break                       # queue finished
         job["song"] = job["order"][job["index"]]
+        # Heard is heard: this is the one place a song actually starts, so it
+        # is the one place the window is told about, and it takes draws, songs
+        # you clicked and songs you walked back to without distinguishing.
+        note_heard(job, job["song"])
         path = job["paths"][job["song"]]
         if not resuming:
             # A song picked back up off the disk keeps the gain it was already
@@ -1784,11 +1948,19 @@ def cmd_play(args):
         set_setting("shuffle", True)
     shuffle = shuffling()
     name, song = args.playlist, args.song
+    # `--library` asks for the library by name, which nothing else can: a bare
+    # `play` carries on with the playlist that is going, and naming a song to
+    # mean the library gives away which song it opens on. It is how the window
+    # starts the library shuffled and lets the draw choose, rather than picking
+    # a song itself and calling it a start.
+    library = getattr(args, "library", False)
     # A bare song name means the library, starting there - and it means the
     # library even while a playlist is playing, so `play SONG` never quietly
     # scopes itself to whatever happened to be on at the time.
     if name and not song and not find(name) and os.path.basename(name) in idx:
         name, song = None, name
+    elif library:
+        name, song = None, name or song
     else:
         name = name or st.get("playlist")
 
@@ -1808,9 +1980,23 @@ def cmd_play(args):
         return fail(args.json, "nothing in %s is in your music folder" % where
                     if listed else "%s is empty" % where, 2)
 
-    # Shuffled with no song named, the opening song is a draw like every
-    # other one - otherwise a shuffled playlist would always start the same.
-    start = random.choice(songs) if shuffle else songs[0]
+    # Shuffled with no song named, the opening song is a draw like every other
+    # one - so a playlist doesn't always start the same, and so it is levelled
+    # against what this playlist has already heard rather than landing
+    # anywhere. The counts come from the player because that is where they
+    # live, and the ones that matter are this playlist's own: nothing playing,
+    # or a playlist not played yet, is an empty tally either way.
+    session = ask({"op": "plays"}) or {}
+    key = name or ""
+    # What this playlist has heard lately, and then the song sounding right
+    # now - which is the most recent thing heard by definition, even when it
+    # belongs to some other playlist and the window is the only thing here
+    # that will care about it.
+    lately = [s for s in (session.get("heard") or {}).get(key) or []
+              if s != st.get("song")] + ([st["song"]] if st.get("song") else [])
+    drawn = shuffle and not song
+    start = (draw(songs, (session.get("plays") or {}).get(key) or {}, lately)
+             if drawn else songs[0])
     if song:
         start = os.path.basename(song)
         if start not in songs:
@@ -1825,8 +2011,11 @@ def cmd_play(args):
     # naming a song starts there and carries on rather than stopping after it.
     # `paths` is where each one is: worked out once here, so the player never
     # has to search for a file and the queue can't shift under it mid-song.
+    # `drawn` says whether the shuffle chose the opening song. Whether it
+    # counts as a play is the player's to decide - it is the one that knows
+    # whether this playlist is being started or moved about in.
     job = {"playlist": name, "songs": songs, "paths": paths, "order": [start],
-           "index": 0, "song": start, "paused": False,
+           "index": 0, "song": start, "paused": False, "drawn": drawn,
            "shuffle": shuffle, "step": 1, "seq": 0}
     if not start_playing(job):
         return fail(args.json, "couldn't start the player", 1)
@@ -1850,13 +2039,23 @@ def cmd_shuffle(args):
     return emit(args.json, {"shuffle": on}, "shuffle " + ("on" if on else "off")) or 0
 
 def cmd_pause(args, want=True):
-    st = playing()
-    if not st:
+    """Hold the song, or let it go again - and say what actually happened.
+
+    One question to the player, which is the one thing that knows whether it
+    was already paused, so what is printed is its answer rather than what it
+    was asked for. Asking what was playing and then telling it to pause would
+    be two answers from two moments, with the song free to change in between
+    and nothing gained: the player has to make the decision either way."""
+    r = ask({"op": "pause", "want": want})
+    if not (r and r.get("ok")):
         return fail(args.json, "nothing playing", 1)
-    if bool(st.get("paused")) != want:
-        send("pause", want=want)
-    return emit(args.json, {"paused": want, "song": st["song"]},
-                "%s %s" % ("paused" if want else "resumed", st["song"])) or 0
+    paused, song = bool(r.get("paused")), r.get("song") or "the song"
+    state = "paused" if paused else "playing"
+    return emit(args.json,
+                {"paused": paused, "song": r.get("song"),
+                 "changed": bool(r.get("changed"))},
+                "%s %s" % ("paused" if paused else "resumed", song)
+                if r.get("changed") else "%s is already %s" % (song, state)) or 0
 
 def cmd_move(args, op):
     st = playing()
@@ -2418,7 +2617,7 @@ COMMANDS = [
     ("stream",  "play a search result now, and fetch it as it plays", "id",          None),
     ("remove",  "drop a song from a playlist, or delete it",      "playlist song?",  None),
     ("delete",  "delete a playlist (its songs stay)",             "playlist",        None),
-    ("play",    "play a playlist, one song, or the library",      "playlist? song?", "shuffle"),
+    ("play",    "play a playlist, one song, or the library",      "playlist? song?", "shuffle library"),
     ("shuffle", "play in a random order, until you turn it off",   "action?",         None),
     ("levelling","play every song at one loudness",               "action?",         None),
     ("target",  "the loudness levelling aims for, in dB",          "db?",             None),
@@ -2469,17 +2668,22 @@ def main(argv=None):
         for spec in positional.split():
             p.add_argument(spec.rstrip("?+"),
                            nargs={"?": "?", "+": "+"}.get(spec[-1]))
-        if flag == "cover":
-            p.add_argument("--cover", help="an image to use as its cover art")
-        elif flag == "clear":
-            p.add_argument("--clear", action="store_true",
-                           help="take the cover art off again")
-        elif flag == "shuffle":
-            p.add_argument("--shuffle", action="store_true",
-                           help="turn shuffle on, and play shuffled")
-        elif flag == "count":
-            p.add_argument("--count", type=int, default=SEARCH_N,
-                           help="how many results to bring back (up to %d)" % SEARCH_MAX)
+        for f in (flag or "").split():
+            if f == "cover":
+                p.add_argument("--cover", help="an image to use as its cover art")
+            elif f == "clear":
+                p.add_argument("--clear", action="store_true",
+                               help="take the cover art off again")
+            elif f == "shuffle":
+                p.add_argument("--shuffle", action="store_true",
+                               help="turn shuffle on, and play shuffled")
+            elif f == "library":
+                p.add_argument("--library", action="store_true",
+                               help="play the whole library, whatever is on now")
+            elif f == "count":
+                p.add_argument("--count", type=int, default=SEARCH_N,
+                               help="how many results to bring back (up to %d)"
+                                    % SEARCH_MAX)
 
     args = ap.parse_args(argv)
     if args.cmd == "help":

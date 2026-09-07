@@ -449,10 +449,13 @@ mpv is started with `--no-config`, so an `mpv.conf` of your own never quietly
 becomes part of how this sounds. The levelling below is the only thing that
 touches the volume.
 
-It keeps two lists. **`songs`** is the pool it draws from, and **`order`** is
-what it has actually played, grown one song at a time. So `order` is the
-history, which is what `back` walks and what shuffle checks to avoid replaying
-something you just heard - one list doing the work of three.
+It keeps two lists and a tally. **`songs`** is the pool it draws from,
+**`order`** is what it has actually played, grown one song at a time - so
+`order` is the history, which is what `back` walks - and **`plays`** is how
+many times each song has been played, **kept per playlist**. Your library is a
+playlist here too, being a pool like any other, and a song sitting in two lists
+is two separate things owed: it is each list that has to come out even, not the
+song that has to be fair to itself.
 
 **Shuffle is a switch, not a jump.** `simplmusik shuffle` toggles it,
 `shuffle on` / `shuffle off` set it outright, and the button in the window is
@@ -467,22 +470,87 @@ own for your library, and naming a song still starts on that song and draws
 from there on. With no song named, the opening song is a draw too, so a
 shuffled playlist doesn't always open on the same track.
 
-Each next song is picked at random from what you haven't heard lately: never
-the current song, and never the last half a playlist-length of them. So a
-10-song playlist won't repeat within 5, and a 100-song one won't within 50. It
-runs on indefinitely rather than ending.
+**The draw is a window, then a levelling** - in that order, and the order is
+the point.
+
+*The window is absolute.* Nothing heard in the last half a playlist can be
+drawn, however it came to be heard. A 10-song playlist won't repeat within 5,
+a 100-song one within 50. Two songs means a window of one - the song you are
+on - so the other is always fair game and a pair alternates instead of seizing
+up: start one, skip, and the song you skipped to was never barred, because the
+song you left is the whole of the half.
+
+*The levelling decides the rest.* Of the songs the window allows, the ones the
+playlist has played fewest, at random among those. So it still comes out round
+by round - every song once before any song twice, in a different order each
+round - and runs on indefinitely rather than ending.
+
+They cannot deadlock in a real playlist: j songs into a round the fewest-played
+pool holds N-j songs while the window can bar at most N//2 - j of them, and
+N-j is always the larger. A one-song playlist is the only one that runs out,
+and it plays its one song.
+
+**Two things count as a play.** A song the draw chose. And the song a playlist
+*opens* on - putting a list on is starting it, and the song you start it on is
+a song you have heard, whether you named it or the draw did.
+
+**One thing doesn't:** picking a song out of a playlist that is already going.
+That is you moving about inside it rather than the shuffle choosing, so the
+draw still owes that song exactly what it owed it before, and the song it
+picks *after* yours counts like any other. The difference between the two
+cases is only ever whether that playlist has played anything yet this session.
+
+That is what keeps the tally flat: the only thing that moves a count is a
+choice the queue made, and it only ever moves a song from the bottom of the
+tally to the top, so left to the draw no two songs in a pool are ever more
+than one play apart.
+
+**`heard` is not `plays`,** and the difference is the whole trick. Everything
+that comes out of the speakers goes in `heard` - draws, songs you clicked,
+songs you walked back to - because your ears cannot tell who chose the song,
+so the window doesn't either. Only the queue's own choices go in `plays`. That
+is what lets a song you clicked be barred from coming round again without also
+being counted as a play the shuffle owed you.
+
+It has one visible consequence: clicking about can put the tally two apart for
+a moment. A song you clicked is barred by the window but was never counted, so
+the draw may play something a second time while the song it owes sits out its
+half a playlist. It comes back level as soon as that song is free. The window
+gives way to nothing - that is what "impossible" means here, and the levelling
+is the rule that bends.
+
+**A session is playing that never stopped**, however you got there. The tally
+belongs to the player process, not to the queue, so it survives skipping,
+pausing, and putting on a different playlist - a queue is swapped underneath
+the player and the counts stay put, each list's own kept apart from the rest.
+Coming back to a playlist mid-session comes back to what it was owed, and that
+is also why coming back to it is not *starting* it: the list has played
+something already, so a song you pick there is a jump, not an opening. It ends
+when the music does: `stop`, or a queue running out. The next `play` starts
+everything at nought.
+
+The song a queue *opens* on is drawn the same way and counted the same way.
+`play` does that first draw itself - it is what tells you
+which song it started - asking the player for the session's counts so the
+opening song is levelled against a session already running rather than landing
+anywhere. `play --library` is how the window says "the library, shuffled,
+you choose the song": a bare `play` would carry on with the playlist that is
+going, and naming a song would make the *window* the one that chose it.
 
 ```sh
 simplmusik shuffle                  # flip the switch
 simplmusik shuffle on               # ...or set it outright
 simplmusik play --shuffle           # on, and play your library from a draw
+simplmusik play --library           # the library, whatever is playing now
 simplmusik play --shuffle 'Road trip'                            # a playlist
 simplmusik play --shuffle 'Road trip' 'Killer Queen - Queen.mp3' # from there
 ```
 
 **`back`** steps back through `order`, so under shuffle it retraces exactly
 what you heard rather than picking something new. At the first track it
-restarts that track instead of stopping.
+restarts that track instead of stopping. Walking the history counts nothing -
+those plays were counted when they were drawn, and hearing them again is not
+the shuffle choosing.
 
 **Seeking** moves the mpv that is already playing, so the song carries on from
 the new point rather than starting again. `simplmusik seek 1:23` jumps to a
@@ -578,13 +646,28 @@ window wears whatever your desktop has been told to wear, and follows it while
 it is open, so a desktop that goes dark in the evening takes the window along.
 Light and dark pin it whatever the desktop says.
 
-That choice is the one setting that isn't a CLI call. It belongs to this window
-on this machine rather than to your library - `simplmusik` in a terminal has no
-palette to set, and a music folder synced to another machine shouldn't drag this
-machine's screen along with it - so it's kept in the browser, under
-`simplmusik.theme`, and read by a few lines in `index.html` before the first
-paint so a reopened window never starts in the wrong palette and corrects itself
-in front of you.
+That choice is the one setting that isn't a CLI call. It belongs to this machine
+rather than to your library - `simplmusik` in a terminal has no palette to set,
+and a music folder synced to another machine shouldn't drag this machine's
+screen along with it - so it goes to `~/.config/simplmusik/config.json` under
+`theme`, beside `shuffle` and `volume`, through a `POST /api/theme` that exists
+precisely because there is no command to run instead.
+
+It is deliberately *not* kept in the browser, which is where it started and
+where it did not work. The window is served on a free port picked fresh at every
+launch, and a browser files what a page stored under the address it came
+from - so every launch arrived at an address nothing had ever been saved under,
+found nothing, and started over at *System*. Anything the page needs to remember
+across launches has to be kept behind the server for the same reason.
+
+Reading it back is `index.html`'s job, before the first paint, so a reopened
+window never starts in the wrong palette and corrects itself in front of you.
+The server writes the saved choice into the file as it serves it, replacing a
+`__THEME__` token in the few lines at the top; `app.js` reads it off the
+`data-theme-want` attribute those lines set. The substitution only ever puts one
+of `system`, `light` or `dark` into the page - a config hand-edited to anything
+else reads as `system` - so there is nothing there for a value to inject
+through.
 
 The desktop window has to agree with the page it frames, or the titlebar ends up
 the odd one out. `simplmusik-ui` reads the desktop's preference - through the
