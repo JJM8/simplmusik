@@ -18,8 +18,6 @@ A local music player. Written in Python, native to Linux.
 - download any music for FREE, into your library or straight into a playlist
 - audio levelling, so songs sit at the same volume
 
-![The library](screenshots/library.png)
-
 Playlists sit beside it, with whatever's playing along the bottom.
 
 ![A playlist](screenshots/playlist.png)
