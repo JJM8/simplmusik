@@ -42,11 +42,14 @@ Commands:
   stop                       stop playback
 Add --json to any command for machine-readable output.
 
-How playback works: `play` starts one detached player process that owns the
-queue and drives one long-lived mpv, telling it a song at a time over mpv's
-JSON IPC socket. It rewrites the state file at
-every song change, so the state file always names the song actually sounding
-- which is what makes `status` correct, including after a skip.
+How playback works: there is one player. `play` starts a detached process that
+owns the queue and drives one long-lived mpv, telling it a song at a time over
+mpv's JSON IPC socket - and if one is already running, `play` hands it the new
+queue instead of starting a second. What is playing is not written down
+anywhere: it is that process, which holds an exclusive lock saying so and
+answers a socket saying what. `status` here, and the window, and a second
+terminal all ask it the same question and get the same answer, because there
+is only one place the answer lives.
 
 The player keeps two lists. `songs` is the pool it draws from; `order` is what
 it has actually played, grown one song at a time. So `order` is the history,
@@ -73,15 +76,16 @@ can clip. `target` moves where they are all aimed; only the two measurements
 are cached, never a gain, so aiming somewhere else re-measures nothing.
 Measurements are kept in ~/.cache/simplmusik.json.
 
-Control: stop and pause are signals, because they act on the process. Anything
-that moves the queue - skip, back, shuffle, seek - goes through a control file
-the player is nudged to read, because those carry a value and signals can't.
+Control: every command - stop, pause, skip, back, shuffle, seek - is a line of
+JSON to the player's socket, answered by the player. Nothing signals a pid and
+nothing looks one up, because a pid means nothing outside the namespace that
+issued it and the flatpak gives every launch a namespace of its own.
 
 Exit codes: 0 ok, 1 user error, 2 nothing found.
 """
 
-import argparse, json, os, random, re, select, shutil, signal, socket
-import subprocess, sys, time, zipfile
+import argparse, fcntl, json, os, random, re, select, shutil, signal, socket
+import subprocess, sys, threading, time, zipfile
 
 AUDIO = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
 HOME_MUSIC = os.path.expanduser("~/Music")          # where playlists once sat
@@ -89,10 +93,15 @@ CONF = os.path.expanduser("~/.config/simplmusik")  # the simplmusik folder
 CONFIG = os.path.join(CONF, "config.json")
 HOMELESS = os.path.join(CONF, "playlists")          # where they waited, once
 WAS = [HOMELESS, os.path.join(HOME_MUSIC, "playlists")]   # where they used to live
-STATE = os.path.expanduser("~/.local/state/simplmusik.json")
-CTL = os.path.expanduser("~/.local/state/simplmusik-ctl.json")
+LOCK = os.path.expanduser("~/.local/state/simplmusik-player.lock")
+SOCK = os.path.expanduser("~/.local/state/simplmusik-player.sock")
 MPVSOCK = os.path.expanduser("~/.local/state/simplmusik-mpv.sock")
 JOB = os.path.expanduser("~/.local/state/simplmusik-job.json")
+# Where playback used to be written down, back when it was written down at all.
+# Nothing reads these now; a player sweeps them up so an upgrade leaves nothing
+# behind that looks like a player to a copy of this that hasn't been upgraded.
+LEGACY = [os.path.expanduser("~/.local/state/simplmusik.json"),
+          os.path.expanduser("~/.local/state/simplmusik-ctl.json")]
 DLDIR = os.path.expanduser("~/.local/state/simplmusik-downloads")
 RESOLVED = os.path.expanduser("~/.local/state/simplmusik-resolved")
 CACHE = os.path.expanduser("~/.cache/simplmusik.json")
@@ -108,9 +117,39 @@ YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
 YTDLP_USER = os.path.expanduser("~/.local/share/simplmusik/yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 
-# ---------------------------------------------------------------- state file
-# The one source of truth for what is playing. Only the player process writes
-# it; every command reads it. No globals, so a fresh CLI process is never lost.
+# --------------------------------------------------------------- the player
+# There is one player, and this is what makes it one.
+#
+# What is playing is not written down anywhere. It is held by the process
+# doing the playing - the only thing that can't be wrong about it - and
+# everything else asks that process over a socket it listens on. `status` in a
+# terminal and the window both ask the same question of the same process and
+# are told the same thing, because there is only one thing to be told. That is
+# the whole of the design: one variable, in one place, with no second copy to
+# fall out of step with it.
+#
+# Two rules keep it single, and both are the kernel's to enforce rather than
+# ours to remember:
+#
+#   the lock    A player holds an exclusive flock on LOCK for as long as it
+#               plays. Two processes cannot both hold it, so two players
+#               cannot both exist - whatever raced, however fast you asked.
+#               The kernel drops it when the process ends, however it ends, so
+#               there is no stale lock to clear up after a crash.
+#   the socket  "Is anything playing?" is "does anyone answer on SOCK?". A
+#               socket whose process is gone refuses the connection outright,
+#               so a dead player and a live one can never be confused.
+#
+# What this replaces is a pid in a file, and the reason it had to go is that a
+# pid only means anything inside the namespace that issued it. The flatpak
+# gives every launch a namespace of its own, so the player behind one window
+# wrote down that it was pid 283 and the next window read that, asked after
+# its own pid 283 - a different process, or none - and concluded there was
+# nothing playing. It could neither see the player nor signal it, so it
+# started a second one over the top, and a third, each one audible and none of
+# them reachable. A lock and a socket are the filesystem's, and every copy of
+# this app - flatpak, package, or a checkout run from a terminal - is looking
+# at the same filesystem.
 
 def load_json(path, default):
     try:
@@ -125,68 +164,93 @@ def save_json(path, obj, indent=None):
         json.dump(obj, f, indent=indent)
     os.replace(path + ".tmp", path)    # atomic: no reader sees a half file
 
-def save_state(st):
-    save_json(STATE, st)
+# The lock is held by keeping its file open, so the descriptor has to outlive
+# the call that took it - hence a global. Closing it is the one way to let
+# playback be started twice, so nothing here ever closes it.
+_LOCK_FD = []
 
-def clear_state():
-    # The socket goes with them: mpv leaves it behind when it is killed rather
-    # than asked, and a stale one is a file that looks like a player.
-    for path in (STATE, CTL, MPVSOCK):
+def hold_lock():
+    """Take the one lock there is, or find out somebody else has it. True if
+    this process is now the player, False if one already exists."""
+    try:
+        os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+        fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:                     # somebody is playing: not us, then
+        os.close(fd)
+        return False
+    _LOCK_FD.append(fd)
+    return True
+
+def ask(req, timeout=2.0):
+    """Put a question or an order to the player, and wait for its answer.
+
+    None when there is no player to ask - nothing listening, or a socket file
+    left behind by one that was killed, which refuses a connection rather than
+    accepting it. Both are the same answer and neither is a guess, which is
+    the point: this is the only test of whether anything is playing, and it
+    works the same from inside a flatpak, from a package, or from a checkout,
+    because a socket is a file and we are all looking at the same disk."""
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(timeout)
+        s.connect(SOCK)
+    except OSError:
+        return None
+    try:
+        s.sendall(json.dumps(req).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            got = s.recv(65536)
+            if not got:                 # hung up mid-answer: no answer
+                return None
+            buf += got
+        return json.loads(buf.split(b"\n", 1)[0])
+    except (OSError, ValueError):
+        return None
+    finally:
+        s.close()
+
+def playing(timeout=2.0):
+    """What is playing, as the one process that knows has it. {} if nothing
+    is. Everything in here that used to read the state file reads this."""
+    r = ask({"op": "now"}, timeout)
+    return r if r and r.get("playing") else {}
+
+def send(op, **kw):
+    """Tell the player to do something. False if there is nothing playing,
+    which is not an error anywhere it is used - there is simply nothing to
+    tell."""
+    r = ask(dict(op=op, **kw))
+    return bool(r and r.get("ok"))
+
+def quit_stale_mpv():
+    """Ask whatever is on the mpv socket to quit, and take the socket away.
+
+    An mpv outlives its player only when the player was killed outright, and
+    then it is still holding the sound card while nothing at all is driving
+    it. Whoever is listening on that socket is that mpv, by definition - so it
+    is asked by name rather than by pid, which is what makes this work across
+    a sandbox boundary that a signal could never cross."""
+    mpv_line(["quit"])
+    for path in [MPVSOCK] + LEGACY:
         try:
             os.remove(path)
         except OSError:
             pass
 
-def alive(pid):
-    try:
-        os.kill(int(pid or 0), 0)
-        return True
-    except (OSError, TypeError, ValueError):
+def stop_player():
+    """Stop playback. True if something was actually playing."""
+    if not ask({"op": "stop"}):
+        quit_stale_mpv()        # nobody to stop, but perhaps something to tidy
         return False
-
-def reap(pid):
-    """Kill an mpv left behind by a player that died without cleaning up.
-    Confirms the process really is mpv, so a recycled pid can never take
-    an unrelated process down with it."""
-    try:
-        with open("/proc/%d/comm" % int(pid)) as f:
-            if f.read().strip() == "mpv":
-                os.kill(int(pid), signal.SIGKILL)
-    except (OSError, TypeError, ValueError):
-        pass
-
-def state():
-    """What is playing right now, or {} if nothing is."""
-    st = load_json(STATE, {})
-    if st and alive(st.get("pid")):
-        return st
-    if st:                      # player is gone: tidy up after it
-        reap(st.get("child"))
-        clear_state()
-    return {}
-
-def position(st):
-    """How far into the current song we are, in seconds - mpv's own count of
-    it, which is the only one there is now that nothing here restarts a song
-    to move it. It stands still while paused without being told to, and can
-    read a shade below zero in the moment after a song is handed over, which
-    is what the clamp is for. 0.0 if mpv can't be reached, which only happens
-    when there is nothing playing to ask about."""
-    return max(0.0, ask_mpv("time-pos") or 0.0)
-
-def send(op, **kw):
-    """Ask the running player to move the queue. False if nothing is playing."""
-    st = state()
-    if not st:
-        return False
-    os.makedirs(os.path.dirname(CTL), exist_ok=True)
-    with open(CTL + ".tmp", "w") as f:
-        json.dump(dict(op=op, **kw), f)
-    os.replace(CTL + ".tmp", CTL)
-    try:
-        os.kill(st["pid"], signal.SIGHUP)
-    except OSError:
-        return False
+    for _ in range(40):         # up to 2s for it to tear its mpv down and go
+        if not ask({"op": "now"}, 0.2):
+            return True
+        time.sleep(0.05)
     return True
 
 # --------------------------------------------------------------------- cache
@@ -785,6 +849,47 @@ def ask_mpv(prop):
     m = mpv_line(["get_property", prop])
     return m.get("data") if m and m.get("error") == "success" else None
 
+def mpv_props(*names, timeout=0.3):
+    """Several properties over one connection, so the position and the length
+    of a song are read from the same instant rather than a round trip apart.
+    Missing ones are simply absent: mpv with nothing loaded answers `duration`
+    with an error, which is not a failure worth reporting anywhere."""
+    out = {}
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(timeout)
+        s.connect(MPVSOCK)
+    except OSError:
+        return out
+    try:
+        for i, name in enumerate(names):
+            s.sendall(json.dumps({"command": ["get_property", name],
+                                  "request_id": i + 1}).encode() + b"\n")
+        buf, seen = b"", 0
+        while seen < len(names):
+            got = s.recv(65536)
+            if not got:
+                break
+            buf += got
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                m = json.loads(line)
+                rid = m.get("request_id")
+                # mpv pushes its events down this socket too, and one can land
+                # between the questions and the answers. Ours wear request ids.
+                if not isinstance(rid, int) or not 1 <= rid <= len(names):
+                    continue
+                seen += 1
+                if m.get("error") == "success":
+                    out[names[rid - 1]] = m.get("data")
+    except (OSError, ValueError):
+        pass
+    finally:
+        s.close()
+    return out
+
 def volume_filter(db):
     """The filter chain for a gain in dB - and nothing at all for no gain, so
     a song that needs no moving is not run through a filter that does none."""
@@ -799,10 +904,10 @@ class Mpv:
     """
 
     def __init__(self):
-        try:                    # a killed mpv leaves its socket behind, and
-            os.remove(MPVSOCK)  # the next one won't bind over it
-        except OSError:
-            pass
+        # A killed mpv leaves both its socket and itself behind, and the next
+        # one can bind over neither. Asking it to quit is how it is disposed
+        # of: there is no pid here worth trusting, and no need for one.
+        quit_stale_mpv()
         os.makedirs(os.path.dirname(MPVSOCK), exist_ok=True)
         self.proc = subprocess.Popen(
             ["mpv"] + MPV_ARGS + ["--input-ipc-server=" + MPVSOCK],
@@ -941,65 +1046,212 @@ def local_copy(job, song):
         return os.path.join(cache_dir(), song)
     return None
 
+def serve_control(job, want, guard, wake_w, finish):
+    """The player answering for itself, on its own thread.
+
+    A thread rather than a turn of the playing loop, because the loop spends
+    real time in places it cannot be interrupted - measuring a song's loudness
+    is a decode pass, and a window polling through that has to be told what is
+    playing rather than left hanging until the song starts.
+
+    It never writes to mpv. It leaves a note in `want` and prods the loop
+    awake, exactly as the signal handlers it replaces did, so every command
+    mpv is given is still written by the one thread that writes to it and no
+    two commands can be interleaved halfway through a line.
+
+    The exceptions are the two that must happen whether the loop is listening
+    or not: reading how far into the song we are, which asks mpv on a
+    connection of its own, and stopping, which is the end of the process."""
+
+    def nudge(**note):
+        with guard:
+            want.update(note)
+        try:
+            os.write(wake_w, b".")      # break the loop out of its wait
+        except OSError:
+            pass
+
+    def snapshot():
+        """Everything anyone asks about what is playing, in one answer. It is
+        one answer on purpose: a caller that got the song from here and the
+        position from somewhere else could be handed two different moments."""
+        with guard:
+            song, songs = job.get("song"), job.get("songs") or []
+            out = {"playing": True, "ok": True, "song": song,
+                   "path": (job.get("paths") or {}).get(song),
+                   "playlist": job.get("playlist"), "index": job.get("index", 0),
+                   "queue": len(songs), "paused": bool(job.get("paused")),
+                   "shuffle": bool(job.get("shuffle")), "seq": job.get("seq", 0),
+                   "vid": job.get("vid"),
+                   # Where we are in the playlist, which is not where we are in
+                   # the session: `index` counts songs played, and a shuffled
+                   # stretch runs it on past the end of the list.
+                   "track": songs.index(song) + 1 if song in songs else None}
+        # Outside the lock: mpv is asked over a socket with a timeout on it,
+        # and the playing loop must never wait on that to change a song.
+        pos = mpv_props("time-pos", "duration")
+        out["elapsed"] = max(0.0, pos.get("time-pos") or 0.0)
+        out["duration"] = pos.get("duration")
+        return out
+
+    def answer(req):
+        op = req.get("op")
+        if op == "now":
+            return snapshot()
+        if op == "play":                # a new queue for the player we already
+            new = req.get("job")        # have, rather than a second player
+            if not new:
+                return {"ok": False, "error": "no queue"}
+            nudge(swap=new, stop=True)
+            return {"ok": True, "song": new.get("song")}
+        if op == "stop":
+            return None                 # answered, then acted on: see below
+        if op in ("skip", "back"):
+            with guard:
+                job["step"] = 1 if op == "skip" else -1
+            nudge(stop=True)
+            return {"ok": True}
+        if op == "pause":
+            with guard:
+                job["paused"] = (not job.get("paused") if req.get("want") is None
+                                 else bool(req["want"]))
+                paused = job["paused"]
+            nudge(pause=paused)
+            return {"ok": True, "paused": paused}
+        if op == "seek":
+            nudge(seek=max(0.0, float(req.get("pos") or 0)))
+            return {"ok": True}
+        if op == "shuffle":
+            with guard:
+                job["shuffle"] = bool(req.get("on"))
+                del job["order"][job["index"] + 1:]   # drop the redo history,
+            nudge()                                   # so the new mode decides
+            return {"ok": True}
+        if op == "levelling":
+            nudge(level=True)
+            return {"ok": True}
+        if op == "volume":
+            nudge(volume=True)
+            return {"ok": True}
+        return {"ok": False, "error": "no such command: %s" % op}
+
+    def handle(conn):
+        conn.settimeout(5.0)
+        buf = b""
+        while b"\n" not in buf:
+            got = conn.recv(65536)
+            if not got:
+                return
+            buf += got
+        req = json.loads(buf.split(b"\n", 1)[0])
+        stopping = req.get("op") == "stop"
+        reply = {"ok": True, "stopped": True} if stopping else answer(req)
+        conn.sendall(json.dumps(reply).encode() + b"\n")
+        if stopping:
+            conn.close()        # answered before we go, so `stop` isn't a
+            finish()            # question that dies with the process
+
+    def loop(srv):
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                handle(conn)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass            # one bad caller is not the end of playback
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    # Only the lock holder gets here, so a socket file in the way is one left
+    # behind by a player that is gone, and taking it is ours to do.
+    try:
+        os.remove(SOCK)
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(SOCK), exist_ok=True)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(SOCK)
+    srv.listen(16)
+    threading.Thread(target=loop, args=(srv,), daemon=True).start()
+    return srv
+
 def player(job):
     """The detached process that owns playback: play one song, record it,
     repeat. It owns the mpv too - one, for the whole session - so the loop is
-    "hand mpv a song, wait for it to end" rather than a player per song."""
-    mpv = Mpv()
-    # What a signal has asked for, carried out by `drain` in the loop below.
-    # Handlers only ever leave a note here, because the socket is the loop's
-    # to write to; see `Mpv.until_end`.
-    want = {}
-    # A signal breaks the loop's `select` by writing to this pipe. Without it
-    # a handler would set its flag and then the loop would go straight back to
-    # waiting on mpv, and a skip would not be acted on until the song ended.
+    "hand mpv a song, wait for it to end" rather than a player per song.
+
+    It also *is* what is playing, as far as the rest of this app is concerned:
+    it holds the lock that says so and answers the socket that says what. It
+    outlives the window on purpose, so `simplmusik play` in a terminal and a
+    window opened an hour later are the same playback - the window finds this
+    process and asks it, rather than starting anything."""
+    # Before anything else, and before a single sound: either we are the
+    # player or there already is one. There is no third answer, and no way for
+    # two processes to get past this line at once.
+    if not hold_lock():
+        # Somebody else has it. Hand them the queue we were started with - the
+        # person asked for it either way - and leave. This is the race that
+        # used to end with two players: it now ends with one, playing what was
+        # asked for last.
+        for _ in range(40):
+            if send("play", job=job):
+                return 0
+            time.sleep(0.05)
+        return 1
+
+    mpv = None
+    # What a command has asked for, carried out by `drain` in the loop below.
+    # The socket thread only ever leaves a note here, because the loop is the
+    # one thing that writes to mpv; see `Mpv.until_end`.
+    want, guard = {}, threading.Lock()
+    # A command breaks the loop's `select` by writing to this pipe. Without it
+    # a note would be left and the loop would go straight back to waiting on
+    # mpv, and a skip would not be acted on until the song ended.
     wake_r, wake_w = os.pipe()
     for fd in (wake_r, wake_w):
         os.set_blocking(fd, False)
-    signal.set_wakeup_fd(wake_w)
 
-    def on_stop(*_):
-        # The one handler that does its own work: there is no loop left to
-        # hand it to. No socket is touched - the process is killed outright.
-        mpv.kill()
-        clear_state()
-        os._exit(0)
+    def finish(code=0):
+        """Stop being the player, and stop being a process. The lock goes when
+        this exits, which is the only thing that has to happen and the one
+        thing we cannot forget to do."""
+        if mpv:
+            mpv.kill()
+        for path in [SOCK, MPVSOCK] + LEGACY:
+            try:
+                os.remove(path)     # ours to remove: we hold the lock
+            except OSError:
+                pass
+        os._exit(code)
 
-    def on_pause(*_):
-        job["paused"] = not job["paused"]
-        want["pause"] = job["paused"]
+    # Answering starts before mpv does, so a `play` that has only just
+    # returned is already something `status` and the window can ask about.
+    serve_control(job, want, guard, wake_w, finish)
+    # Killed rather than asked - the sandbox torn down around us, or a plain
+    # `kill` - and there is no loop left to hand it to.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_a: finish())
 
-    def on_ctl(*_):
-        """Read one queued command. Skip and back only set the direction and
-        ask for the song to be stopped - the loop below does the moving, so
-        there is a single place that ever changes `index`."""
-        c = load_json(CTL, {})
-        try:
-            os.remove(CTL)
-        except OSError:
-            pass
-        if c.get("op") in ("skip", "back"):
-            job["step"] = 1 if c["op"] == "skip" else -1
-            want["stop"] = True
-        elif c.get("op") == "seek":
-            want["seek"] = max(0.0, float(c.get("pos") or 0))
-        elif c.get("op") == "levelling":
-            want["level"] = True
-        elif c.get("op") == "volume":
-            want["volume"] = True
-        elif c.get("op") == "shuffle":
-            job["shuffle"] = bool(c.get("on"))
-            del job["order"][job["index"] + 1:]   # drop the redo history, so
-            save_state(job)                       # the new mode decides next
+    mpv = Mpv()
 
     def drain():
-        """Carry out what the handlers asked for. Everything here is a write
-        to the socket, which is why none of it happens in a handler."""
-        if "pause" in want:
-            mpv.send("set_property", "pause", want.pop("pause"))
-            save_state(job)
-        if "seek" in want:
-            at = want.pop("seek")
+        """Carry out what the socket thread asked for. Everything here is a
+        write to mpv, which is why none of it happens on that thread."""
+        with guard:
+            todo, keep = {}, {}
+            for k, v in want.items():
+                (keep if k in ("swap", "restart") else todo)[k] = v
+            want.clear()
+            want.update(keep)
+        if "pause" in todo:
+            mpv.send("set_property", "pause", todo["pause"])
+        if "seek" in todo:
+            at = todo["seek"]
             local = local_copy(job, job["song"])
             if local and remote(job["paths"][job["song"]]):
                 # It finished downloading while you listened. A seek is the one
@@ -1008,7 +1260,8 @@ def player(job):
                 # anyway. Left alone, a stream plays out as a stream - this is
                 # the only thing that ever swaps a song under itself.
                 job["paths"][job["song"]] = local
-                want["restart"] = at
+                with guard:
+                    want["restart"] = at
                 mpv.send("stop")        # the loop below picks the song up again
             else:
                 # The song carries on from there rather than starting again, so
@@ -1016,29 +1269,42 @@ def player(job):
                 # remember, and a seek while paused is still paused when it
                 # lands.
                 mpv.send("seek", at, "absolute")
-        if want.pop("level", False):
+        if todo.get("level"):
             # Levelling turned on or off mid-song, or aimed somewhere else:
             # swap the filter under the song that is playing, so it is heard
             # now and heard seamlessly. The gain is worked out again from the
             # cache, so neither of those re-measures anything.
             job["gain"] = gain(job["song"], job["paths"][job["song"]])
             mpv.send("set_property", "af", volume_filter(job["gain"]))
-            save_state(job)
-        if want.pop("volume", False):
+        if todo.get("volume"):
             # mpv's own volume, left alone by everything else here, so turning
             # it down never disturbs the filter levelling is riding on.
             mpv.send("set_property", "volume", volume())
-        if want.pop("stop", False):
+        if todo.get("stop"):
             mpv.send("stop")
 
-    for sig, handler in ((signal.SIGTERM, on_stop), (signal.SIGINT, on_stop),
-                         (signal.SIGUSR2, on_pause), (signal.SIGHUP, on_ctl)):
-        signal.signal(sig, handler)
-
-    job["pid"] = os.getpid()
-    job["child"] = mpv.proc.pid
     at, resuming = 0.0, False
-    while not mpv.dead and 0 <= job["index"] < len(job["order"]):
+    while not mpv.dead:
+        # A new queue, handed to us by whoever asked for it - from the window,
+        # from a terminal, or by a player that lost the race to be us. It is
+        # taken here, before a song is loaded, so nothing from the old queue is
+        # ever heard after the new one was asked for.
+        with guard:
+            swap = want.pop("swap", None)
+            if swap is not None:
+                seq = job.get("seq", 0)
+                job.clear()
+                job.update(swap)
+                job["seq"] = seq        # keeps counting: a caller watching for
+                at, resuming = 0.0, False   # the song to change still sees it
+                # Whatever was asked of the queue we have just put down does
+                # not carry over to the one we are picking up: the stop that
+                # came with the swap is the swap, and a seek was into a song
+                # nobody is playing any more.
+                want.pop("stop", None)
+                want.pop("seek", None)
+        if not 0 <= job["index"] < len(job["order"]):
+            break                       # queue finished
         job["song"] = job["order"][job["index"]]
         path = job["paths"][job["song"]]
         if not resuming:
@@ -1052,43 +1318,55 @@ def player(job):
         mpv.load(path, job["gain"], volume(), at)
         if job["paused"]:       # swapped mid-song while paused: still paused
             mpv.send("set_property", "pause", True)
-        save_state(job)
         mpv.until_end(wake_r, drain)
         # A swap ends the file mpv was playing, which is not the song ending:
         # the same song goes round again, off the disk, at the point asked for.
-        at = want.pop("restart", None)
+        with guard:
+            at = want.pop("restart", None)
+            pending = "swap" in want
         resuming = at is not None
-        if resuming:
-            continue
+        if resuming or pending:
+            continue            # a queue waiting to be taken decides, not us
         at = 0.0
         # Both of these were asked of the song that has just ended, so neither
         # outlives it: a skip in the gap between two songs is already the move
         # the loop is making, and a seek into a song nobody is playing is not
         # a place the next one should open at.
-        want.pop("stop", None)
-        want.pop("seek", None)
+        with guard:
+            want.pop("stop", None)
+            want.pop("seek", None)
         step, job["step"] = job["step"], 1
         job["paused"] = False   # a skip while paused lands playing
         advance(job, step)
-    mpv.kill()
-    clear_state()               # queue finished: nothing is playing any more
+    finish()                    # queue finished: nothing is playing any more
 
-def stop_player():
-    """Stop playback. True if something was actually playing."""
-    st = state()
-    if not st:
-        return False
-    try:
-        os.kill(st["pid"], signal.SIGTERM)
-    except OSError:
-        pass
-    for _ in range(40):         # up to 2s for it to tear its mpv down
-        if not alive(st["pid"]):
-            break
+def start_playing(job):
+    """Put a queue on the player. True once something is actually playing.
+
+    This is the only way playback ever starts, and it asks before it acts: a
+    player that is already running is handed the new queue and swaps to it,
+    keeping the one mpv it has always had. A second player is started only
+    when nobody answers - and even then that process takes the lock before it
+    makes a sound, so the case this all exists for (two windows, or a window
+    and a terminal, asking at the same moment) ends with one player playing
+    what was asked for last, rather than two playing at once."""
+    if send("play", job=job):
+        return True
+    # Nothing playing, so start something. The queue goes in a file, not on
+    # the command line: Linux caps a single argument at 128 KB, and a library
+    # is its own weight in names and paths - so passing it as an argument made
+    # every library past a few hundred songs fail to play at all. The file is
+    # named after this process so that two of us racing cannot read, or
+    # delete, each other's.
+    handover = "%s.%d" % (JOB, os.getpid())
+    save_json(handover, job)
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_player", handover],
+                     start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+    for _ in range(60):         # up to 3s for it to be answering for itself
+        if playing(0.2):
+            return True
         time.sleep(0.05)
-    reap(st.get("child"))
-    clear_state()
-    return True
+    return False
 
 def landed(st, timeout=1.0):
     """What is playing once a skip or back has taken effect. Under shuffle the
@@ -1098,12 +1376,12 @@ def landed(st, timeout=1.0):
     seq, end = st.get("seq", 0), time.time() + timeout
     while time.time() < end:
         time.sleep(0.05)
-        new = state()
+        new = playing()
         if not new:
             return None                     # queue ran out
         if new.get("seq", 0) != seq:
             return new.get("song")
-    return (state() or {}).get("song")
+    return playing().get("song")
 
 # -------------------------------------------------------------------- youtube
 # Searching and downloading both go through yt-dlp, imported rather than run as
@@ -1185,17 +1463,15 @@ def video_id(s):
 # ------------------------------------------------------------------ commands
 
 def cmd_status(args):
-    lib, pls, st, dir_ = library(), playlists(), state(), folder()
-    # Where we are in the playlist, which is not where we are in the session:
-    # `index` counts songs played, and a shuffled stretch runs it on past the
-    # end of the list. Shuffled, there is no last track, so only count played.
-    track = (st["songs"].index(st["song"]) + 1
-             if st and st["song"] in st["songs"] else None)
+    lib, pls, st, dir_ = library(), playlists(), playing(), folder()
+    # Where we are in the playlist is worked out by the player, which is the
+    # one that knows: shuffled, there is no last track, so only count played.
+    track = st.get("track")
     info = {"folder": dir_, "songs": len(lib), "playlists": len(pls),
             "playing": bool(st), "paused": bool(st.get("paused")),
             "current_playlist": st.get("playlist"), "current_song": st.get("song"),
             "track": track, "played": st.get("index", 0) + 1 if st else None,
-            "queue": len(st.get("songs", [])) or None,
+            "queue": st.get("queue") or None,
             "shuffle": shuffling(),
             "playlists_list": [p["name"] for p in pls]}
     if not st:
@@ -1463,7 +1739,7 @@ def cmd_remove(args):
         # open and would happily sound a deleted song to the end, which is the
         # one thing that would make the library and what you hear disagree.
         # Nothing to move on to either, so the honest answer is nothing playing.
-        st = state()
+        st = playing()
         stopped = bool(st and st.get("song") == song)
         if stopped:
             stop_player()
@@ -1500,7 +1776,7 @@ def cmd_delete(args):
                 % (stem, n, "" if n == 1 else "s")) or 0
 
 def cmd_play(args):
-    st, idx = state(), index()
+    st, idx = playing(), index()
     # `--shuffle` throws the one shuffle switch rather than shuffling this
     # playback only, so it is the same switch the `shuffle` command and the
     # button in the window throw - and it stays thrown afterwards.
@@ -1545,23 +1821,15 @@ def cmd_play(args):
     if not shutil.which("mpv"):
         return fail(args.json, "mpv not found - install mpv", 1)
 
-    stop_player()               # never stack two players
     # `songs` is the pool, `order` is only what has actually been played, so
     # naming a song starts there and carries on rather than stopping after it.
     # `paths` is where each one is: worked out once here, so the player never
     # has to search for a file and the queue can't shift under it mid-song.
     job = {"playlist": name, "songs": songs, "paths": paths, "order": [start],
-           "index": 0, "song": start, "child": 0, "paused": False,
+           "index": 0, "song": start, "paused": False,
            "shuffle": shuffle, "step": 1, "seq": 0}
-    # The queue goes in a file, not on the command line. Linux caps a single
-    # argument at 128 KB, and a library is its own weight in names and paths -
-    # so passing it as an argument made every library past a few hundred songs
-    # fail to play at all. A file has no such ceiling.
-    save_json(JOB, job)
-    job["pid"] = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "_player", JOB],
-        start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL).pid
-    save_state(job)             # write it here too, so `status` is right at once
+    if not start_playing(job):
+        return fail(args.json, "couldn't start the player", 1)
     return emit(args.json, {"playing": name or "library", "song": start,
                             "songs": len(songs), "shuffle": shuffle},
                 "playing %s: %s (%d song%s%s)"
@@ -1582,22 +1850,22 @@ def cmd_shuffle(args):
     return emit(args.json, {"shuffle": on}, "shuffle " + ("on" if on else "off")) or 0
 
 def cmd_pause(args, want=True):
-    st = state()
+    st = playing()
     if not st:
         return fail(args.json, "nothing playing", 1)
     if bool(st.get("paused")) != want:
-        os.kill(st["pid"], signal.SIGUSR2)
+        send("pause", want=want)
     return emit(args.json, {"paused": want, "song": st["song"]},
                 "%s %s" % ("paused" if want else "resumed", st["song"])) or 0
 
 def cmd_move(args, op):
-    st = state()
+    st = playing()
     if not st:
         return fail(args.json, "nothing playing", 1)
     send(op)
-    now = landed(st)
-    return emit(args.json, {"op": op, "was": st["song"], "now": now},
-                "%s: %s -> %s" % (op, st["song"], now or "end of queue")) or 0
+    landed_on = landed(st)
+    return emit(args.json, {"op": op, "was": st["song"], "now": landed_on},
+                "%s: %s -> %s" % (op, st["song"], landed_on or "end of queue")) or 0
 
 def cmd_seek(args):
     """Jump within the song that is playing. A relative jump is resolved here,
@@ -1608,14 +1876,14 @@ def cmd_seek(args):
     ends it, which moves to the next one - a fair reading of "seek to the
     end". Callers that do know the length (the UI does) clamp before
     asking."""
-    st = state()
+    st = playing()
     if not st:
         return fail(args.json, "nothing playing", 1)
     t = parse_time(args.time)
     if t is None:
         return fail(args.json, "give a position like 1:23, 83, +30 or -10", 1)
     secs, rel = t
-    at = max(0.0, position(st) + secs if rel else secs)
+    at = max(0.0, st.get("elapsed", 0.0) + secs if rel else secs)
     if not send("seek", pos=at):
         return fail(args.json, "nothing playing", 1)
     return emit(args.json, {"seek": round(at, 1), "song": st["song"]},
@@ -1660,14 +1928,41 @@ def cmd_search(args):
 # it is while it runs. Each download process writes its own small file named
 # after the video, which the UI reads and the process removes when it's done:
 # no shared file for two downloads to race over, and a process killed halfway
-# leaves an entry that readers discard the moment they check its pid.
+# leaves an entry that readers discard the moment they find its lock free.
+
+# Whether a fetch is still running is asked the same way playback is: by
+# taking a lock, never by looking up a pid. A fetch started inside the flatpak
+# and one started from a terminal are different pid namespaces and the same
+# filesystem, so the lock is the only thing both can see.
+
+def dl_lock(vid):
+    return os.path.join(DLDIR, vid + ".lock")
+
+def dl_hold(vid):
+    """Claim this song's download for this process, for as long as it runs.
+    False if somebody else is already fetching it. The few tries are for a
+    reader that has the lock for the instant it takes to test it."""
+    for _ in range(10):
+        try:
+            os.makedirs(DLDIR, exist_ok=True)
+            fd = os.open(dl_lock(vid), os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _LOCK_FD.append(fd)         # held until this process ends
+            return True
+        except OSError:
+            os.close(fd)
+            time.sleep(0.02)
+    return False
 
 def dl_report(vid, stage, percent=None):
     path = os.path.join(DLDIR, vid + ".json")
     try:
         os.makedirs(DLDIR, exist_ok=True)
         with open(path + ".tmp", "w") as f:
-            json.dump({"id": vid, "pid": os.getpid(), "stage": stage,
+            json.dump({"id": vid, "stage": stage,
                        "percent": percent, "updated": time.time()}, f)
         os.replace(path + ".tmp", path)     # atomic: no reader sees half a file
     except OSError:
@@ -1675,7 +1970,8 @@ def dl_report(vid, stage, percent=None):
 
 def dl_done(vid):
     for path in (os.path.join(DLDIR, vid + ".json"),
-                 os.path.join(DLDIR, vid + ".json.tmp")):
+                 os.path.join(DLDIR, vid + ".json.tmp"),
+                 dl_lock(vid)):
         try:
             os.remove(path)
         except OSError:
@@ -1687,14 +1983,14 @@ def dl_fail(vid, why=""):
     `dl_done` clears the progress file when a fetch is over, which would make
     one that died look exactly like one nobody ever asked for - and a stream
     whose download failed would then sit in the library looking as though it
-    were still on its way. This entry names no live pid on purpose: the reader
+    were still on its way. It says so in as many words on purpose: the reader
     keeps a failed one rather than tidying it away with the abandoned ones,
     and asking for the song again is what clears it."""
     path = os.path.join(DLDIR, vid + ".json")
     try:
         os.makedirs(DLDIR, exist_ok=True)
         with open(path + ".tmp", "w") as f:
-            json.dump({"id": vid, "pid": 0, "stage": "failed",
+            json.dump({"id": vid, "stage": "failed",
                        "error": str(why)[:200], "updated": time.time()}, f)
         os.replace(path + ".tmp", path)
     except OSError:
@@ -1706,7 +2002,8 @@ def dl_live(vid):
     Asking to stream something that is already coming down is an ordinary
     thing to do - you clicked download, then decided not to wait - and two
     fetches would pull the same file twice and race each other to move it into
-    place. A failed entry names no live process and is not one of these."""
+    place. A failed fetch is not one of these: it says so, and it holds no
+    lock."""
     try:
         with open(os.path.join(DLDIR, vid + ".json")) as f:
             d = json.load(f)
@@ -1714,11 +2011,23 @@ def dl_live(vid):
         return False
     if d.get("stage") == "failed":
         return False
+    return dl_held(vid)
+
+def dl_held(vid):
+    """Whether anyone holds this song's download lock. Taking it is the test:
+    it succeeds only if nobody has it, and then it is given straight back."""
     try:
-        os.kill(int(d.get("pid") or 0), 0)
+        fd = os.open(dl_lock(vid), os.O_RDWR)
+    except OSError:
+        return False                    # no lock file: nobody is fetching
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False                    # it was free, so its holder is gone
+    except OSError:
         return True
-    except (OSError, ValueError, TypeError):
-        return False
+    finally:
+        os.close(fd)
 
 def dl_opts(dest):
     """The options a download runs under.
@@ -1808,6 +2117,7 @@ def cmd_download(args):
     # UI reads a song's title, artist and cover art from.
     opts = dict(dl_opts(dest), progress_hooks=[dl_hook(vid)])
     os.makedirs(dest, exist_ok=True)
+    dl_hold(vid)                # this fetch is ours, for as long as it runs
     dl_report(vid, "starting")
     try:
         with m.YoutubeDL(opts) as y:
@@ -1936,6 +2246,7 @@ def fetch(vid, song):
         dl_done(vid)            # already a library song: nothing worth caching
         return 0
     got = os.path.join(cache, song)
+    dl_hold(vid)                # this fetch is ours, for as long as it runs
     dl_report(vid, "caching")
     try:
         os.makedirs(cache, exist_ok=True)
@@ -2037,18 +2348,14 @@ def cmd_stream(args):
             [sys.executable, os.path.abspath(__file__), "_fetch", vid, song],
             start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
 
-    stop_player()               # never stack two players
     # One song, and the queue is the same shape `play` builds - the player
     # loop can't tell this job from any other, and doesn't need to.
     job = {"playlist": None, "songs": [song], "paths": {song: source},
-           "order": [song], "index": 0, "song": song, "child": 0,
+           "order": [song], "index": 0, "song": song,
            "paused": False, "shuffle": False, "step": 1, "seq": 0,
            "vid": vid}        # what to look for in the cache, if it lands
-    save_json(JOB, job)
-    job["pid"] = subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "_player", JOB],
-        start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL).pid
-    save_state(job)
+    if not start_playing(job):
+        return fail(args.json, "couldn't start the player", 1)
     return emit(args.json, {"song": song, "id": vid, "streaming": live},
                 ("streaming " if live else "playing ") + song) or 0
 

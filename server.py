@@ -8,8 +8,8 @@ Two jobs, and deliberately no more:
   2. Serve what a CLI can't: cover art bytes and tag metadata, and the other
      way round, the bytes of a picture dropped on a playlist - which go to a
      file and then straight back through the CLI, so setting cover art from
-     the window is the same `cover` command a terminal would run. Where we are
-     in the song comes from the player's own state file, which records it.
+     the window is the same `cover` command a terminal would run. What is
+     playing, and where we are in it, is asked of the player process itself.
 
 The CLI is imported rather than re-implemented here. Which folder is your
 music folder, what a playlist holds and where each of its songs actually went
@@ -282,19 +282,15 @@ def cover_bytes(path):
     return data
 
 # -------------------------------------------------------------- play state
-# The state file names the song; how far into it we are comes from `position`,
-# which asks the mpv that is playing it. So a seek or a pause is reflected
-# exactly, and there is no clock here to drift out of step with the player.
+# This page has no idea what is playing and never keeps one. It asks the player
+# process, which is the only thing that knows, and gets the song, the position
+# in it and whether it is paused as one answer describing one instant. So a
+# window opened long after `simplmusik play` was typed in a terminal shows that
+# playback, mid-song, correctly - it is the same player being asked.
 
 def playing():
-    """The player's state, or {} if nothing is playing."""
-    try:
-        with open(sm.STATE) as f:
-            st = json.load(f)
-        os.kill(int(st.get("pid") or 0), 0)          # player still alive?
-        return st
-    except (OSError, ValueError, TypeError):
-        return {}
+    """What the player says it is playing, or {} if there is no player."""
+    return sm.playing()
 
 def downloads():
     """Downloads running right now, keyed by video id, as the CLI reports them.
@@ -315,16 +311,13 @@ def downloads():
             # already on its way from one nobody has started.
             if d.get("stage") == "caching":
                 continue
-            # A fetch that failed names no live pid, and is kept rather than
+            # A fetch that failed holds no lock, and is kept rather than
             # tidied away: the point of it is to be seen. Asking for the song
             # again is what clears it.
-            if d.get("stage") != "failed":
-                os.kill(int(d.get("pid") or 0), 0)     # still downloading?
+            if d.get("stage") != "failed" and not sm.dl_held(str(d.get("id") or f[:-5])):
+                raise OSError("nobody is fetching it")
         except (OSError, ValueError, TypeError):
-            try:
-                os.remove(path)      # its process died without tidying up
-            except OSError:
-                pass
+            sm.dl_done(f[:-5])       # its process died without tidying up
             continue
         out[str(d.get("id") or f[:-5])] = {"stage": d.get("stage") or "downloading",
                                            "percent": d.get("percent"),
@@ -364,24 +357,25 @@ def snapshot():
     song = st.get("song", "")
     # The player worked out every path when the queue was built, so the file
     # it is holding open is known exactly, even if the song has since moved.
-    path = (st.get("paths") or {}).get(song) or song_path(song)
+    path = st.get("path") or song_path(song)
     duration = (tags(path) or {}).get("duration") if path else None
-    if duration is None and sm.remote(path):
-        # A stream has no file to read a length off, so mpv is asked for the
-        # one it worked out from the source itself. Without this the slider has
-        # no end to draw and nothing to seek against - the whole of what makes
-        # a streamed song feel unlike a downloaded one.
+    if duration is None:
+        # A stream has no file to read a length off, so the length is the one
+        # mpv worked out from the source itself, which came back with the rest
+        # of the answer. Without this the slider has no end to draw and nothing
+        # to seek against - the whole of what makes a streamed song feel unlike
+        # a downloaded one.
         try:
-            duration = round(float(sm.ask_mpv("duration")), 1)
+            duration = round(float(st.get("duration")), 1)
         except (TypeError, ValueError):
             duration = None
-    elapsed = sm.position(st)
+    elapsed = st.get("elapsed", 0.0)
     if duration:
         elapsed = min(elapsed, duration)   # never report past the end
     return {"playing": True, "paused": bool(st.get("paused")),
             "song": song, "playlist": st.get("playlist"),
             "rel": song, "index": st.get("index", 0),
-            "queue": len(st.get("songs") or []),
+            "queue": st.get("queue", 0),
             "shuffle": sm.shuffling(),
             "volume": sm.volume(),
             "elapsed": round(elapsed, 1),
