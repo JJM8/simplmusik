@@ -10,6 +10,8 @@ A local music player. Written in Python, native to Linux.
 
 [![Download the .deb](https://img.shields.io/badge/Download-.deb%20for%20Debian%20%2F%20Ubuntu-2ea44f?style=for-the-badge&logo=debian&logoColor=white)](https://github.com/JJM8/simplmusik/releases/latest/download/simplmusik_all.deb)
 
+**Anywhere else, run it straight from a checkout - `./install` puts it in your menu.**
+
 - plays the music on your own machine
 - points itself at the music folder your desktop already has, and asks
   for a different one only if that comes up empty
@@ -75,12 +77,12 @@ simplmusik update
 
 ```sh
 ./build-flatpak
-flatpak install --user ./build/simplmusik_0.1.0.flatpak
+flatpak install --user ./build/simplmusik_0.1.3.flatpak
 ```
 
 ```sh
 ./build-deb
-sudo apt install ./build/simplmusik_0.1.0_all.deb
+sudo apt install ./build/simplmusik_0.1.3_all.deb
 ```
 
 Or both at once, which is what a release is - `--fresh` fetches the newest
@@ -98,7 +100,16 @@ yt-dlp rather than reusing the cached one:
 
 Adds it to the applications menu without installing anything system-wide, and
 tells you what's missing. Everything stays in this folder, so keep the checkout
-where it is (or re-run `./install` after moving it).
+where it is (or re-run `./install` after moving it). The menu entry and the
+window run these files as they sit, so an edit here is in the app the next time
+you open it - which is what you want while working on it.
+
+For the `simplmusik` command as well, point a name on your PATH at the CLI in
+this folder:
+
+```sh
+ln -s "$PWD/simplmusik" ~/.local/bin/simplmusik
+```
 
 ## Run
 
@@ -113,11 +124,19 @@ Meant for agents as much as for people.
 
 ```sh
 simplmusik status
-simplmusik list
+simplmusik list                          # All songs, then your playlists
 simplmusik play --shuffle
-simplmusik search wonderwall
+simplmusik search wonderwall             # your library, numbered
+simplmusik search --yt wonderwall        # ...or YouTube
 simplmusik create "Road trip"
+simplmusik add "Road trip" 2             # the second row it just showed you
 ```
+
+Every command that takes a song takes it three ways: the number beside it in
+the last list you were shown, its whole filename, or enough of the filename to
+tell it from the rest. So searching and then adding is two steps rather than
+two steps and a filename to copy - and `add PLAYLIST N` on a YouTube result
+downloads it and adds it in one.
 
 Put `--json` before the command and you get JSON back, so an agent can read
 the result without parsing text meant for a person.
@@ -125,20 +144,6 @@ the result without parsing text meant for a person.
 ```sh
 simplmusik --json status
 ```
-
-Installed as a flatpak the CLI is in the sandbox rather than on your PATH, so
-it is reached through flatpak - worth an alias if you use it much:
-
-```sh
-alias simplmusik='flatpak run --command=simplmusik org.simplmusik.Player'
-```
-
-Reading and steering a player that is already going works exactly as it does
-anywhere else. Starting one is the exception: `play` hands the song to a
-background player and returns, and flatpak takes the sandbox down with the
-command that exits, which leaves mpv playing with nothing left to stop it. So
-with the flatpak, start playback from the window - or from this alias while the
-window is open. If you live in the terminal, the .deb is the better fit.
 
 ## More
 

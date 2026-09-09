@@ -57,7 +57,7 @@ threading.Thread(target=sm.ytdlp, daemon=True).start()
 ALLOWED = {"status", "folder", "songs", "list", "create", "add", "remove",
            "delete", "rename", "cover", "play", "shuffle", "levelling", "pause",
            "resume", "skip", "back", "seek", "stop", "search", "download",
-           "stream", "volume", "target"}
+           "stream", "volume", "target", "stats"}
 
 # Most commands are a file read and answer at once. These two go to the network
 # instead, and a download re-encodes what it fetched, so they get their own
@@ -180,20 +180,11 @@ def song_entry(name, path):
             "folder": os.path.dirname(path) if path else ""}
 
 def playlists():
-    """Every playlist, most recently changed first - the order both the sidebar
-    and the add-to-playlist menu use, decided here so there is one answer to it.
-    The file's own timestamp is the whole mechanism: adding a song rewrites the
-    playlist, which is what makes it recent. Nothing is stored to track it, and
-    editing a playlist by hand counts too, which is what you'd want."""
-    out = []
-    for p in sm.playlists():
-        try:
-            mtime = os.path.getmtime(sm.playlist_file(p["file"]))
-        except OSError:
-            mtime = 0
-        out.append(dict(p, mtime=mtime))
-    out.sort(key=lambda p: (-p["mtime"], p["name"].lower()))
-    return out
+    """Every playlist, most recently played first - the order the sidebar and
+    the add-to-playlist menu both use. The CLI decides it (`sm.playlists`), so
+    the window and the terminal read the library in one order rather than each
+    having its own opinion; there is nothing to do here but pass it on."""
+    return sm.playlists()
 
 def library():
     """The whole library plus every playlist. Playlists carry filenames only;
@@ -206,11 +197,15 @@ def library():
         for n in names:
             songs.setdefault(n, song_entry(n, None))    # named but not found
         pls.append({"file": p["file"], "name": p["name"], "songs": names,
-                    "count": len(names), "mtime": p["mtime"],
+                    "count": len(names), "recent": p["recent"],
                     "cover": cover_url(p)})
     for p in pls:
         p["duration"] = sum(songs[n]["duration"] or 0 for n in p["songs"])
-    ordered = sorted(songs.values(), key=lambda s: s["file"].lower())
+    # Newest first, which is the order `index` handed them over in - the song
+    # you added last is the one you are most likely to have come here for. The
+    # ones a playlist names but the folder hasn't got were added to the map
+    # after the walk and have no date of their own, so they trail the rest.
+    ordered = list(songs.values())
     root = sm.folder()
     return {"root": root, "root_exists": os.path.isdir(root),
             "playlists": pls, "songs": ordered,
@@ -393,6 +388,11 @@ def snapshot():
         elapsed = min(elapsed, duration)   # never report past the end
     return {"playing": True, "paused": bool(st.get("paused")),
             "song": song, "playlist": st.get("playlist"),
+            # The YouTube result being streamed, while one is. It is how a
+            # search row knows the song sounding right now is its own: the
+            # filename alone can't say so, because a streamed song has no file
+            # in the library to be named by yet.
+            "vid": st.get("vid"),
             "rel": song, "index": st.get("index", 0),
             "queue": st.get("queue", 0),
             "shuffle": sm.shuffling(),

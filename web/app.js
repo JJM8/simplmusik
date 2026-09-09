@@ -35,9 +35,11 @@ const prefetch = id => fetch('/api/prefetch?id=' + encodeURIComponent(id))
 /* view: a playlist's file stem, null for the whole library, or SETTINGS.
    A symbol, so no playlist can ever be named the same thing by accident. */
 const SETTINGS = Symbol('settings');
+const STATS = Symbol('stats');
 
 const state = { lib: { playlists: [], songs: [], root: '' }, byFile: {},
-                view: null, query: '', addQuery: '', now: {} };
+                view: null, query: '', addQuery: '', now: {},
+                stats: null, statsWhy: null, statsStep: 'day' };
 
 const MIN_FIND = 2;      // a query shorter than this isn't worth a search
 const FIND_N = 8;        // what a search brings back - the CLI's own default
@@ -58,7 +60,7 @@ function ytSearch(paint) {
 
   async function ask(n) {
     const mine = ++seq;
-    const r = await call('search', ...s.query.split(/\s+/), '--count', String(n));
+    const r = await call('search', '--yt', ...s.query.split(/\s+/), '--count', String(n));
     if (mine !== seq) return;             // a later search has replaced this one
     s.n = n;
     s.finding = false;
@@ -228,6 +230,7 @@ function renderPlaylists() {
   const showing = f => state.view === f && !state.query;
 
   $('#settings-btn').classList.toggle('on', showing(SETTINGS));
+  $('#stats-btn').classList.toggle('on', showing(STATS));
   $('#lib-nav').replaceChildren(
     navButton('i-note', 'All songs', state.lib.songs.length, showing(null),
               () => openPlaylist(null)));
@@ -263,6 +266,12 @@ function openPlaylist(file) {
   state.view = file;
   renderPlaylists();
   render();
+  // A new view starts at its top. #list keeps its scroll offset across a
+  // replaceChildren, so without this you arrive in a playlist already partway
+  // down it - at a row you never chose, in a list you haven't seen the start
+  // of. Done after the render, so the box is measured against what is now in
+  // it rather than what was.
+  $('#list').scrollTop = 0;
 }
 
 /* Up and down walk the sidebar, from anywhere in the window - the one bit of
@@ -290,7 +299,7 @@ function revealView(i) {
 }
 
 function stepSidebar(d) {
-  if (state.view === SETTINGS) return;
+  if (state.view === SETTINGS || state.view === STATS) return;
   const views = sidebarViews();
   // A search spans the whole library, so it sits on no row and there is
   // nothing to step from: the first arrow enters the list from the end it is
@@ -315,7 +324,8 @@ function currentSongs() {
     const q = state.query.toLowerCase();
     return state.lib.songs.filter(s => matches(s, q));
   }
-  if (!state.view || state.view === SETTINGS) return state.lib.songs;
+  if (!state.view || state.view === SETTINGS || state.view === STATS)
+    return state.lib.songs;
   const pl = state.lib.playlists.find(p => p.file === state.view);
   return pl ? playlistSongs(pl) : [];
 }
@@ -534,9 +544,12 @@ const inPlaylist = () => (!state.query && state.view && state.view !== SETTINGS)
 
 function play(song, inside = inPlaylist()) {
   if (song.missing) return toast('“' + song.title + '” isn’t in your music folder');
-  // No playlist named is how the CLI is told 'the library, from this song on'.
+  // The window always says which list it is playing from: a playlist by name,
+  // All songs and a search by `--library`. Never silence - the CLI reads a
+  // song with no list named as a song typed in a terminal, where there is no
+  // list on screen to mean, and works one out from what is playing instead.
   // Naming a song still names it under shuffle: it starts there and draws on.
-  run('play', ...(inside ? [inside] : []), song.file);
+  run('play', ...(inside ? [inside] : ['--library']), song.file);
 }
 
 /* Start what is on screen, with no song in mind - the Play button at the top
@@ -636,9 +649,14 @@ async function removeSong(song) {
     lib => !(lib.playlists.find(p => p.file === stem)?.songs || []).includes(song.file));
 }
 
+/* The number column, and the play arrow that covers it on hover. A YouTube
+   row has no number - it is in no list to be the nth of - but it keeps the
+   column, so the arrow sits where it sits on every other row. Both kinds are
+   built here because the playing bars replace this and have to put back
+   exactly what they found. */
 function trackNumber(row, i) {
   const num = el('div', 'num');
-  num.append(el('span', 'n', i + 1));
+  num.append(el('span', 'n', row.classList.contains('yt') ? '' : i + 1));
   const p = svg('i-play');
   p.setAttribute('class', 'play');
   num.append(p);
@@ -909,6 +927,7 @@ function render() {
   // Typing in the search box leaves settings for the results, and clearing it
   // comes back - so the box works from here too, without a way out to find.
   if (state.view === SETTINGS && !state.query) return renderSettings();
+  if (state.view === STATS && !state.query) return renderStats();
   renderHead();
   renderList();
 }
@@ -1195,6 +1214,227 @@ function renderSettings() {
   $('#list').replaceChildren(page);
 }
 
+/* ------------------------------------------------------------------ stats */
+/* One question, drawn: how long you listened, and when. `simplmusik stats`
+   works the buckets out from the play log and hands over all three sizes at
+   once, so switching between them is instant and the window does no
+   arithmetic of its own.
+
+   Hours per day is the default because that is the shape of a listening
+   habit. Hourly is the same series zoomed into the last two days, weekly the
+   same one pulled back to half a year - a zoom rather than a new question. */
+
+const STEPS = [['hour', 'Hourly'], ['day', 'Daily'], ['week', 'Weekly']];
+const STEP_SUB = { hour: 'the last 48 hours', day: 'the last 30 days',
+                   week: 'the last 26 weeks' };
+
+/* Seconds as somebody would say them - the same wording the CLI prints, so
+   one evening is never described two ways. */
+const spellSecs = s => {
+  s = Math.round(s || 0);
+  if (s < 90) return `${s} sec`;
+  const m = Math.round(s / 60);
+  return m < 90 ? `${m} min` : `${Math.floor(m / 60)} hr ${m % 60} min`;
+};
+
+/* Read afresh every time the page is opened, and held while you are on it: the
+   log only grows when a song ends, so nothing changes under you while you read
+   and the sidebar's own timer should not cost a round trip. */
+async function loadStats() {
+  const r = await call('stats');
+  state.stats = r.ok ? (r.data || null) : null;
+  // The CLI refuses with a sentence when there is nothing logged yet, which is
+  // the right thing to put on an empty page, so it is kept rather than
+  // replaced with one of our own.
+  state.statsWhy = r.ok ? null : (r.error || 'couldn’t read the play log');
+}
+
+/* ---------------------------------------------------------- the chart */
+
+const SVGNS = 'http://www.w3.org/2000/svg';
+const node = (t, attrs) => {
+  const n = document.createElementNS(SVGNS, t);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+};
+
+/* A column: square where it stands on the baseline, rounded at the end the
+   data reaches. The radius gives way on a short bar rather than swelling it,
+   so a quiet hour still reads as smaller than a busy one. */
+function column(x, y, w, h) {
+  const r = Math.min(4, w / 2, h);
+  return `M${x} ${y + h}V${y + r}a${r} ${r} 0 0 1 ${r} ${-r}h${w - 2 * r}`
+       + `a${r} ${r} 0 0 1 ${r} ${r}V${y + h}Z`;
+}
+
+const tickText = s => !s ? '0'
+  : s >= 3600 ? (((s / 3600) % 1) ? (s / 3600).toFixed(1) : s / 3600) + 'h'
+  : Math.round(s / 60) + 'm';
+
+/* Where the axis stops and what it counts in. Clean numbers only - the ticks
+   carry every value that isn't labelled on the chart, so they have to be
+   numbers you can read off rather than whatever the tallest bar happened to
+   be. Four gaps at most, which is as many lines as can cross a plot this
+   size without becoming the thing you look at. */
+function scaleFor(top) {
+  const unit = top >= 3600 ? 3600 : 60;
+  const steps = unit === 3600 ? [0.25, 0.5, 1, 2, 3, 4, 6, 12, 24]
+                              : [1, 2, 5, 10, 15, 30];
+  const want = top / unit || 1;
+  const step = steps.find(s => want / s <= 4) || steps[steps.length - 1];
+  const high = Math.max(step, Math.ceil(want / step) * step);
+  const ticks = [];
+  for (let v = 0; v <= high + 1e-9; v += step) ticks.push(v * unit);
+  return { high: high * unit, ticks };
+}
+
+/* Drawn at the size it is actually being shown at rather than scaled into a
+   viewBox: a chart stretched to fit would take its type and its 4px corners
+   along with it, and both are meant to be the same size on every screen. */
+function drawChart(box, rows) {
+  const W = Math.max(320, Math.round(box.clientWidth));
+  const H = 260, padL = 46, padR = 14, padT = 14, padB = 28;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const svg = node('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`,
+                            class: 'chart', role: 'img' });
+  const top = Math.max(...rows.map(r => r.heard), 0);
+  const { high, ticks } = scaleFor(top);
+  const y = v => padT + plotH - (v / high) * plotH;
+
+  svg.setAttribute('aria-label',
+    `Listening time per bucket. Highest ${spellSecs(top)}.`);
+
+  // The grid, one step off the surface and hairline: it is there to be
+  // measured against, not to be looked at.
+  for (const t of ticks) {
+    svg.append(node('line', { class: 'grid', x1: padL, x2: W - padR,
+                              y1: y(t) + .5, y2: y(t) + .5 }));
+    const lab = node('text', { class: 'tick', x: padL - 9, y: y(t) + 4,
+                               'text-anchor': 'end' });
+    lab.textContent = tickText(t);
+    svg.append(lab);
+  }
+
+  const band = plotW / rows.length;
+  const barW = Math.max(2, Math.min(24, band - 2));   // the 2px gap is the gap
+  // Enough labels to place the chart in time, and no more - they collide long
+  // before the bars do. Counted back from the newest, so 'now' is always one.
+  const every = Math.max(1, Math.ceil(rows.length / 7));
+
+  // The highlight goes down before the bars, so it lights the column the bar
+  // stands in rather than painting over the bar you are pointing at.
+  const mark = node('rect', { class: 'band', y: padT, height: plotH,
+                              width: band, opacity: 0 });
+  svg.append(mark);
+
+  rows.forEach((r, i) => {
+    const x = padL + i * band + (band - barW) / 2;
+    if (r.heard > 0) {
+      const h = Math.max(2, (r.heard / high) * plotH);
+      svg.append(node('path', { class: 'bar', d: column(x, padT + plotH - h, barW, h) }));
+    }
+    if ((rows.length - 1 - i) % every === 0) {
+      const lab = node('text', { class: 'tick', x: x + barW / 2,
+                                 y: H - padB + 17, 'text-anchor': 'middle' });
+      lab.textContent = r.label;
+      svg.append(lab);
+    }
+  });
+
+  // Every hit target last, so all of them are above every bar. Interleaved
+  // with the bars, a tall bar drawn after its neighbour's target would take
+  // the pointer itself and the column next to it would go dead.
+  rows.forEach((r, i) => {
+    // The target is the whole column of air, not the bar: an empty Tuesday has
+    // nothing to point at and is still worth being told about.
+    const hit = node('rect', { class: 'hit', x: padL + i * band, y: padT,
+                               width: band, height: plotH });
+    const why = node('title');
+    why.textContent = `${r.full} — ${r.heard ? spellSecs(r.heard) : 'nothing'}`;
+    hit.append(why);
+    hit.dataset.i = i;
+    svg.append(hit);
+  });
+
+  const tip = el('div', 'chart-tip');
+  tip.hidden = true;
+
+  svg.onmousemove = e => {
+    const at = e.target.closest?.('.hit');
+    if (!at) return;
+    const i = +at.dataset.i, r = rows[i];
+    mark.setAttribute('x', padL + i * band);
+    mark.setAttribute('opacity', '1');
+    tip.replaceChildren(el('div', 'k', r.full),
+                        el('div', 'v', r.heard ? spellSecs(r.heard) : 'nothing'));
+    tip.hidden = false;
+    // Kept inside the box: near the right-hand edge it flips to the other
+    // side of the column rather than hanging off the chart.
+    const mid = padL + i * band + band / 2;
+    tip.style.left = Math.min(Math.max(mid, 60), W - 60) + 'px';
+    tip.style.top = Math.max(6, y(r.heard) - 52) + 'px';
+  };
+  svg.onmouseleave = () => { tip.hidden = true; mark.setAttribute('opacity', '0'); };
+
+  box.replaceChildren(svg, tip);
+}
+
+// One observer for the page, reconnected each render: the chart is drawn at
+// the width it has, so it has to be drawn again when that changes.
+let chartWatch = null;
+
+function renderStats() {
+  closeMenu();
+  const head = $('#head');
+  head.replaceChildren();
+  head.append(el('h1', '', 'Stats'));
+
+  const page = el('div', 'settings');
+  const s = state.stats;
+  if (!s) {
+    const e = el('div', 'empty');
+    e.append(el('strong', '', state.statsWhy ? 'Nothing to show yet' : 'Reading…'));
+    if (state.statsWhy) e.append(el('div', '', state.statsWhy));
+    e.style.padding = '40px 10px';
+    page.append(e);
+    return void $('#list').replaceChildren(page);
+  }
+
+  const step = state.statsStep || 'day';
+  const rows = (s.series || {})[step] || [];
+  const total = rows.reduce((n, r) => n + r.heard, 0);
+
+  // The filter sits over the chart, and the total beside it is of what the
+  // chart is showing - change the step and the number changes with it.
+  const top = el('div', 'chart-head');
+  const fig = el('div', 'fig');
+  fig.append(el('div', 'hero', spellSecs(total)),
+             el('div', 'sub', 'listening in ' + STEP_SUB[step]));
+  top.append(fig, segment(STEPS, step, v => {
+    state.statsStep = v;
+    renderStats();
+  }));
+  page.append(top);
+
+  const panel = el('div', 'panel chart-panel');
+  const box = el('div', 'chart-wrap');
+  panel.append(box);
+  page.append(panel);
+
+  page.append(el('div', 'hint',
+    'Time your ears actually did: a song paused is not counted, and a song you '
+    + 'played twice over is counted twice. Read out of the play log in your '
+    + 'music folder — `simplmusik stats` says the same in a terminal.'));
+
+  $('#list').replaceChildren(page);
+
+  // Drawn once the box is in the document and has a width to be drawn at.
+  drawChart(box, rows);
+  chartWatch?.disconnect();
+  chartWatch = new ResizeObserver(() => drawChart(box, rows));
+  chartWatch.observe(box);
+}
+
 /* ------------------------------------------------------------- downloads */
 /* What the search turned up on YouTube, listed under whatever the library
    matched. Downloading writes one file into ~/Music and does nothing else -
@@ -1287,7 +1527,7 @@ function playFound(r, pl) {
   if (!have) return stream(r, pl);
   // Downloaded, but not in the playlist on screen: there is no list to play it
   // in, so it plays from the library instead of from a list it isn't in.
-  if (pl && !pl.songs.includes(r.song)) return run('play', r.song);
+  if (pl && !pl.songs.includes(r.song)) return run('play', '--library', r.song);
   return play(have);
 }
 
@@ -1301,14 +1541,15 @@ function foundRow(r, pl) {
   const busy = !!r.downloading || !!dl;
   row.classList.toggle('dl-on', busy);
 
+  // The file this result has turned out to be, once it is one. It is how the
+  // row knows itself in what the player reports after a stream has landed and
+  // the song is being played from the disk like any other.
+  if (r.song) row.dataset.song = r.song;
+
   // Play sits where it sits on every other row - the left-hand column, under
   // the number, shown when the pointer is over the row. A found song is
   // played the same way a library song is, so it is asked for the same way.
-  const num = el('div', 'num');
-  num.append(el('span', 'n', ''));
-  const p = svg('i-play');
-  p.setAttribute('class', 'play');
-  num.append(p);
+  const num = trackNumber(row, 0);
 
   const art = el('div', 'art');
   art.append(cover({ title: r.title, artist: r.channel }));
@@ -1360,12 +1601,32 @@ function foundRow(r, pl) {
   return row;
 }
 
+/* A row spins while either of two things says it is downloading: this flag,
+   set the moment it is asked for, and the CLI's own report, which the poll
+   copies into `state.now.downloads`. The call coming back settles the first
+   but not the second, and the two disagree for as long as half a second - the
+   poll's tick. That is long enough to matter when there is nothing to fetch:
+   a song already in the library answers in about the time it takes to ask
+   YouTube what the file would be called, and the CLI has said 'starting' by
+   then, so a poll can land in the gap. The render that follows would rebuild
+   the row from that stale entry as still downloading, and `markDownloads`
+   goes on turning a ring for an entry it can no longer find - so it would sit
+   there saying 'Downloading...' until the 15s library reload redrew it.
+
+   So the answer is the end of it: this fetch is over, whatever the last poll
+   thought, and the entry goes with it. The next poll re-reads the truth from
+   disk, so a download still genuinely running comes straight back. */
+function downloadOver(r) {
+  r.downloading = false;
+  if (state.now.downloads) delete state.now.downloads[r.id];
+}
+
 async function download(r, pl) {
   if (r.downloading) return;
   r.downloading = true;
   render();                         // say so now, not when the bytes land
   const res = await call('download', r.id);
-  r.downloading = false;
+  downloadOver(r);
   if (!res.ok) {
     render();
     toast(res.error || 'the download didn\'t work');
@@ -1373,6 +1634,7 @@ async function download(r, pl) {
   }
   const d = res.data || {};
   r.song = d.song;
+  render();                         // the ring stops here, not at the next poll
   // Downloaded from inside a playlist, the song joins it: half a job otherwise,
   // since that is the list you were looking at when you asked for it.
   if (pl && d.song) return void addTo(pl, d.song);
@@ -1488,12 +1750,22 @@ addEventListener('resize', closeMenu);
    The same song sitting in a second playlist is not the one being played, so
    it stays an ordinary row there. `playlist` is the stem the player was
    started with and null for the library, which is what the view is too - so
-   'is this the list it's playing from' is still a single comparison. */
+   'is this the list it's playing from' is still a single comparison.
+
+   A YouTube row is in no list, so that question never reaches it and it asks
+   the plainer one: is the player on this? Which is true while it is streaming
+   this very result, and true again once the result has become a file and that
+   file is what is playing. Those two are the before and after of a stream
+   landing, and nothing has to be told when it happens - the id leaves the
+   player's answer as the filename arrives, so the bars move themselves, on
+   the same tick every other song change moves on. */
 function markNowPlaying() {
   const n = state.now;
   const here = !!n.playing && (n.playlist || null) === inPlaylist();
   document.querySelectorAll('.track').forEach(row => {
-    const on = here && row.dataset.rel === n.rel;
+    const { yt, song, rel } = row.dataset;
+    const on = yt ? !!n.playing && (yt === n.vid || song === n.rel)
+                  : here && rel === n.rel;
     row.classList.toggle('now', on);
     row.classList.toggle('paused', on && n.paused);
     const num = row.querySelector('.num');
@@ -1565,7 +1837,10 @@ async function loadLibrary() {
     if (Date.now() > held.until) { pending.delete(held); continue; }
     held.apply();
   }
-  if (state.view && state.view !== SETTINGS
+  // The pages that are not playlists are not in this list and never will be,
+  // so they are asked about first: without that the reload every 15s decides
+  // the page you are reading has been deleted and puts you back in the library.
+  if (state.view && state.view !== SETTINGS && state.view !== STATS
       && !state.lib.playlists.some(p => p.file === state.view))
     state.view = null;                      // it went away: fall back to all songs
   renderPlaylists();
@@ -1859,6 +2134,12 @@ document.onkeydown = e => {
 /* ------------------------------------------------------------------ start */
 
 $('#settings-btn').onclick = () => openPlaylist(SETTINGS);
+$('#stats-btn').onclick    = async () => {
+  state.stats = state.statsWhy = null;
+  openPlaylist(STATS);
+  await loadStats();
+  if (state.view === STATS) render();   // ...unless you already left
+};
 
 loadLibrary();
 poll();

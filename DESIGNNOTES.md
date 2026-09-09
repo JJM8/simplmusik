@@ -6,12 +6,12 @@ A CLI music player and a desktop UI for it, on Linux Mint.
 
 ```sh
 ./build-deb                                        # a package of the lot
-sudo apt install ./build/simplmusik_0.1.0_all.deb
+sudo apt install ./build/simplmusik_0.1.3_all.deb
 ```
 
 ```sh
 ./build-flatpak                                    # the same, for any distro
-flatpak install --user ./build/simplmusik_0.1.0.flatpak
+flatpak install --user ./build/simplmusik_0.1.3.flatpak
 ```
 
 Playback is **mpv** and the loudness measuring is **ffmpeg**; tags and cover
@@ -41,10 +41,14 @@ ships beside it. With `abspath` the CLI looked for its bundled yt-dlp in
 
 ### The same app, packaged twice
 
-The .deb depends on the archive for mpv, ffmpeg, mutagen, GTK and WebKit. The
-flatpak cannot: it has to hold everything, on a machine whose package manager
-it knows nothing about. The GNOME runtime turns out to cover most of it -
-WebKit 4.1 by the name the window asks for, GTK 3, Python, and ffmpeg - so
+The .deb depends on the archive for mpv, ffmpeg, mutagen, GTK and WebKit,
+which is why it is three megabytes rather than a bundled runtime. Everything
+it needs by name is in Ubuntu 22.04 and Debian 12 onwards, and the one thing
+that cannot be a dependency - yt-dlp - rides along inside the package.
+
+The flatpak cannot lean on any of that, on a machine whose package manager it
+knows nothing about. The GNOME runtime turns out to cover most of it - WebKit
+4.1 by the name the window asks for, GTK 3, Python, and ffmpeg - so
 `org.simplmusik.Player.yml` builds only what is genuinely missing, which is
 mpv and mutagen.
 
@@ -64,7 +68,9 @@ What the sandbox does cost is the CLI. `play` starts a background player and
 returns, and flatpak takes the sandbox down with the command that exits, so a
 `play` run from outside the window leaves mpv going with nothing left holding
 it. Queries and control of a player already running are fine, because those
-reach it through files and a socket that both sides can see.
+reach it through files and a socket that both sides can see. `export_cli` in
+`simplmusik-ui` is what gives the command a name on the host at all: a three
+line wrapper in `~/.local/bin` handing its arguments back to the sandbox.
 
 ### From a checkout instead
 
@@ -202,7 +208,32 @@ In the window, the same command is the Settings page.
 simplmusik create 'Road trip'
 simplmusik add 'Road trip' ~/Downloads/*.mp3            # imports, then lists them
 simplmusik add 'Road trip' 'Killer Queen - Queen.mp3'   # already in the library
+simplmusik add 'Road trip' 'killer queen'               # enough of the name
+simplmusik add 'Road trip' 3                            # the third row you were shown
 ```
+
+Three ways to name a song, and every command that takes one takes all three:
+the number beside it in the last list you were shown, its whole filename, or
+enough of the filename to tell it from every other song. They are tried in that
+order. A whole name goes before a part of one so that a song can always be
+named outright however many others contain its name, and a real playlist or a
+real file always beats a guess - naming a thing of your own is never taken away
+from you. Several matches is a question, not a coin toss: it says which songs
+it found and asks for another word.
+
+The numbering is the point of the other two. `search`, `songs` and `list` all
+print numbered lists, and the numbers are only worth printing if the next
+command takes one - filenames here read `Artist - Title (Official Video).mp3`,
+with the odd fullwidth quote in them, and that is not something anybody types
+twice. So a listing writes down what it showed, in
+`~/.local/state/simplmusik-shown.json`. It is the one piece of state a command
+leaves behind for the next one, and it expires after an hour, which is the
+point: a number means "the third one you just showed me", and that stops being
+true long before a file does. After it, a number is a number again and a song
+actually called 3 wins.
+
+One list at a time, because there is one you were last shown - a search in the
+window writes there too, since it is the same person asking.
 
 `remove PLAYLIST SONG` only edits that list and `delete PLAYLIST` only deletes
 the list, so neither touches your music and neither stops to ask. `remove SONG`
@@ -215,10 +246,19 @@ holds the file open and would otherwise sound a song that is no longer in your
 library right to the end.
 
 A song that isn't in any playlist is still in your library, and `play` with
-nothing to go on plays the whole thing. There is no "all songs" playlist to
-name, either: a song on its own **means** the library, starting there - even
-while a playlist is playing, so it never quietly scopes itself to whatever was
-already on. That is the one command the All songs view uses.
+nothing to go on plays the whole thing. A song on its own **means** the
+library, starting there - even while a playlist is playing, so it never quietly
+scopes itself to whatever was already on. That is the one command the All songs
+view uses.
+
+The library has no file and never will - it is every song in your music folder,
+which is not a list anybody made - but it does have a name. **All songs** is
+what the window calls it at the top of its sidebar, so it is what the CLI calls
+it too: `list` counts it alongside the playlists, `list 'All songs'` prints it,
+`play 'All songs'` starts it, and `add 'All songs' FILE` imports into the
+library without putting the song in any list. `library` and `all` mean the same
+thing, and a playlist you actually called one of those wins - `find` is always
+asked first.
 
 In the window, a playlist carries an **Add songs** box under its own tracks.
 Empty, it lists every song in your library that isn't in the playlist already;
@@ -314,19 +354,33 @@ the same trick the player's state file uses. The UI reads them on the poll it
 was already making for the progress bar, so nothing new is asked of the network.
 
 ```sh
-simplmusik search daft punk one more time    # id, title and length per result
-simplmusik search daft punk --count 24       # a longer list, up to 40
+simplmusik search wonderwall                 # your own songs, numbered
+simplmusik search --yt daft punk one more time    # ...or YouTube. `-yt` too
+simplmusik search --yt daft punk --count 24  # a longer list, up to 40
 simplmusik download FGBhQbmPwH8              # or a full youtube.com/youtu.be link
+simplmusik download 2 --to 'Road trip'       # ...into a playlist as well
+simplmusik add 'Road trip' 2                 # the same two steps, said once
 ```
 
-A download lands in your music folder and **joins no playlist** - it
-becomes an ordinary library song like any file you copied in yourself, and
-`add` is still the only thing that puts a song in a playlist. Which is what the
-window does next when you download from inside one: the same **Download**
-section sits under a playlist's Add songs box, and a row pressed there is a
-`download` and then an `add`, so the song arrives in your library and in that
-playlist. Pressed from the top bar, with no playlist on screen, it's the
-download by itself. It arrives as an mp3 with its
+**Your own songs by default, YouTube when you ask.** Have I got this? is the
+common question and it is answered off the disk in no time at all, where
+YouTube is a network round trip you asked for. The window has always shown the
+two halves in this order, its own songs above what YouTube has; `--yt` is that
+same order on one command with a switch. A library search matches every word of
+the query anywhere in the filename, in any order and any case, so `wham go go`
+finds the song those words are scattered through.
+
+A download lands in your music folder and joins no playlist unless `--to` names
+one - it is otherwise an ordinary library song like any file you copied in
+yourself. `--to` is the second half of what the window does when you download
+from inside a playlist: the same **Download** section sits under a playlist's
+Add songs box, and a row pressed there is a `download` and then an `add`.
+Pressed from the top bar, with no playlist on screen, it's the download by
+itself. `add PLAYLIST N` on a YouTube result is the same pair in one command,
+and `stream --to` is it again for a song you want to hear now - the playlist
+gets the row straight away, because the filename is settled before a byte
+arrives, and a detached process waits for the fetch and moves the song out of
+the cache into your library so that row comes true instead of going stale. It arrives as an mp3 with its
 title, artist and cover art written into the tags, which is exactly where the
 UI reads all three from, so it looks like the rest of your library at once.
 
@@ -369,6 +423,7 @@ Both search boxes work this way, the top bar's and a playlist's.
     install         menu entry and icons
     build-deb       the .deb, for apt-based distributions
     build-flatpak   the .flatpak, for every other one
+    build-all       both at once, which is what a release is
     simplmusik     the CLI - the only thing that touches playback, your
                     library or your settings
 
@@ -394,11 +449,26 @@ terminal get the same one. Walking that folder is the only thing here that
 touches the whole disk, so one walk is held for a few seconds and shared by the
 covers on screen.
 
-Playlists come back most recently changed first, which is the order both the
-sidebar and the add-to-playlist menu show them in - the one you're working on
-stays at the top. Recency is the playlist file's own timestamp, so adding a
-song is what makes it recent and editing a file by hand counts too. Nothing is
-stored anywhere to keep track of it.
+Everything reads newest first, and the CLI is where that is decided - the
+backend passes the order on rather than having an opinion of its own, so the
+window and a terminal list the same library the same way round.
+
+- **Songs** go by when they turned up in your music folder: the file's own
+  timestamp, which a download stamps as it writes, an import takes from the
+  import, and a synced folder carries to the other machine - so nothing has to
+  be written down, and two machines agree.
+- **A playlist's songs** go by when you added them, and the file is stored in
+  that order: adding puts a song on the top of the list rather than the bottom.
+  Where a song sits *is* the record of when it was added, so there is no date
+  to keep beside it and no view that can disagree with the file. Lists written
+  before this are the same list backwards, and are turned round once on the
+  first read; `"order": "newest"` in the file is how that is known to be done.
+- **Playlists themselves** go by when you last played one, which is written to
+  the file when playback starts. One you have never played sits by the day you
+  made it (`"created"`), so a new playlist opens at the top and drifts down as
+  others are played rather than starting at the bottom of the list you made it
+  to lead. A playlist from before either date was kept falls back to the file's
+  own timestamp.
 
 The backend exists only for what a CLI can't hand over:
 

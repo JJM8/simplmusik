@@ -8,7 +8,19 @@ fetched at build time, and `simplmusik update` replaces it later.
 
     ./build-deb                  # build simplmusik_<version>_all.deb
     ./build-deb --version 0.2.0  # ...with a version of your choosing
+    ./build-deb --fresh          # ...fetching yt-dlp again first
     ./build-deb --keep           # leave the staging tree for a look
+
+Every build gets its own number. VERSION below is the one you are about to
+cut; it ticks up by .1 once the package is built, so no two builds go out
+alike. Set that line by hand to move a whole version - 0.2.0 - and the ticking
+carries on from there. Naming a version with --version uses it as given and
+leaves the counter where it is.
+
+Use --fresh when cutting a release. The yt-dlp in build/yt-dlp.cache is reused
+between builds, which is what you want while working and not what you want in
+something you hand out - YouTube retires extractors within months, and a
+package is only as current as the copy frozen into it.
 
 Needs dpkg-deb, which is on every Debian and Ubuntu already.
 """
@@ -18,7 +30,7 @@ import time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
-VERSION = "0.1.3"          # what the next build will be; see bump()
+VERSION = "0.2.0"          # what the next build will be; see bump()
 PKG = "simplmusik"
 MAINTAINER = "Josh <john.mcgill@mail.com>"
 
@@ -34,9 +46,9 @@ YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 
 def bump():
     """Tick the last part of VERSION up by one, in this file, and say what it
-    now reads. Called by build-all once both packages are built, so VERSION
-    above is always the number of the build you are about to cut rather than
-    the last one you cut - two builds never go out wearing the same number.
+    now reads. Called at the end of a build, so VERSION above is always the
+    number of the build you are about to cut rather than the last one you
+    cut - two builds never go out wearing the same number.
 
     To move a whole version, set VERSION by hand - 0.2.0 - and the ticking
     carries on from there. Nothing else in the tree names a version, so that
@@ -274,14 +286,19 @@ def du_kb(root):
 
 def main():
     args = sys.argv[1:]
-    version = VERSION
-    if "--version" in args:
+    version, pinned = VERSION, "--version" in args
+    if pinned:
         i = args.index("--version")
         if i + 1 >= len(args):
             sys.exit("--version needs a number, e.g. --version 0.2.0")
         version = args[i + 1]
     if not shutil.which("dpkg-deb"):
         sys.exit("dpkg-deb isn't installed - `sudo apt install dpkg-dev`")
+
+    cache = os.path.join(BUILD, "yt-dlp.cache")
+    if "--fresh" in args and os.path.isfile(cache):
+        os.remove(cache)
+        print("dropped the cached yt-dlp - it will be fetched again")
 
     stage = os.path.join(BUILD, "%s_%s_all" % (PKG, version))
     if os.path.isdir(stage):
@@ -306,6 +323,12 @@ def main():
 
     print("\n%s  (%.1f MB)" % (out, os.path.getsize(out) / 1e6))
     print("\nInstall it with:\n    sudo apt install %s" % out)
+
+    # The number is spent now the package is built: tick it over so the next
+    # build is a new version rather than a second copy of this one. A version
+    # asked for by hand is yours and is left alone.
+    if not pinned:
+        print("\nnext build will be %s" % bump())
     if LICENSE == "UNSET":
         print("\nnote: there is no LICENSE file, so the package's copyright "
               "says so.\n      Add one and set LICENSE in this script before "

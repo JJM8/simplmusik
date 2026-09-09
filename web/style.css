@@ -33,14 +33,14 @@
      raised is the row under the pointer or the field being typed in, never
      the panel around it. */
   --bg:         #0b0b0d;
-  --sidebar:    #0b0b0d;
-  --bar:        #0b0b0d;
+  --sidebar:    #18181b;
+  --bar:        #18181b;
   --surface:    #282831;
   --hover:      #363642;
   --border:     #434350;
   /* The rule the column headings sit on - a hairline barely off the page,
      for a divide inside a section rather than between two of them. */
-  --seam:       #24242e;
+  --seam:       #0b0b0b
   /* What the joins *between* sections are painted with, in one place because
      it is the one thing being tried out: --border is the app's own divider
      grey, var(--accent-ink) makes every seam an orange rule instead. Both
@@ -257,7 +257,22 @@ input  { font: inherit; }
   background: var(--surface);
 }
 
-.side-foot { padding: 10px; }
+.side-foot { padding: 10px; display: flex; flex-direction: column; gap: 2px; }
+
+/* New playlist sits over the two pages rather than beside them, so its text is
+   centred: ranged left it reads as a third item in a column of three, and the
+   line under it is what says there are two things there and not three. */
+.linkbtn.center { justify-content: center; }
+
+/* Settings and Stats share the line under it, and Stats takes half the room
+   Settings does. That is the honest proportion: settings is the page you go
+   into looking for something, stats is the one you glance at and leave. */
+.foot-row { display: flex; gap: 2px; }
+.foot-row .linkbtn { width: auto; min-width: 0; flex: 2; }
+.foot-row .linkbtn.half {
+  flex: 1; justify-content: center; gap: 6px; padding: 0 6px;
+  white-space: nowrap; overflow: hidden;
+}
 
 .linkbtn {
   display: flex; align-items: center; gap: 9px;
@@ -822,6 +837,44 @@ input  { font: inherit; }
   padding: 9px 3px 0;
   font-size: 12px; line-height: 1.55; color: var(--faint);
 }
+
+/* ----------------------------------------------------------------- stats */
+/* One chart, and the two things that frame it: what it adds up to, and which
+   size of bucket it is drawn in. Everything else the play log knows is a
+   terminal away - this page answers one question. */
+
+.chart-head {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 16px; padding: 14px 2px 16px;
+}
+.chart-head .hero {
+  font-size: 30px; font-weight: 600; letter-spacing: -.4px; color: var(--text);
+}
+.chart-head .sub { font-size: 13px; color: var(--faint); margin-top: 3px; }
+
+.chart-panel { padding: 8px 10px 4px; }
+.chart-wrap { position: relative; }
+.chart { display: block; width: 100%; }
+
+/* The data is the only loud thing here. The grid is one step off the surface
+   and hairline; the type wears text tokens, never the colour of the bars. */
+/* The bars never take the pointer: the hit targets over them are what
+   answers a hover, and they cover the empty columns too. */
+.chart .bar { fill: var(--accent-ink); pointer-events: none; }
+.chart .grid { stroke: var(--border); stroke-width: 1; }
+.chart .tick { fill: var(--faint); font-size: 11px;
+               font-variant-numeric: tabular-nums; }
+.chart .band { fill: var(--hover); }
+.chart .hit  { fill: transparent; cursor: default; }
+
+.chart-tip {
+  position: absolute; transform: translateX(-50%);
+  padding: 7px 10px; border-radius: var(--radius);
+  background: var(--bg); border: 1px solid var(--border);
+  pointer-events: none; white-space: nowrap; z-index: 2;
+}
+.chart-tip .k { font-size: 12px; color: var(--faint); }
+.chart-tip .v { font-size: 13px; color: var(--text); margin-top: 2px; }
 
 /* ---------------------------------------------------------------- player */
 

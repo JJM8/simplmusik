@@ -7,7 +7,8 @@ Playlists are small JSON files in .simplmusik/playlists inside that folder -
 so syncing it between machines takes your playlists with it - naming a song by
 its filename and where it was last seen:
 
-    {"name": "Road trip",
+    {"name": "Road trip", "created": 1730000000, "played": 1730500000,
+     "order": "newest",
      "songs": [{"file": "Killer Queen - Queen.mp3", "dir": "/home/me/Music"}]}
 
 The filename is the identity everywhere; `dir` is only a shortcut. A song that
@@ -15,12 +16,21 @@ has moved is looked for again under your music folder once and the list rewritte
 with where it turned up. One that is nowhere keeps its place, marked not found
 - a drive you haven't plugged in yet is no reason to edit your playlist.
 
+Everything reads newest first. Songs go by the file's own timestamp - when it
+turned up in your folder - and a playlist's songs go by the order they are
+written in, which is why adding one puts it at the top: the list is stored the
+way it is read. `created` and `played` are what the sidebar sorts playlists by
+(last played, or the day you made it); `order` says the list has been put
+newest-first, and is what stops an older one being turned round twice.
+
 Commands:
   status                     library + playback summary
   folder [set] [dir]         show your music folder, or choose another
                              (`folder set` on its own opens a folder picker)
-  songs                      list every song in the library
-  list [playlist]            list playlists, or the songs in one
+  songs                      list every song in the library, newest first
+  list [playlist]            list playlists, or the songs in one - playlists
+                             by when you last played one, songs by when they
+                             were added, both newest first
   create <name> [--cover P]  make a new, empty playlist
   rename <playlist> <name>   give a playlist a different name
   cover <playlist> [image]   show, set or (--clear) drop its cover art
@@ -117,8 +127,8 @@ Measurements are kept in ~/.cache/simplmusik.json.
 
 Control: every command - stop, pause, skip, back, shuffle, seek - is a line of
 JSON to the player's socket, answered by the player. Nothing signals a pid and
-nothing looks one up, because a pid means nothing outside the namespace that
-issued it and the flatpak gives every launch a namespace of its own.
+nothing looks one up, because a pid written down is only a guess by the time
+anything reads it, and means nothing outside the namespace that issued it.
 
 Exit codes: 0 ok, 1 user error, 2 nothing found.
 """
@@ -141,12 +151,33 @@ JOB = os.path.expanduser("~/.local/state/simplmusik-job.json")
 # behind that looks like a player to a copy of this that hasn't been upgraded.
 LEGACY = [os.path.expanduser("~/.local/state/simplmusik.json"),
           os.path.expanduser("~/.local/state/simplmusik-ctl.json")]
+# Where the play log used to be, back when it was this machine's rather than
+# the library's. `migrate` lifts it into the music folder, once.
+WAS_PLAYS = os.path.expanduser("~/.local/state/simplmusik-plays.jsonl")
 DLDIR = os.path.expanduser("~/.local/state/simplmusik-downloads")
 RESOLVED = os.path.expanduser("~/.local/state/simplmusik-resolved")
+SHOWN = os.path.expanduser("~/.local/state/simplmusik-shown.json")
 CACHE = os.path.expanduser("~/.cache/simplmusik.json")
 NULL = subprocess.DEVNULL
 
 CONF_DOT = ".simplmusik"            # the hidden folder playlists sit in
+PLAYS_NAME = "plays.jsonl"          # ...and the log of what you played, beside them
+
+# The library, named. It is not a playlist and has no file - it is every song
+# in your music folder, which is not a list anybody made - but it is the list
+# the window shows at the top of its sidebar and the one `play` falls back to,
+# so everything that takes a playlist name takes this one too. A playlist you
+# actually called "Library" wins: `find` is always asked first, and a name you
+# gave something of your own is never taken away from you.
+LIBRARY_NAME = "All songs"
+LIBRARY_NOTE = "default library"
+LIBRARY_ALIASES = {"all songs", "all-songs", "allsongs", "all",
+                   "library", "default library"}
+
+def is_library(name):
+    """Whether a name means the library rather than a playlist. Only ever
+    asked after `find` has said there is no playlist by that name."""
+    return (name or "").strip().lower() in LIBRARY_ALIASES
 
 # realpath, not abspath: installed, this file is a symlink on the PATH into
 # the folder holding the rest of us, and only the resolved path leads back to
@@ -180,15 +211,14 @@ YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 #               so a dead player and a live one can never be confused.
 #
 # What this replaces is a pid in a file, and the reason it had to go is that a
-# pid only means anything inside the namespace that issued it. The flatpak
-# gives every launch a namespace of its own, so the player behind one window
-# wrote down that it was pid 283 and the next window read that, asked after
-# its own pid 283 - a different process, or none - and concluded there was
-# nothing playing. It could neither see the player nor signal it, so it
-# started a second one over the top, and a third, each one audible and none of
-# them reachable. A lock and a socket are the filesystem's, and every copy of
-# this app - flatpak, package, or a checkout run from a terminal - is looking
-# at the same filesystem.
+# pid only means anything inside the namespace that issued it. Give two
+# launches a namespace each and the player behind one window writes down that
+# it is pid 283; the next window reads that, asks after its own pid 283 - a
+# different process, or none - and concludes there is nothing playing. It can
+# neither see the player nor signal it, so it starts a second one over the
+# top, and a third, each one audible and none of them reachable. A lock and a
+# socket are the filesystem's, and every copy of this app - package or a
+# checkout run from a terminal - is looking at the same filesystem.
 
 def load_json(path, default):
     try:
@@ -231,8 +261,8 @@ def ask(req, timeout=2.0):
     left behind by one that was killed, which refuses a connection rather than
     accepting it. Both are the same answer and neither is a guess, which is
     the point: this is the only test of whether anything is playing, and it
-    works the same from inside a flatpak, from a package, or from a checkout,
-    because a socket is a file and we are all looking at the same disk."""
+    works the same from a package or from a checkout, because a socket is a
+    file and we are all looking at the same disk."""
     try:
         s = socket.socket(socket.AF_UNIX)
         s.settimeout(timeout)
@@ -441,19 +471,40 @@ def under(path, root):
     path = os.path.abspath(os.path.expanduser(path))
     return path == root or path.startswith(root + os.sep)
 
+def arrived(path):
+    """When a song turned up in your library.
+
+    The file's own timestamp, and nothing written down beside it: a download
+    stamps itself as it is written, an import is copied rather than cloned so
+    it dates from the import, and a folder synced to another machine carries
+    its timestamps across - so both machines read the library in the same
+    order, without a record either of them has to keep. A file we can't ask
+    about is 0, which is the bottom of the list: where something we know
+    nothing about belongs."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
 def index():
-    """Every song you have, as {filename: full path}."""
+    """Every song you have, as {filename: full path}, newest first.
+
+    The walk itself stays alphabetical, so which of two files with one name
+    wins is decided the way it always was; the order is put on afterwards.
+    Newest first is the order everything shows - `songs`, the window's All
+    songs, and playing the library - because it is decided here, once."""
     out = {}
     for here, dirs, names in os.walk(folder()):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for n in sorted(names):
             if os.path.splitext(n)[1].lower() in AUDIO and n not in out:
                 out[n] = os.path.join(here, n)
-    return out
+    return dict(sorted(out.items(),
+                       key=lambda kv: (-arrived(kv[1]), kv[0].lower())))
 
 def library():
-    """Every song in the library: one flat, sorted list of filenames."""
-    return sorted(index())
+    """Every song in the library: one flat list, newest first."""
+    return list(index())
 
 def playlists_dir():
     """Where playlists are kept: inside your music folder, so syncing that
@@ -474,6 +525,18 @@ def cache_dir():
     is then a rename, which either has happened or hasn't, instead of a copy
     that can be interrupted halfway."""
     return os.path.join(folder(), CONF_DOT, "cache")
+
+def plays_path():
+    """Every song you have played, kept with the library rather than with this
+    machine. It is a record *of* your library - what you played and what you
+    skipped - so a folder synced between two machines should carry it along
+    the way it carries the playlists, rather than leaving each machine with
+    half a history and neither with the whole of one.
+
+    Hidden, beside the playlists, so `index` walks past it: a log is never a
+    song. It is not in the cache folder next door because nothing regenerates
+    it - lose it and those evenings are simply gone."""
+    return os.path.join(folder(), CONF_DOT, PLAYS_NAME)
 
 def remote(path):
     """Whether this is something mpv fetches rather than a file on disk.
@@ -499,18 +562,69 @@ def sweep_cache(days=1):
     except OSError:
         pass
 
-def rehome(was):
-    """Follow the music folder. Playlists live inside it, so choosing a
-    different one has to take them with it - otherwise they would be left
-    behind in a folder nothing looks at any more, out of sight."""
-    now = playlists_dir()
-    if os.path.abspath(was) == os.path.abspath(now) or not os.path.isdir(was):
-        return
+def lift(old, now):
+    """Move something that has changed address. Nothing happens if it was
+    never at the old one, or if something is already at the new - so this can
+    be asked on every command and only ever acts the once. True if it moved.
+
+    Nothing here is worth failing a command over: a playlist that could not be
+    carried across stays readable where it is, which is the whole of the
+    damage, and asking again tomorrow tries again."""
+    if (not os.path.exists(old) or os.path.exists(now)
+            or os.path.abspath(old) == os.path.abspath(now)):
+        return False
     try:
         os.makedirs(os.path.dirname(now), exist_ok=True)
-        shutil.move(was, now)
+        shutil.move(old, now)
+        return True
     except OSError:
-        pass                        # the playlists stay where they are
+        return False
+
+def drain_plays():
+    """Bring the play log in from the address it used to be kept at.
+
+    Appended rather than moved, which is the one way this differs from every
+    other move here: both files can hold lines worth keeping. A player started
+    before this version is still running and still writing to the old address,
+    and the evening it is in the middle of should not be stranded there
+    because some other command migrated the file out from under it. So the old
+    file is emptied into the new one and removed, and a player that writes to
+    it again simply has it drained again next time.
+
+    Appending is the one thing this format is built for, so there is nothing
+    to merge: the lines each carry the moment they describe, and anything
+    reading them that cares about order sorts on `at` rather than trusting the
+    file. A last line cut short by a crash is closed before the join, so a
+    half-written record can never swallow the first good one after it."""
+    now = plays_path()
+    if (not os.path.isfile(WAS_PLAYS)
+            or os.path.abspath(WAS_PLAYS) == os.path.abspath(now)):
+        return
+    try:
+        with open(WAS_PLAYS, "rb") as f:
+            was = f.read()
+        if was:
+            if not was.endswith(b"\n"):
+                was += b"\n"
+            os.makedirs(os.path.dirname(now), exist_ok=True)
+            fd = os.open(now, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "ab") as f:
+                f.write(was)        # only removed if this got there
+        os.remove(WAS_PLAYS)
+    except OSError:
+        pass                        # it stays where it is, and is tried again
+
+def rehome(was, log):
+    """Follow the music folder. The playlists and the record of what you have
+    played both live inside it, so choosing a different one has to take them
+    along - otherwise they are left behind in a folder nothing looks at any
+    more, out of sight.
+
+    The cache next door is not carried. It holds fetches in flight and songs
+    on their way into the folder they were asked for, which is the one being
+    left; there is nothing in it that the new folder is missing."""
+    lift(was, playlists_dir())
+    lift(log, plays_path())
 
 def stems():
     """Every playlist file, by name. One place decides what counts as one."""
@@ -541,6 +655,33 @@ def store(songs):
     return [{"file": s["file"], "dir": os.path.dirname(s["path"])} if s["path"]
             else {"file": s["file"]} for s in songs]
 
+def newest_first(stem, m):
+    """Put a playlist's songs newest first, once, and say whether that changed
+    anything.
+
+    The file's order is the order: the CLI, the window and a playlist opened in
+    an editor all read one list, and playing it plays it as it reads - so there
+    is nothing to keep in step, and no view that disagrees with what is stored.
+    Adding a song puts it on the top (see `cmd_add`), which is the whole of the
+    bookkeeping; where a song sits is when it was added.
+
+    Lists made before this was so were written oldest first, which is the same
+    list backwards. Turning one round is a one-time job, and `order` is how it
+    is known to be done - without it a list would be turned again on every
+    read. The date the file carried up to now is kept as the date it was made,
+    because this rewrite is about to replace it and it is the only record of
+    when the playlist appeared."""
+    if m.get("order") == "newest":
+        return False
+    m["order"] = "newest"
+    m["songs"] = list(reversed(m.get("songs") or []))
+    if not m.get("created"):
+        try:
+            m["created"] = round(os.path.getmtime(playlist_file(stem)), 3)
+        except OSError:
+            pass                # nothing to keep: it falls back to today
+    return True
+
 def songs_of(stem):
     """A playlist's songs, each as {"file": name, "path": where it is now}.
 
@@ -553,9 +694,13 @@ def songs_of(stem):
     in the list with path None: the list is what you made, and a file that is
     off the disk today may be back tomorrow, so nothing is quietly dropped.
     Duplicates are, though - shuffle's 'not played lately' check reads the
-    list and one name twice in it would fool that."""
+    list and one name twice in it would fool that.
+
+    The list comes back in the order it is written in, which is newest first:
+    see `newest_first`."""
     m = meta(stem)
-    root, idx, out, seen, moved = folder(), None, [], set(), False
+    root, idx, out, seen = folder(), None, [], set()
+    moved = newest_first(stem, m)
     for e in m.get("songs") or []:
         name, was = entry(e)
         if not name or name in seen:
@@ -646,13 +791,50 @@ def set_cover(stem, src):
     write_meta(stem, m)
     return dest
 
+def recency(stem, m):
+    """Where a playlist stands in the order: when you last put it on, or - if
+    you never have - when you made it.
+
+    Two dates rather than one because a playlist you have never played still
+    has to sit somewhere, and the day you made it is what you know about it;
+    so a new playlist opens at the top and drifts down as others are played,
+    rather than starting at the bottom of a list you made it to be at the top
+    of. One kept somewhere this app has never written to has neither date, and
+    the file's own timestamp stands in for both."""
+    for k in ("played", "created"):
+        v = m.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    try:
+        return os.path.getmtime(playlist_file(stem))
+    except OSError:
+        return 0.0
+
+def mark_played(stem):
+    """Remember that this is the playlist you just put on - which is what
+    lifts it to the top of the sidebar. Written when playback starts and not
+    again as it runs: it is 'the last one you chose', not 'the one that has
+    been sounding longest'."""
+    m = meta(stem)
+    m["played"] = round(time.time(), 3)
+    write_meta(stem, m)
+
 def playlists():
+    """Every playlist, most recently played first - the order the sidebar, the
+    add-to menu and `list` all read in, decided here so there is one answer to
+    it and not one per screen.
+
+    `songs_of` comes first because it settles the file, dates included, and
+    `recency` has to read what it settled rather than what was there before."""
     out = []
     for f in stems():
         stem = f[:-5]
+        songs = songs_of(stem)
         m = meta(stem)
         out.append({"file": stem, "name": m.get("name") or stem,
-                    "cover": cover_path(stem), "songs": songs_of(stem)})
+                    "cover": cover_path(stem), "songs": songs,
+                    "recent": recency(stem, m)})
+    out.sort(key=lambda p: (-p["recent"], p["name"].lower()))
     return out
 
 def find(name):
@@ -669,32 +851,60 @@ def find(name):
             return f[:-5]
     return None
 
+def filed_under(song):
+    """The playlist a song was most recently filed in, or None if none names
+    it. `find` asks where a playlist is by its name; this asks the same of a
+    song, which is the question a stream has when it ends.
+
+    Written rather than played: filing a song is writing the file, so the
+    file's own timestamp is the record of when you did it, and the newest of
+    them is where you last put this song. Only the stored names are read -
+    `songs_of` resolves every one of them and writes back what it found, which
+    would stamp every playlist it looked at with the moment it was asked and
+    leave nothing to tell them apart by."""
+    best = None
+    for f in stems():
+        stem = f[:-5]
+        if not any(entry(e)[0] == song for e in meta(stem).get("songs") or []):
+            continue
+        try:
+            when = os.path.getmtime(playlist_file(stem))
+        except OSError:
+            continue                    # gone since `stems` listed it
+        if best is None or when > best[0]:
+            best = (when, stem)
+    return best[1] if best else None
+
 def migrate():
-    """Two things have changed shape. The config kept a list of music folders
+    """Three things have changed shape. The config kept a list of music folders
     and now keeps one, so a list is collapsed to its first - which is already
     where playlists lived and where new songs landed, so nothing moves.
 
-    And playlists themselves have moved twice: out of ~/Music/playlists, which
+    Playlists themselves have moved twice: out of ~/Music/playlists, which
     tied them to the one music folder; and then into the music folder itself,
-    so that a folder synced between machines brings its playlists along. Each
-    happens once, the first time anything runs after it."""
+    so that a folder synced between machines brings its playlists along.
+
+    And the play log has made that same journey since, for that same reason.
+    It began beside the lock and the socket in ~/.local/state, which is this
+    machine's and no part of any library - so syncing your music to a second
+    machine left the history behind on the first, and neither of them had the
+    whole of it. It is a record of this library and it travels with it.
+
+    Each happens once, the first time anything runs after it."""
     c = load_json(CONFIG, {})
     if "folders" in c:
         dirs = c.pop("folders")
         c.setdefault("folder", dirs[0] if isinstance(dirs, list) and dirs
                      else default_folder())
         save_json(CONFIG, c, indent=2)
-    now = playlists_dir()           # asked after the collapse, not before
-    if os.path.isdir(now):
-        return                      # already where they belong
+    # Both moves below are *into* the music folder, so both are asked after
+    # the collapse above and not before: which folder that is has only just
+    # been settled.
+    drain_plays()
+    now = playlists_dir()
     for old in WAS:
-        if os.path.isdir(old) and os.path.abspath(old) != os.path.abspath(now):
-            try:
-                os.makedirs(os.path.dirname(now), exist_ok=True)
-                shutil.move(old, now)
-            except OSError:
-                pass                # nothing here is worth failing a command
-            return
+        if lift(old, now):
+            break                   # the first one they were at is the one
 
 def emit(as_json, obj, text):
     if as_json:
@@ -1010,23 +1220,34 @@ class Mpv:
                     pass
         return out
 
-    def until_end(self, wake, drain):
-        """Wait for the song to finish - however it finishes: played out,
-        stopped for a skip, or a file that turned out not to be playable. mpv
-        says which, but the player doesn't need to be told: `step` already
-        holds what to do next, set by whoever asked.
+    def until_end(self, wake, drain, tick=None, every=1.0):
+        """Wait for the song to finish, and say how it finished - played out,
+        stopped for a skip, or a file that turned out not to be playable. The
+        player doesn't need mpv's word for what to do next (`step` already
+        holds that, set by whoever asked) but it does need it for the log:
+        "stop" and "eof" are the difference between a song you skipped and one
+        you heard to the end, and nothing else here can tell them apart.
 
-        `wake` is the pipe a signal writes to, so a skip breaks the wait as
+        `wake` is the pipe a command writes to, so a skip breaks the wait as
         promptly as an event does, and `drain` is what carries out whatever
         the handler asked for. Every command mpv gets is sent from here, in
         the ordinary flow - never from a handler, which could cut in halfway
-        through a line being written and leave mpv something it can't read."""
+        through a line being written and leave mpv something it can't read.
+
+        `tick` runs on a quiet second and nowhere else: it reads where we are
+        in the song, which mpv forgets the instant the song ends, so a skip
+        has a position to be logged at. It is skipped whenever anything is
+        actually ready, so a command is never made to wait behind a read."""
         while not self.dead:
             drain()
             try:
-                ready = select.select([self.sock, wake], [], [])[0]
+                ready = select.select([self.sock, wake], [], [], every)[0]
             except OSError:
-                return
+                return "error"
+            if not ready:
+                if tick:
+                    tick()
+                continue
             if wake in ready:
                 try:
                     os.read(wake, 4096)     # the byte itself says nothing; the
@@ -1035,13 +1256,521 @@ class Mpv:
             if self.sock in ready:
                 for m in self.lines():
                     if m.get("event") == "end-file":
-                        return
+                        return m.get("reason") or "eof"
+        return "error"                      # mpv hung up mid-song
 
     def kill(self):
         try:
             self.proc.kill()
         except OSError:
             pass
+
+# ------------------------------------------------------------- the play log
+# Every song that sounds is written down, one line per song, as it ends. The
+# player is the only thing that writes here, because the player is the only
+# thing that knows: a window polling what is playing would miss everything
+# played from a terminal, count twice with two windows open, and could not
+# tell a skip from a seek. One line covers the whole span a song was up for -
+# how it was chosen, how far it got, and why it stopped - so a skip, a play
+# and a song you walked back to are the same record read three ways.
+#
+# JSONL and append-only, on purpose. A line is one `write` to a file opened
+# O_APPEND, which is atomic for anything this size, needs no read-modify-write
+# and cannot be interrupted into a half-file - and it is written from a signal
+# handler when the player is asked to stop, where anything that takes a lock
+# could deadlock instead. A line that fails to be written is lost and nothing
+# else is: the log is a record, and playback never waits on it.
+#
+# It lives in the music folder, hidden beside the playlists - see `plays_path`.
+# Appending suits that too: two machines syncing a folder between them are
+# each adding lines to the end of one file rather than rewriting it, which is
+# the shape a sync has the best chance of reconciling.
+
+# How the span ended. `eof` is mpv's own word for a song played out; the rest
+# are ours, because mpv only ever says "stop" and cannot know who asked.
+ENDS = ("eof", "skip", "back", "swap", "stop", "error")
+
+def log_play(path, rec):
+    """One finished span, appended. Never raises: a log is not worth a song.
+
+    The file is named by the caller rather than looked up here, because the
+    one caller that matters is closing a span from a signal handler on the way
+    out - and reading the config to find where the music folder is, at that
+    moment, is work that can be done earlier and cannot then fail late."""
+    try:
+        line = (json.dumps(rec, separators=(",", ":")) + "\n").encode()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, TypeError):
+        pass
+
+def source_of(path):
+    """Where the bytes came from: the network, the cache a stream is filling,
+    or a file in your library."""
+    if remote(path):
+        return "stream"
+    try:
+        return "cache" if under(os.path.dirname(path or ""), cache_dir()) else "file"
+    except OSError:
+        return "file"
+
+def open_span(job, live):
+    """A song has started. Begin its record.
+
+    `heard` is counted off the wall clock rather than off mpv's position,
+    because the wall clock is what your ears did: a song seeked back through
+    is heard twice over and a song paused is not heard at all, and neither of
+    those reads off a position. The clock starts here and pauses subtract.
+
+    A span belongs to the song, not to the file mpv is playing - a stream that
+    lands on the disk mid-song is reloaded from the copy and keeps this one,
+    which is why the loop only opens a span when it isn't resuming."""
+    song = job.get("song")
+    path = (job.get("paths") or {}).get(song) or ""
+    live["rec"] = {"at": round(time.time(), 3), "song": song,
+                   "playlist": job.get("playlist"), "pick": job.get("pick"),
+                   "src": source_of(path), "vid": job.get("vid"),
+                   "shuffle": bool(job.get("shuffle"))}
+    # Where the line will go, settled now: the song is playing out of this
+    # library, so it is this library's log it belongs in even if the folder is
+    # changed under us while it plays.
+    live["log"] = plays_path()
+    live["t0"], live["held"], live["since"] = time.time(), 0.0, None
+    live.pop("pos", None)
+    live.pop("of", None)
+    live.pop("seen", None)
+    if job.get("paused"):       # swapped in mid-song while paused: not heard
+        live["since"] = time.time()
+
+def hold_span(live, paused):
+    """Start or stop counting a pause against the span. Idempotent, because
+    the pause command is sent as a repair as much as a command and arrives
+    whether the flag moved or not."""
+    now = time.time()
+    if paused and live.get("since") is None:
+        live["since"] = now
+    elif not paused and live.get("since") is not None:
+        live["held"] = live.get("held", 0.0) + now - live.pop("since")
+        live["since"] = None
+    # The sample clock starts again either way: a pause is counted here, and
+    # the position standing still across one is the same pause seen twice.
+    live.pop("seen", None)
+
+def sample_span(live, pos):
+    """Where in the song we are, taken on the tick. mpv drops the position the
+    moment a file ends, so the last sample before the end is the only place a
+    skip's position can come from - it is worth a second, and no more.
+
+    The tick is also the only thing here that can tell playing from standing
+    still, and `heard` is counted off the wall clock - so it has to. A song
+    that is up but not moving is running that clock without reaching anybody:
+    a stream stalled on the network, a laptop that slept with the music on,
+    mpv paused by something that is not us. A sample that finds the position
+    exactly where the last one left it is time held, not time heard - the
+    same as a pause, and for the same reason. It is the difference between a
+    four minute song and the hour one of them once claimed."""
+    now = time.time()
+    if pos.get("time-pos") is not None:
+        was, seen = live.get("pos"), live.get("seen")
+        live["pos"] = max(0.0, float(pos["time-pos"]))
+        # A seek counts as heard, in either direction: the second it took is a
+        # second the song was on, and only a position that has not moved at
+        # all is a song that was not playing.
+        if was is not None and seen is not None and abs(live["pos"] - was) < 0.05:
+            live["held"] = live.get("held", 0.0) + max(0.0, now - seen)
+        live["seen"] = now
+    if pos.get("duration") is not None:
+        live["of"] = round(float(pos["duration"]), 1)
+
+def close_span(live, why):
+    """The song is over. Write the line.
+
+    Popped rather than read, so the two things that can close a span - the
+    loop reaching the end of a song, and `finish` being called from the socket
+    thread or a signal - cannot both write it."""
+    rec = live.pop("rec", None)
+    if not rec:
+        return
+    hold_span(live, False)              # a span closed while paused stops here
+    of = live.get("of")
+    # Played out means played to the end, whatever the last sample said: it is
+    # up to a second old and the song is over by definition.
+    reached = of if why == "eof" and of else live.get("pos")
+    heard = max(0.0, time.time() - live.get("t0", time.time()) - live.get("held", 0.0))
+    # `held` goes down beside `heard` because the two together are the only
+    # way to say when the listening happened: a span covers the wall clock
+    # from `at` to `at + heard + held`, and a chart of hours has to know that
+    # much to put a song on either side of the hour it ran through.
+    rec.update({"end": why if why in ENDS else "error",
+                "reached": round(reached, 1) if reached is not None else None,
+                "of": of, "heard": round(heard, 1),
+                "held": round(max(0.0, live.get("held", 0.0)), 1)})
+    log_play(live.get("log") or plays_path(), rec)
+
+# --------------------------------------------------------------- the record
+# The log, read back. Every span ever played is a line in it, and reading all
+# of them is how every question here is answered: there is no running total
+# kept anywhere, because a total is a second thing to keep in step with the
+# lines and the lines are cheap to add up. A year of heavy listening is a few
+# thousand of them, which is a few milliseconds and a megabyte.
+#
+# Nothing here trusts the file. It is appended to by every player that has
+# ever run against this library - two machines syncing the folder between them
+# are both writing to it - so a line can arrive torn, or twice, or out of the
+# order it happened in, and not one of those is worth losing the history over.
+# A line that cannot be read is skipped and the rest are still counted.
+
+# How a span ended, sorted into what it says about the song. `eof` is the song
+# played out. The three actives are you cutting it short yourself: `skip` and
+# `back` are the buttons that mean "not this one", and `swap` is you going and
+# fetching something else instead - which says more about what you wanted than
+# about what was on. `stop` and `error` say nothing either way: the song
+# playing when you quit for the evening never got a verdict, and counting that
+# as a skip would punish it for having been last.
+ACTIVE = ("skip", "back", "swap")
+NEUTRAL = ("stop", "error")
+JUDGED = ("eof",) + ACTIVE          # spans you expressed something about
+
+SESSION_GAP = 1800      # half an hour of silence is the end of an evening
+
+def num(v):
+    """A number off a logged line, or None if it isn't one. The file is shared
+    between machines and versions, so a field is only ever what it looks
+    like - and a stats page is not worth crashing over a bad one."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+def read_plays(path=None, since=None):
+    """Every span, oldest first, with the damage stepped over.
+
+    Sorted rather than taken as it comes: one player appends in the order it
+    played, but two machines syncing one folder interleave, and anything that
+    reads a sequence out of this - an evening, a run of skips - would read a
+    shuffled one otherwise.
+
+    Deduplicated on the moment and the song, which together name a span: a
+    sync that resolves a conflict by keeping both copies would otherwise have
+    you listening to the same evening twice."""
+    try:
+        with open(path or plays_path(), "r", encoding="utf-8",
+                  errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []                   # no log yet is not an error, it is Tuesday
+    rows, seen = [], set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue                # a torn line, or half a file a sync landed
+        at = num(isinstance(r, dict) and r.get("at"))
+        if at is None or not isinstance(r.get("song"), str) or not r["song"]:
+            continue
+        key = (round(at, 3), r["song"])
+        if key in seen:
+            continue
+        seen.add(key)
+        if since is not None and at < since:
+            continue
+        r["at"], r["heard"] = at, max(num(r.get("heard")) or 0.0, 0.0)
+        # Lines written before pauses were recorded have no `held`, which
+        # reads as a span that ran straight through - which is what it was,
+        # give or take the pause nobody wrote down.
+        r["held"] = max(num(r.get("held")) or 0.0, 0.0)
+        r["reached"], r["of"] = num(r.get("reached")), num(r.get("of"))
+        # A song cannot have been heard for longer than it lasts. The player
+        # no longer writes lines that say otherwise, but the log is older than
+        # that and is appended to by every version that ever ran against this
+        # library - and one span of a four minute song claiming an hour is all
+        # it takes for an hour of the chart to report sixty-two minutes. The
+        # excess becomes time the song was up and not heard, so the stretch of
+        # clock the span covers is still the stretch it really covered.
+        if r["of"] and r["heard"] > r["of"]:
+            r["held"] += r["heard"] - r["of"]
+            r["heard"] = r["of"]
+        r["end"] = r.get("end") if r.get("end") in ENDS else "error"
+        rows.append(r)
+    rows.sort(key=lambda r: r["at"])
+    return rows
+
+def span_of(rec):
+    """The stretch of wall clock one span covered: from the moment the song
+    came on to the moment it stopped being on. Listening plus any time it
+    stood paused, because a pause is time the song was still up - it just
+    wasn't heard.
+
+    This is the only thing that knows a song has length. Everything that
+    places listening in time goes through here, so an evening and an hour of
+    the chart can never disagree about when a song was on."""
+    return rec["at"], rec["at"] + rec["heard"] + rec.get("held", 0.0)
+
+def pool_of(rec):
+    """Which list a span was played out of. The library is one of them - it is
+    a pool like any other here, and calling it by the name the window and
+    `list` both use it by is what keeps one answer from becoming two."""
+    return rec.get("playlist") or LIBRARY_NAME
+
+def spell_secs(secs):
+    """Seconds as somebody would say them out loud. The window says it the
+    same way; this is the one place the wording is decided."""
+    secs = int(round(secs or 0))
+    if secs < 90:
+        return "%d sec" % secs
+    mins = int(round(secs / 60.0))
+    if mins < 90:
+        return "%d min" % mins
+    return "%d hr %d min" % (mins // 60, mins % 60)
+
+def pct(part, whole):
+    """A percentage, or None when there is nothing to take one of. None is not
+    zero: a song you have never cut short has no skip rate, and printing 0%
+    would claim we asked and the answer was none."""
+    return round(100.0 * part / whole, 1) if whole else None
+
+def bail_bucket(rec):
+    """How far into a song you left it, in the four sizes that mean different
+    things. Inside five seconds is not liking the song; past halfway is liking
+    it and having somewhere else to be. Lumping those together as one 'skip'
+    is what loses the only interesting thing the position knows."""
+    at, of = rec.get("reached"), rec.get("of")
+    if at is None:
+        return "unknown"            # a stream cut before mpv said how long
+    if at < 5:
+        return "first 5 sec"
+    if at < 30:
+        return "first 30 sec"
+    if not of or at < of / 2.0:
+        return "first half"
+    return "past halfway"
+
+BAILS = ("first 5 sec", "first 30 sec", "first half", "past halfway", "unknown")
+
+def counted(rows, field):
+    """One field's values, tallied, biggest first."""
+    out = {}
+    for r in rows:
+        v = r.get(field)
+        v = v if isinstance(v, str) else str(v)
+        out[v] = out.get(v, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+def group(rows, key):
+    """Spans gathered under whatever names them - a song, or a playlist - and
+    each group added up the same way. One function for both, so `stats songs`
+    and `stats playlists` can never come to different arithmetic."""
+    out = {}
+    for r in rows:
+        name = key(r)
+        g = out.get(name)
+        if not g:
+            g = out[name] = {"name": name, "heard": 0.0, "plays": 0,
+                             "finished": 0, "active": 0, "skipped": 0,
+                             "swapped": 0, "backed": 0, "chosen": 0,
+                             "drawn": 0, "first": r["at"], "last": r["at"],
+                             "songs": set()}
+        g["heard"] += r["heard"]
+        g["plays"] += 1
+        g["last"] = max(g["last"], r["at"])
+        g["first"] = min(g["first"], r["at"])
+        g["songs"].add(r["song"])
+        end = r["end"]
+        g["finished"] += end == "eof"
+        g["active"] += end in ACTIVE
+        g["skipped"] += end == "skip"
+        g["swapped"] += end == "swap"
+        g["backed"] += end == "back"
+        g["chosen"] += r.get("pick") == "you"
+        g["drawn"] += r.get("pick") == "draw"
+    for g in out.values():
+        judged = g["finished"] + g["active"]
+        g["judged"] = judged
+        g["finish_rate"] = pct(g["finished"], judged)
+        g["skip_rate"] = pct(g["active"], judged)
+        g["songs"] = len(g["songs"])
+        g["heard"] = round(g["heard"], 1)
+    return list(out.values())
+
+# How a table of groups can be ordered. Time listened is the default and the
+# honest one: a play is a song that started, and four aborted starts hunting
+# for the right version of a track will out-count an evening spent inside one
+# song. Both are here because the count is the one everybody looks for, and
+# seeing it beside the time is what shows why it is the wrong column.
+ORDERS = {"time": lambda g: (-g["heard"], -g["plays"], g["name"].lower()),
+          "plays": lambda g: (-g["plays"], -g["heard"], g["name"].lower()),
+          "skips": lambda g: (-g["active"], -g["plays"], g["name"].lower()),
+          "recent": lambda g: (-g["last"], g["name"].lower())}
+
+def rank(groups, by="time", count=None):
+    rows = sorted(groups, key=ORDERS.get(by, ORDERS["time"]))
+    return rows[:count] if count else rows
+
+def sessions(rows):
+    """The evenings. A gap of half an hour with nothing playing ends one -
+    long enough that a cup of tea between songs doesn't split an evening in
+    two, short enough that tonight is never counted as part of yesterday."""
+    out = []
+    for r in rows:
+        if out and r["at"] - out[-1]["end"] <= SESSION_GAP:
+            here = out[-1]
+        else:
+            here = {"at": r["at"], "end": r["at"], "heard": 0.0, "plays": 0}
+            out.append(here)
+        # The span ended after it was heard, not when it started: an evening
+        # runs to the end of its last song and not to the beginning of it.
+        here["end"] = max(here["end"], span_of(r)[1])
+        here["heard"] += r["heard"]
+        here["plays"] += 1
+    for s in out:
+        s["heard"] = round(s["heard"], 1)
+        s["length"] = round(s["end"] - s["at"], 1)
+    return out
+
+# Listening time over time, at three sizes. The same series each way: an hour
+# of the day, a day, a week - so switching between them is a zoom rather than
+# a different question, and the window can hold all three and switch without
+# asking again.
+STEPS = {"hour": (3600, 48), "day": (86400, 30), "week": (604800, 26)}
+
+def bucket_start(at, step):
+    """The moment the bucket holding `at` begins, in local time - because a day
+    is a local thing and a log that has crossed a timezone still happened in
+    the evenings it happened in.
+
+    Every step back is taken from the middle of a bucket rather than its edge,
+    which is what keeps the hour the clocks change from landing in the bucket
+    next door."""
+    t = time.localtime(at)
+    day = (t.tm_year, t.tm_mon, t.tm_mday)
+    if step == "hour":
+        return time.mktime(day + (t.tm_hour, 0, 0, 0, 0, -1))
+    if step == "week":                  # back to the Monday it belongs to
+        back = time.localtime(time.mktime(day + (12, 0, 0, 0, 0, -1))
+                              - t.tm_wday * 86400)
+        day = (back.tm_year, back.tm_mon, back.tm_mday)
+    return time.mktime(day + (0, 0, 0, 0, 0, -1))
+
+def next_bucket(b, step, span):
+    """The bucket after this one, and how the length of a bucket is known.
+    Taken from the middle of it rather than its edge, the same way the walk
+    back is, so the day the clocks change is a step of 23 or 25 hours and
+    still lands exactly one bucket along."""
+    nxt = bucket_start(b + span * 1.5, step)
+    return nxt if nxt > b else b + span      # never stand still, whatever the clock says
+
+def pour(into, rec, step, span):
+    """One span's listening time, added to the buckets it was heard in.
+
+    A song is not heard at the instant it starts, it is heard over the minutes
+    that follow: the five minutes of a song put on at 10:58 are two minutes of
+    the ten o'clock hour and three of the eleven, not five of the ten. Charged
+    whole to the hour it started in - which is what this used to do - an hour
+    with a song running through each of its ends could report more listening
+    than an hour holds, and 62 minutes in an hour is the one number a chart of
+    hours must never be able to show.
+
+    Split by how much of the span each bucket holds. Where a song stood paused
+    there is no telling which side of the boundary the pause fell, so the
+    listening is spread evenly across the time the song was up - exact for
+    every span that ran straight through, and the honest guess for the rest."""
+    at, end = span_of(rec)
+    if rec["heard"] <= 0:
+        return
+    b, wall = bucket_start(at, step), end - at
+    if wall <= 0:                   # a span with no length is a moment, not a stretch
+        into[b] = into.get(b, 0.0) + rec["heard"]
+        return
+    while b < end:
+        nxt = next_bucket(b, step, span)
+        lo, hi = max(at, b), min(end, nxt)
+        if hi > lo:
+            into[b] = into.get(b, 0.0) + rec["heard"] * (hi - lo) / wall
+        b = nxt
+
+def series(rows, step):
+    """How long you listened in each of the last buckets, oldest first.
+
+    The empty ones are kept. A quiet Tuesday is part of the shape of a week,
+    and a chart that closed the gap up would draw a month of listening as if
+    it had all been one - which is the one thing this is meant to show."""
+    span, count = STEPS[step]
+    into = {}
+    for r in rows:
+        pour(into, r, step, span)
+    at, marks = bucket_start(time.time(), step), []
+    for _ in range(count):
+        marks.append(at)
+        at = bucket_start(at - span / 2.0, step)     # a step back, DST and all
+    # A bucket cannot hold more listening than it has time in it. One span can
+    # no longer overfill one, but two players against the same library overlap
+    # in real time and their lines both land here, so the ceiling is kept as a
+    # ceiling rather than left to arithmetic that no longer needs it.
+    return [{"at": b, "heard": round(min(into.get(b, 0.0),
+                                         next_bucket(b, step, span) - b), 1),
+             "label": time.strftime({"hour": "%H:%M", "week": "%-d %b"}
+                                    .get(step, "%a %-d"), time.localtime(b)),
+             "full": time.strftime({"hour": "%a %-d %b, %H:%M"}
+                                   .get(step, "%a %-d %b"), time.localtime(b))}
+            for b in reversed(marks)]
+
+def stats(rows):
+    """Everything the command reports, worked out in one pass over the log.
+
+    One shape, whichever topic asked: the text views each print a slice of
+    this and `--json` prints all of it, so the window and the terminal are
+    reading the same arithmetic rather than each doing its own."""
+    judged = [r for r in rows if r["end"] in JUDGED]
+    active = [r for r in judged if r["end"] in ACTIVE]
+    finished = [r for r in judged if r["end"] == "eof"]
+    fracs = sorted(r["reached"] / r["of"] for r in active
+                   if r["reached"] is not None and r["of"])
+    reached = sorted(r["reached"] for r in active if r["reached"] is not None)
+    bail = {b: 0 for b in BAILS}
+    for r in active:
+        bail[bail_bucket(r)] += 1
+    every = sessions(rows)
+    clock = {"%02d" % h: 0 for h in range(24)}
+    for r in rows:
+        clock["%02d" % time.localtime(r["at"]).tm_hour] += 1
+    return {
+        "spans": len(rows),
+        "songs": len({r["song"] for r in rows}),
+        "heard": round(sum(r["heard"] for r in rows), 1),
+        "first": rows[0]["at"] if rows else None,
+        "last": rows[-1]["at"] if rows else None,
+        "finished": len(finished),
+        "judged": len(judged),
+        "finish_rate": pct(len(finished), len(judged)),
+        "active": len(active),
+        "skip_rate": pct(len(active), len(judged)),
+        "skipped": sum(1 for r in active if r["end"] == "skip"),
+        "swapped": sum(1 for r in active if r["end"] == "swap"),
+        "backed": sum(1 for r in active if r["end"] == "back"),
+        "neutral": sum(1 for r in rows if r["end"] in NEUTRAL),
+        "chosen": sum(1 for r in rows if r.get("pick") == "you"),
+        "drawn": sum(1 for r in rows if r.get("pick") == "draw"),
+        "bail_median_frac": round(100 * fracs[len(fracs) // 2], 1) if fracs else None,
+        "bail_median_secs": round(reached[len(reached) // 2], 1) if reached else None,
+        "bail": bail,
+        "ends": counted(rows, "end"),
+        "sources": counted(rows, "src"),
+        "clock": clock,
+        "series": {k: series(rows, k) for k in STEPS},
+        "sessions": len(every),
+        "longest_session": round(max((s["heard"] for s in every), default=0.0), 1),
+        "by_song": group(rows, lambda r: r["song"]),
+        "by_playlist": group(rows, pool_of),
+        "recent": every[-1] if every else None,
+    }
 
 # -------------------------------------------------------------------- player
 
@@ -1134,11 +1863,17 @@ def credit_start(job):
     `play` does the drawing itself, because it is what tells you which song it
     has started - but the counting belongs here, with the session, which is the
     only place that knows what a playlist has heard already."""
+    drawn = job.pop("drawn", False)
+    # How the opening song was chosen, which the log wants and the tally does
+    # not: the draw picked it, or you did - `play SONG`, a row clicked in the
+    # window, a search streamed. The two questions have different answers, and
+    # this is the one that doesn't care whether the playlist was already going.
+    job["pick"] = "draw" if drawn else "you"
     opening = pool_key(job) not in (job.get("plays") or {})
-    if (job.pop("drawn", False) or opening) and job.get("order"):
+    if (drawn or opening) and job.get("order"):
         count_play(job, job["order"][0])
 
-def pick(job):
+def draw_next(job):
     """The next song when shuffling: the draw, over the pool we are playing,
     counted because we are the one choosing. The song just finished is the
     last thing heard, so the window keeps it out without being told to."""
@@ -1148,16 +1883,83 @@ def advance(job, step):
     """Move one song. Going back walks `order`, which is the history, so it
     replays exactly what you heard; going forward off the end of it appends
     whatever comes next. Nothing appended means the queue is finished."""
+    # Walking history, in either direction, until it runs out and the draw or
+    # the list decides - which is the one case the log calls a draw.
+    job["pick"] = "back" if step < 0 else "next"
     job["index"] = max(0, job["index"] + step)   # back at the start replays
     if job["index"] < len(job["order"]):
         return
     if job["shuffle"]:
-        job["order"].append(pick(job))
+        job["order"].append(draw_next(job))
+        job["pick"] = "draw"
     else:
         i = job["songs"].index(job["order"][-1]) + 1 \
             if job["order"][-1] in job["songs"] else len(job["songs"])
         if i < len(job["songs"]):
             job["order"].append(job["songs"][i])
+
+def follow_on(job, guard):
+    """Carry a finished stream on into the list its song was kept in, turning
+    the job into that queue, and say whether there was one to turn it into.
+
+    A stream is a queue of one, so the end of it used to be the end of the
+    music - even when, while it played, you had just told this app where the
+    song lives. Being told that is the whole answer to what comes next: the
+    playlist you filed it in, the newest of them if you filed it in more than
+    one, and your library if you only kept it. Keeping it nowhere is the one
+    case with no answer, and that one stops the way every stream used to.
+
+    False means there is nowhere to go, and the player is about to stop - so
+    what state the job is left in is nobody's business by then."""
+    song = job["song"]
+    stem = filed_under(song)
+    if stem:
+        listed = songs_of(stem)
+    elif song in index():
+        listed = [{"file": n, "path": p} for n, p in index().items()]
+    else:
+        return False                # kept nowhere: nowhere to carry on into
+    paths = {p["file"]: p["path"] for p in listed if p["path"]}
+    if not paths:
+        return False                # a list, but nothing in it is on the disk
+    shuffle = shuffling()
+
+    # Read off the disk above and written here, because the socket thread
+    # answers out of `job`: it has to see the queue this was or the queue it
+    # became, and never one turning into the other.
+    with guard:
+        was = pool_key(job)
+        job["playlist"], job["songs"] = stem, list(paths)
+        job["paths"], job["shuffle"] = paths, shuffle
+        job.pop("vid", None)    # on the disk now: nothing left to fetch for it
+        if pool_key(job) != was:
+            # A play and a hearing, counted into the list the song has just
+            # joined, because the draw over that list has to know it as a song
+            # this playlist has played - or the first thing it does is hand
+            # straight back the song you have this second finished listening
+            # to. Only when the pool changes: the library is the pool a stream
+            # already counts into, and counting it there again is twice.
+            note_heard(job, count_play(job, song))
+        if song in paths:
+            # What just played is this queue's history rather than its
+            # opening: in `order`, so `back` replays what you actually heard,
+            # and behind `advance`, so what follows it is picked exactly the
+            # way it would be for any other song in this list - the draw when
+            # shuffling, and the next row down when not.
+            job["order"], job["index"] = [song], 0
+            advance(job, 1)
+        else:
+            # In the list, but the copy is still coming down - so there is
+            # nothing to play it from and nothing to carry on from. The list
+            # opens instead, the way `play` would have opened it.
+            job["order"], job["index"] = [draw_next(job) if shuffle
+                                          else job["songs"][0]], 0
+            job["pick"] = "draw" if shuffle else "next"
+        if job["index"] >= len(job["order"]):
+            return False        # the last row of a list played in order
+    if stem:
+        mark_played(stem)       # it is the list you are playing now
+    return True
 
 def local_copy(job, song):
     """A copy of this song on the disk, or None while the network is still the
@@ -1233,13 +2035,16 @@ def serve_control(job, want, guard, wake_w, finish):
             new = req.get("job")        # have, rather than a second player
             if not new:
                 return {"ok": False, "error": "no queue"}
-            nudge(swap=new, stop=True)
+            with guard:
+                job["ended_by"] = "swap"    # mpv will say "stop"; only we know
+            nudge(swap=new, stop=True)      # it was another queue being put on
             return {"ok": True, "song": new.get("song")}
         if op == "stop":
             return None                 # answered, then acted on: see below
         if op in ("skip", "back"):
             with guard:
                 job["step"] = 1 if op == "skip" else -1
+                job["ended_by"] = op        # the song did not end, you ended it
             nudge(stop=True)
             return {"ok": True}
         if op == "pause":
@@ -1357,11 +2162,20 @@ def player(job):
     wake_r, wake_w = os.pipe()
     for fd in (wake_r, wake_w):
         os.set_blocking(fd, False)
+    # The song sounding now, as the log will have it. It is here rather than
+    # on the job because a swap clears the job, and the song the old queue was
+    # playing still has a line to be written about it.
+    live = {}
 
     def finish(code=0):
         """Stop being the player, and stop being a process. The lock goes when
         this exits, which is the only thing that has to happen and the one
         thing we cannot forget to do."""
+        # The song that was playing when you stopped is still a song you
+        # heard, and this is the last moment anything knows about it. Reached
+        # from a signal and from the socket thread as well as from the loop,
+        # so it is written with one `write` and no lock: see `log_play`.
+        close_span(live, "stop")
         if mpv:
             mpv.kill()
         for path in [SOCK, MPVSOCK] + LEGACY:
@@ -1401,6 +2215,7 @@ def player(job):
             # silent while everything that asked was told it was playing.
             with guard:
                 paused = bool(job["paused"])
+            hold_span(live, paused)     # paused time is not time you heard it
             mpv.send("set_property", "pause", paused)
         if "seek" in todo:
             at = todo["seek"]
@@ -1435,6 +2250,12 @@ def player(job):
         if todo.get("stop"):
             mpv.send("stop")
 
+    def tick():
+        """A quiet second. Read where we are in the song, because mpv forgets
+        it the instant the song ends and a skip has to be logged somewhere."""
+        if live.get("rec") and not job.get("paused"):
+            sample_span(live, mpv_props("time-pos", "duration"))
+
     at, resuming = 0.0, False
     while not mpv.dead:
         # A new queue, handed to us by whoever asked for it - from the window,
@@ -1464,12 +2285,24 @@ def player(job):
                 want.pop("stop", None)
                 want.pop("seek", None)
         if not 0 <= job["index"] < len(job["order"]):
-            break                       # queue finished
+            # A stream is a queue of one, and running out of it used to be the
+            # end of the music. Now it is a question - where did you put that
+            # song while it played? - and the list that answers plays on from
+            # here, seamlessly, because it is this same player and this same
+            # mpv picking up the next song. Nothing but a stream has anywhere
+            # to go, and a stream that was kept nowhere hasn't either.
+            if not (job.get("vid") and follow_on(job, guard)):
+                break                   # queue finished
         job["song"] = job["order"][job["index"]]
         # Heard is heard: this is the one place a song actually starts, so it
         # is the one place the window is told about, and it takes draws, songs
         # you clicked and songs you walked back to without distinguishing.
         note_heard(job, job["song"])
+        # ...and the one place a span opens, for the same reason. Not when
+        # resuming: a stream that landed on the disk is reloaded from the copy
+        # at the point you were at, which is the same song still playing.
+        if not resuming:
+            open_span(job, live)
         path = job["paths"][job["song"]]
         if not resuming:
             # A song picked back up off the disk keeps the gain it was already
@@ -1482,14 +2315,23 @@ def player(job):
         mpv.load(path, job["gain"], volume(), at)
         if job["paused"]:       # swapped mid-song while paused: still paused
             mpv.send("set_property", "pause", True)
-        mpv.until_end(wake_r, drain)
+        reason = mpv.until_end(wake_r, drain, tick)
         # A swap ends the file mpv was playing, which is not the song ending:
         # the same song goes round again, off the disk, at the point asked for.
         with guard:
             at = want.pop("restart", None)
             pending = "swap" in want
+            # Left where it is if we are only resuming: nothing has ended, so
+            # whoever set it is still waiting for the ending they asked for.
+            why = None if at is not None else job.pop("ended_by", None)
         resuming = at is not None
-        if resuming or pending:
+        if resuming:
+            continue            # same song, same span: nothing has ended
+        # mpv only ever says that it stopped; who stopped it, and why, is
+        # known here and nowhere else. A song nobody interrupted ended by
+        # itself, and mpv's own word for that is the one worth keeping.
+        close_span(live, why or ("eof" if reason == "eof" else "error"))
+        if pending:
             continue            # a queue waiting to be taken decides, not us
         at = 0.0
         # Both of these were asked of the song that has just ended, so neither
@@ -1563,12 +2405,18 @@ def landed(st, timeout=1.0):
 YTDLP_MIN = "2025"          # older extractors can still search, but not download
 CACHE_WAIT = 600            # seconds `download` will wait on a cache already
                             # filling before giving up and fetching it itself
+CACHE_GRACE = 5             # ...and how long `stream --to` gives a fetch it
+                            # started in the same breath to claim the song,
+                            # before an empty cache means nobody ever will
 RESOLVE_TTL = 3600          # how long a looked-up stream URL is trusted for.
                             # YouTube's own last about six hours; an hour is
                             # short enough that a stale one is never played
 YTDLP_GONE = "yt-dlp isn't installed - run `simplmusik update`"
 SEARCH_N = 8                # results a search comes back with
 SEARCH_MAX = 40             # ...and the most it will, however many you ask for
+SHOWN_TTL = 3600            # how long a printed list's numbering is worth
+                            # taking - a working session, and no longer
+AMBIGUOUS = 4               # how many near-misses a "which one?" names
 
 def zipapp_version(path):
     """The version of a yt-dlp zipapp, read without importing it, or None if
@@ -1624,6 +2472,187 @@ def video_id(s):
     m = re.search(r"(?:v=|/shorts/|/embed/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})", s)
     return m.group(1) if m else None
 
+# ------------------------------------------------------------- naming a song
+# There are three ways to say which song you mean, and every command that
+# takes one takes all three: the number printed beside it in the last list you
+# were shown, its filename, or enough of its filename to tell it from every
+# other song.
+#
+# The number is the reason any of this exists. `search`, `songs` and `list`
+# all print numbered lists, and the numbers are only worth printing if the
+# next command will take one - otherwise the list is something to copy a
+# filename out of, and the filenames here read `Artist - Title (Official
+# Video).mp3` with the odd fullwidth quote in them, which is not something
+# anybody types twice.
+#
+# So a listing writes down what it showed. It is the one piece of state a
+# command leaves behind for the next one, and it expires, which is the point:
+# a number is shorthand for "the third one you just showed me", and that stops
+# being true long before a file on disk does. An hour is a working session.
+# After it a number is only a number again, and a song actually called 3 wins.
+#
+# One list at a time, because there is one you were last shown. A search in
+# the window writes here too - it is the same person asking - and the newest
+# listing is the one the numbers belong to, wherever it was printed.
+
+def remember_shown(kind, what, results):
+    """Write down a numbered list, so its numbering means something to the
+    command after it. Never fatal: a list that couldn't be written down is
+    still a list you can read, and naming a song still works."""
+    try:
+        save_json(SHOWN, {"at": time.time(), "kind": kind,
+                          "what": what, "results": results})
+    except OSError:
+        pass
+
+def last_shown():
+    """The last numbered list, if it is recent enough to still mean anything."""
+    got = load_json(SHOWN, None)
+    if not isinstance(got, dict) or not got.get("results"):
+        return None
+    return None if time.time() - (got.get("at") or 0) > SHOWN_TTL else got
+
+def stale_number(ref):
+    """The hint a bare number earns when the list it meant has expired, or ""
+    when it has earned none.
+
+    Only ever added to an answer that was going to be a no anyway: a number is
+    a perfectly good word, and a song actually called 3 must still be findable
+    by name an hour after the last search. So this explains a failure rather
+    than causing one."""
+    if not re.fullmatch(r"\s*\d+\s*", ref or "") or last_shown():
+        return ""
+    return (" - and the last list was over an hour ago, so %s is a word now, "
+            "not a number: search or list again" % ref.strip()
+            if isinstance(load_json(SHOWN, None), dict) else "")
+
+def hunt(query, names):
+    """Songs whose filename carries every word of the query, in any order and
+    in any case.
+
+    Every word rather than the whole phrase, because a filename reads
+    `Artist - Title (Official Video).mp3` and nobody types the middle of it:
+    matching the words separately is what lets `wham go go` find the song that
+    has `wham` and `go` in it with a title's worth of punctuation in between.
+
+    The order is the order it was given, which is the library's own - newest
+    first - so the newest match comes first, here as everywhere else."""
+    terms = (query or "").lower().split()
+    return [n for n in names if all(t in n.lower() for t in terms)] if terms else []
+
+def numbered(ref):
+    """What a bare number names, as (row, why not).
+
+    Both None when it isn't a number at all, and when there is no listing
+    recent enough for it to be one - in that case it is simply a word, and
+    whatever is actually called that gets to win."""
+    if not re.fullmatch(r"\s*\d+\s*", ref or ""):
+        return None, None
+    got = last_shown()
+    if not got:
+        return None, None
+    results, i = got["results"], int(ref)
+    if 1 <= i <= len(results):
+        return dict(results[i - 1], kind=got.get("kind")), None
+    return None, ("there is no %d in %s - it had %d"
+                  % (i, got.get("what") or "the last list", len(results)))
+
+def pick(ref, idx, files=False):
+    """What one word on the command line names, as (kind, value, why not):
+
+        ("song", filename, None)      a song, by number or by name
+        ("youtube", row, None)        a result of the last YouTube search
+        (None, None, "...")           it named something, and named it wrong
+        (None, None, None)            nothing here knows it - a path, maybe
+
+    Tried in that order on purpose. The number goes first because it is the
+    most recent thing you were shown. The whole filename goes before a part of
+    one, so that a song can always be named outright however many other songs
+    contain its name. And `files` stops the guessing where a real file is a
+    real possibility: `add` may be being handed something to import, and a file
+    that exists is never overruled by a guess at what you meant.
+
+    A number names the row and nothing more - whether the song behind it is
+    still in your music folder is the caller's question, because the answer
+    differs: it is what stops `play`, and it is exactly what `remove` is for."""
+    ref = (ref or "").strip()
+    if not ref:
+        return None, None, "which song?"
+    row, why = numbered(ref)
+    if why:
+        return None, None, why
+    if row:
+        if row.get("kind") == "youtube":
+            return "youtube", row, None
+        return "song", row.get("file"), None
+    name = os.path.basename(ref)
+    if name in idx:
+        return "song", name, None
+    if files and os.path.exists(ref):
+        return None, None, None         # a file to import: not ours to guess at
+    hits = hunt(ref, list(idx))
+    if len(hits) == 1:
+        return "song", hits[0], None
+    if hits:
+        # Cut short, and each one cut short: these are full filenames, and
+        # four of them at their real length is a paragraph to read for a
+        # question that only wants another word or two of the name.
+        return None, None, ("'%s' matches %d songs: %s%s - say which, or "
+                            "`search %s` to see them"
+                            % (ref, len(hits),
+                               ", ".join(h[:40].rstrip() + ("..." if len(h) > 40 else "")
+                                         for h in hits[:AMBIGUOUS]),
+                               ", ..." if len(hits) > AMBIGUOUS else "", ref)
+                            ) + stale_number(ref)
+    return None, None, None
+
+def song_ref(ref, idx):
+    """A song, numbered or named, as (filename, why not). The name only: a
+    song a playlist still points at after the file has gone is named the same
+    way as any other, and dropping it is the whole of what `remove` does."""
+    kind, val, why = pick(ref, idx)
+    if kind == "song":
+        return val, None
+    if kind == "youtube":
+        return None, ("result %s is on YouTube, not in your library - "
+                      "`stream %s` plays it, `download %s` fetches it"
+                      % (ref, ref, ref))
+    return None, why
+
+def video_ref(ref):
+    """A video id, from an id, a link, or the number of a YouTube search
+    result, as (id, why not)."""
+    row, why = numbered(ref)
+    if why:
+        return None, why
+    if row:
+        if row.get("kind") != "youtube":
+            return None, ("result %s is %s, which is already in your library "
+                          "- `play %s` plays it" % (ref, row.get("file"), ref))
+        return row.get("id"), None
+    vid = video_id(ref)
+    return (vid, None) if vid else (
+        None, "not a YouTube video id, link or search result: %s" % ref)
+
+def numbers(kind, what, rows):
+    """Number a list of songs on its way to being printed, and remember the
+    numbering. One place does this so that every list you can be shown is
+    numbered the same way and means the same thing afterwards."""
+    remember_shown(kind, what, [{"n": i + 1, "file": r} for i, r in enumerate(rows)])
+    return ["%2d. %s" % (i + 1, r) for i, r in enumerate(rows)]
+
+def join(stem, name, path):
+    """Put one library song on the top of a playlist, and say whether that
+    was anything new. A playlist holds a song once: where it sits is when it
+    was added, so adding it again would only move it."""
+    songs = songs_of(stem)
+    if any(p["file"] == name for p in songs):
+        return False
+    m = meta(stem)
+    m["songs"] = store([{"file": name, "path": path}] + songs)
+    write_meta(stem, m)
+    return True
+
 # ------------------------------------------------------------------ commands
 
 def cmd_status(args):
@@ -1649,6 +2678,184 @@ def cmd_status(args):
     emit(args.json, info, "folder:      %s\nsongs:       %d\nplaylists:   %d\nnow %s"
          % (dir_, len(lib), len(pls), now))
     return 0
+
+# What `stats` will answer, and what each one prints. The bare command prints
+# the summary and the head of the two tables under it, because that is the
+# question almost everybody is asking; a topic is for when you want the whole
+# of one of them.
+TOPICS = ("summary", "songs", "playlists", "skips", "time", "log")
+
+def when(at, clock=False):
+    """A logged moment, printed. Dates rather than 'three days ago': the log
+    goes back years and a relative date stops meaning anything past a week."""
+    if not at:
+        return "never"
+    return time.strftime("%-d %b %Y" + (" %H:%M" if clock else ""),
+                         time.localtime(at))
+
+def clip(s, n):
+    """A song name cut to fit a column. The whole of it is always in --json,
+    so nothing is lost - only the table is kept to a width you can read."""
+    s = s or ""
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+def since_from(s):
+    """How far back to read: `7d`, `24h`, `2w`, or `all`. False if it is none
+    of those, which the caller turns into an error - a window we couldn't read
+    should not quietly become the whole history."""
+    s = (s or "").strip().lower()
+    if not s or s == "all":
+        return None
+    mul = {"h": 3600.0, "d": 86400.0, "w": 604800.0}.get(s[-1])
+    try:
+        n = float(s[:-1] if mul else s)
+    except ValueError:
+        return False
+    return time.time() - n * (mul or 86400.0)
+
+def table(groups, count, head="song"):
+    """One ranked table. Time first and the count beside it, always: the two
+    columns disagree often enough that showing either one alone is a claim we
+    can't stand behind."""
+    lines = ["  %-9s %5s %5s %5s  %s"
+             % ("LISTENED", "PLAYS", "DONE", "SKIP", head.upper())]
+    for g in groups[:count]:
+        lines.append("  %-9s %5d %5d %5d  %s"
+                     % (spell_secs(g["heard"]), g["plays"], g["finished"],
+                        g["active"], clip(g["name"], 46)))
+    return "\n".join(lines)
+
+def summary_text(s, count):
+    """The whole picture in a dozen lines."""
+    out = ["listening    %s across %d songs, %d played out"
+           % (spell_secs(s["heard"]), s["songs"], s["finished"])]
+    if s["finish_rate"] is not None:
+        out.append("finished     %d%%  - %d of the %d spans you had a view on"
+                   % (round(s["finish_rate"]), s["finished"], s["judged"]))
+        out.append("cut short    %d  - %d skipped, %d swapped away, %d went back"
+                   % (s["active"], s["skipped"], s["swapped"], s["backed"]))
+    if s["bail_median_secs"] is not None:
+        out.append("you leave    %s in, typically  - %s"
+                   % (spell_secs(s["bail_median_secs"]),
+                      ", ".join("%d %s" % (n, b) for b, n in s["bail"].items() if n)))
+    out.append("chosen       %d you picked, %d the shuffle picked"
+               % (s["chosen"], s["drawn"]))
+    if s["sources"]:
+        out.append("sources      " + ", ".join("%d %s" % (n, k)
+                                               for k, n in s["sources"].items()))
+    out.append("evenings     %d, the longest %s of music"
+               % (s["sessions"], spell_secs(s["longest_session"])))
+    out.append("history      %s to %s" % (when(s["first"]), when(s["last"])))
+    songs = rank(s["by_song"], "time", count)
+    pools = rank(s["by_playlist"], "time", count)
+    out.append("\nmost listened to\n" + table(songs, count))
+    if len(pools) > 1 or (pools and pools[0]["name"] != LIBRARY_NAME):
+        out.append("\nlists\n" + table(pools, count, "list"))
+    out.append("\n`simplmusik stats %s` for more."
+               % "`, `simplmusik stats ".join(t for t in TOPICS if t != "summary"))
+    return "\n".join(out)
+
+def skips_text(s, count):
+    """Where you leave songs, and which ones you leave. Two questions that
+    look like one until you see that most bails are in the first five seconds
+    and a few are two thirds of the way in - which are not the same feeling."""
+    out = ["cut short    %d of %d spans you had a view on" % (s["active"], s["judged"])]
+    if s["bail_median_secs"] is not None:
+        out.append("typically    %s in, %g%% of the way through"
+                   % (spell_secs(s["bail_median_secs"]), s["bail_median_frac"] or 0))
+    out.append("")
+    worst = max([n for n in s["bail"].values()] or [0]) or 1
+    for b in BAILS:
+        n = s["bail"][b]
+        if n or b != "unknown":
+            out.append("  %-13s %-24s %3d" % (b, "█" * int(round(20.0 * n / worst)), n))
+    skipped = [g for g in rank(s["by_song"], "skips", None) if g["active"]]
+    if skipped:
+        out.append("\nmost cut short\n" + table(skipped, count))
+    return "\n".join(out)
+
+def time_text(s, rows, count):
+    """When you listen. The clock is the shape of your day; the evenings are
+    the shape of your week."""
+    peak = max(s["clock"].values() or [0]) or 1
+    out = ["by hour of day"]
+    # Only the hours you have ever listened in. An empty hour is a row
+    # saying nothing, and a fresh log would be twenty-three of those
+    # around the one line that means something; a year of listening
+    # fills nearly all of them in, so the shape of a day still draws.
+    for h in sorted(k for k, n in s["clock"].items() if n):
+        n = s["clock"][h]
+        out.append("  %s:00  %-30s %3d"
+                   % (h, "█" * int(round(30.0 * n / peak)), n))
+    every = sessions(rows)[-count:]
+    if every:
+        out.append("\nlatest evenings")
+        out.append("  %-17s %-9s %-9s %s" % ("STARTED", "LISTENED", "LASTED", "SONGS"))
+        for e in reversed(every):
+            out.append("  %-17s %-9s %-9s %d"
+                       % (when(e["at"], clock=True), spell_secs(e["heard"]),
+                          spell_secs(e["length"]), e["plays"]))
+    return "\n".join(out)
+
+def log_text(rows, count):
+    """The spans themselves, newest first - what a stats page is built out of,
+    for when a number on one looks wrong and you want to see why."""
+    out = ["  %-17s %-6s %-6s %-8s %s"
+           % ("WHEN", "PICK", "END", "LISTENED", "SONG")]
+    for r in reversed(rows[-count:]):
+        out.append("  %-17s %-6s %-6s %-8s %s"
+                   % (when(r["at"], clock=True), r.get("pick") or "-", r["end"],
+                      spell_secs(r["heard"]), clip(r["song"], 40)))
+    return "\n".join(out)
+
+def cmd_stats(args):
+    """What you have actually listened to, out of the log every played song
+    writes a line to.
+
+    Everything here is worked out from that file each time it is asked, which
+    is the whole design: there is no tally kept anywhere to fall out of step,
+    and deleting the log is the only thing that ever needs to mean anything.
+
+    Time listened leads every table, and the play count sits beside it rather
+    than instead of it. They disagree more often than you would think - four
+    aborted starts hunting for the right version of a song will out-count the
+    evening you spent inside one - and the count on its own is the number that
+    would be wrong."""
+    topic = (args.topic or "summary").lower()
+    if topic not in TOPICS:
+        return fail(args.json, "no such topic '%s' - try %s"
+                    % (args.topic, ", ".join(TOPICS)), 2)
+    since = since_from(args.since)
+    if since is False:
+        return fail(args.json, "can't read '%s' as a length of time - try 7d, "
+                    "24h, 2w or all" % args.since, 2)
+    count = args.count if args.count and args.count > 0 else (5 if topic == "summary" else 15)
+    rows = read_plays(since=since)
+    if not rows:
+        return fail(args.json, "nothing played yet%s - the log fills up as you "
+                    "listen, and lives at %s"
+                    % (" in that window" if since else "", plays_path()), 2)
+    s = stats(rows)
+    by = (args.by or "time").lower()
+    if by not in ORDERS:
+        return fail(args.json, "can't sort by '%s' - try %s"
+                    % (args.by, ", ".join(ORDERS)), 2)
+
+    if topic == "songs":
+        out = rank(s["by_song"], by, count)
+        text = table(out, count)
+    elif topic == "playlists":
+        out = rank(s["by_playlist"], by, count)
+        text = table(out, count, "list")
+    elif topic == "skips":
+        out, text = s, skips_text(s, count)
+    elif topic == "time":
+        out, text = s, time_text(s, rows, count)
+    elif topic == "log":
+        out, text = rows[-count:], log_text(rows, count)
+    else:
+        out, text = s, summary_text(s, count)
+    return emit(args.json, out, text) or 0
 
 def cmd_folder(args):
     """Your music folder, and choosing a different one. Everything under it
@@ -1680,9 +2887,9 @@ def cmd_folder(args):
         # it is simply nothing to do.
         return emit(args.json, {"folder": dir_, "changed": False},
                     "already your music folder: " + path) or 0
-    was = playlists_dir()       # before the change, so the move can follow it
-    set_folder(path)
-    rehome(was)                 # playlists live in the folder, so they go too
+    was, log = playlists_dir(), plays_path()   # before the change, so the
+    set_folder(path)                          # move has somewhere to follow
+    rehome(was, log)            # both live in the folder, so both go with it
     return emit(args.json, {"folder": path, "changed": True},
                 "music folder is now " + path) or 0
 
@@ -1751,24 +2958,42 @@ def cmd_songs(args):
         return fail(args.json, "no songs in %s - copy some music in, or choose "
                     "a different folder with `simplmusik folder set PATH`"
                     % folder(), 2)
-    return emit(args.json, lib, "\n".join(lib)) or 0
+    return emit(args.json, lib,
+                "\n".join(numbers("library", LIBRARY_NAME, lib))) or 0
 
 def cmd_list(args):
+    """Playlists, or the songs in one - and the library is one of them.
+
+    It has no file and never will: it is every song in your music folder,
+    which is not a list anybody made. But it is what the window shows at the
+    top of its sidebar and what `play` starts by default, so it is named here
+    rather than being the one list you have to know a separate command for.
+    `songs` is still that command, and `list "All songs"` is the same thing
+    said the way you would say it of any other list."""
     if not args.playlist:
-        pls = playlists()
-        if not pls:
-            return fail(args.json, "no playlists (make one with `simplmusik create NAME`)", 2)
-        return emit(args.json, [p["name"] for p in pls],
-                    "\n".join("%-30s %3d" % (p["name"], len(p["songs"])) for p in pls)) or 0
+        rows = [{"name": LIBRARY_NAME, "songs": len(library()), "library": True}]
+        rows += [{"name": p["name"], "songs": len(p["songs"]), "library": False}
+                 for p in playlists()]
+        return emit(args.json, rows,
+                    "\n".join("%-34s %3d" % (r["name"] + (" (%s)" % LIBRARY_NOTE
+                                                          if r["library"] else ""),
+                                             r["songs"]) for r in rows)) or 0
     stem = find(args.playlist)
     if not stem:
+        # The library, asked for by name. `songs` prints exactly this, so it
+        # prints it: two commands, one answer, and no second opinion about the
+        # order or about what an empty music folder should say.
+        if is_library(args.playlist):
+            return cmd_songs(args)
         return fail(args.json, "no playlist '%s'" % args.playlist, 2)
     songs = songs_of(stem)
     if not songs:
         return fail(args.json, "playlist '%s' is empty" % args.playlist, 2)
-    return emit(args.json, [{"file": p["file"], "found": bool(p["path"])} for p in songs],
-                "\n".join(p["file"] + ("" if p["path"] else "   (not found)")
-                          for p in songs)) or 0
+    lines = numbers("library", "playlist '%s'" % stem, [p["file"] for p in songs])
+    return emit(args.json, [{"n": i + 1, "file": p["file"], "found": bool(p["path"])}
+                            for i, p in enumerate(songs)],
+                "\n".join(line + ("" if p["path"] else "   (not found)")
+                          for line, p in zip(lines, songs))) or 0
 
 def cmd_create(args):
     stem = os.path.basename(args.name.rstrip("/"))
@@ -1776,7 +3001,8 @@ def cmd_create(args):
         return fail(args.json, "give the playlist a name", 1)
     if find(stem):
         return fail(args.json, "playlist already exists: %s" % stem, 1)
-    write_meta(stem, {"name": args.name, "songs": []})
+    write_meta(stem, {"name": args.name, "created": round(time.time(), 3),
+                      "order": "newest", "songs": []})
     if args.cover:
         try:
             set_cover(stem, args.cover)
@@ -1834,46 +3060,86 @@ def cmd_cover(args):
                 "cover art set: " + path) or 0
 
 def cmd_add(args):
-    """Add songs to a playlist. A name already in the library is just
-    referenced; anything else is a path to import, copied into your music
-    folder first."""
+    """Add songs to a playlist, or to the library itself.
+
+    Three ways to name each one, and they all end in the same place: the
+    number a search printed beside it, a song already in your library - whole
+    name or enough of it - or a path to a file to import. A YouTube result is
+    fetched first and then added, so `search --yt` and then `add` is the whole
+    of what the window's download button does from inside a playlist.
+
+    `add "All songs" ...` imports into the library and puts the song in no
+    playlist, which is what the library being a list you can add to means."""
     stem = find(args.playlist)
-    if not stem:
+    to_library = stem is None and is_library(args.playlist)
+    if stem is None and not to_library:
         return fail(args.json, "no playlist '%s'" % args.playlist, 2)
     dest, idx = folder(), index()
-    songs = songs_of(stem)
-    have, added, failed = {p["file"] for p in songs}, [], []
+    songs = [] if to_library else songs_of(stem)
+    # What counts as already there: the playlist's own songs, or - adding to
+    # the library - every song in it, since that is the same question.
+    have = set(idx) if to_library else {p["file"] for p in songs}
+    added, failed, fresh = [], [], []
     for src in args.files:
-        name, path = os.path.basename(src), None
-        if name in idx:
-            path = idx[name]
-            if os.path.isfile(src) and not os.path.samefile(src, path):
+        kind, val, why = pick(src, idx, files=True)
+        if why:
+            failed.append(why)
+            continue
+        if kind == "youtube":
+            got, why = fetch_id(val["id"])
+            if not got:
+                failed.append("%s (%s)" % (val.get("title") or val["id"], why))
+                continue
+            idx = index()               # it is a library song now
+            name, path = got["song"], idx.get(got["song"])
+        elif kind == "song":
+            # A numbered row whose file has since gone is still that row, and
+            # a playlist can hold a song it can't find - it says so and plays
+            # past it. So `path` is allowed to be None here.
+            name, path = val, idx.get(val)
+            if path and os.path.isfile(src) and not os.path.samefile(src, path):
                 # One flat namespace: importing over a different song of the
                 # same name would lose it silently, so refuse instead.
                 failed.append("%s (a different song already has that name)" % name)
                 continue
+        elif not os.path.exists(src):
+            # Not a number, not a song in your library, and no file there
+            # either - so there is nothing this could have meant.
+            failed.append("nothing in your library matches '%s', and there's "
+                          "no file there to import" % src + stale_number(src))
+            continue
         else:
+            name = os.path.basename(src)
             try:
                 os.makedirs(dest, exist_ok=True)
                 path = os.path.join(dest, name)
-                shutil.copy2(src, path)
+                # copy, not copy2: an imported song dates from the import,
+                # not from whenever the file you imported was last written -
+                # a song you just added reads as one you just added, and the
+                # library's order is the order things turned up in it.
+                shutil.copy(src, path)
                 idx[name] = path
             except OSError as e:
-                # A bare name that isn't in the library isn't a file to import
-                # either - it's a song that has gone missing since it was listed.
-                failed.append("%s (%s)" % (name, "isn't in your music folder"
-                                           if not os.path.exists(src) else e))
+                failed.append("%s (%s)" % (name, e))
                 continue
         if name not in have:
             have.add(name)
-            songs.append({"file": name, "path": path})
+            fresh.append({"file": name, "path": path})
             added.append(name)
-    m = meta(stem)
-    m["songs"] = store(songs)
-    write_meta(stem, m)
-    text = "\n".join(t for t in ("added %d song(s) to %s" % (len(added), stem) if added else "",
+    # On the top of the list, not the bottom: a playlist reads newest first,
+    # and where a song sits in the file is the only record of when it was
+    # added. Several at once keep the order you named them in, which is the
+    # only thing to go on when they arrive in the same breath. Adding to the
+    # library is only the import - there is no list to write.
+    if not to_library and fresh:
+        m = meta(stem)
+        m["songs"] = store(fresh + songs)
+        write_meta(stem, m)
+    where = LIBRARY_NAME if to_library else stem
+    text = "\n".join(t for t in ("added %d song(s) to %s" % (len(added), where) if added else "",
                                  "couldn't add: " + ", ".join(failed) if failed else "") if t)
-    emit(args.json, {"added": added, "failed": failed}, text or "nothing to add")
+    emit(args.json, {"added": added, "failed": failed, "playlist": where},
+         text or "nothing to add")
     return 0 if added else 1
 
 def cmd_remove(args):
@@ -1881,24 +3147,38 @@ def cmd_remove(args):
     SONG` only edits that list. `remove SONG` is the library one: it deletes
     the file, and every list pointing at it goes with it. A song that is only
     a not-found row - the file is already gone - has nothing to delete, so
-    that one just clears the lists still naming it."""
-    if args.song is None:
-        song = os.path.basename(args.playlist or "")
-        path = index().get(song)
+    that one just clears the lists still naming it.
+
+    Naming the library is the same as naming nothing, so `remove "All songs"
+    SONG` is the library one said the long way round. Either way the song
+    itself can be a number from the last list you were shown, which is what
+    makes `list` and then `remove` two steps rather than two steps and a
+    filename to copy."""
+    idx = index()
+    stem = find(args.playlist) if args.song is not None else None
+    if args.song is not None and not stem and not is_library(args.playlist):
+        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+
+    if stem is None:
+        ref = args.song if args.song is not None else args.playlist
+        got, why = song_ref(ref, idx)
+        song = got or os.path.basename(ref or "")
+        path = idx.get(song)
         holders = [p["file"] for p in playlists()
                    if any(x["file"] == song for x in p["songs"])]
         if not path and not holders:
-            return fail(args.json, "no song '%s' in your library (to drop one from "
-                        "a playlist: remove PLAYLIST SONG)" % song, 2)
+            return fail(args.json, why or
+                        ("no song '%s' in your library (to drop one from "
+                         "a playlist: remove PLAYLIST SONG)" % song), 2)
         if path:
             try:
                 os.remove(path)         # the file first: if this fails,
             except OSError as e:        # nothing has been changed yet
                 return fail(args.json, "couldn't delete %s (%s)" % (song, e), 1)
-        for stem in holders:
-            m = meta(stem)
+        for holder in holders:
+            m = meta(holder)
             m["songs"] = [e for e in (m.get("songs") or []) if entry(e)[0] != song]
-            write_meta(stem, m)
+            write_meta(holder, m)
         # A song being played as it is deleted stops. mpv holds the file
         # open and would happily sound a deleted song to the end, which is the
         # one thing that would make the library and what you hear disagree.
@@ -1913,11 +3193,10 @@ def cmd_remove(args):
                                    " (was in %s)" % ", ".join(holders)
                                    if holders else "",
                                    " - playback stopped" if stopped else "")) or 0
-    stem = find(args.playlist)
-    if not stem:
-        return fail(args.json, "no playlist '%s'" % args.playlist, 2)
+
     songs = songs_of(stem)
-    song = os.path.basename(args.song)
+    got, _ = song_ref(args.song, idx)
+    song = got or os.path.basename(args.song)
     if not any(p["file"] == song for p in songs):
         return fail(args.json, "no song '%s' in '%s'" % (song, stem), 2)
     m = meta(stem)
@@ -1954,23 +3233,52 @@ def cmd_play(args):
     # starts the library shuffled and lets the draw choose, rather than picking
     # a song itself and calling it a start.
     library = getattr(args, "library", False)
-    # A bare song name means the library, starting there - and it means the
-    # library even while a playlist is playing, so `play SONG` never quietly
-    # scopes itself to whatever happened to be on at the time.
-    if name and not song and not find(name) and os.path.basename(name) in idx:
-        name, song = None, name
-    elif library:
+    # ...and `All songs` asks for it the way you would ask for any other list,
+    # which is what having a name for it is for. A playlist actually called
+    # that wins: `find` is asked first.
+    if name and not find(name) and is_library(name):
+        library, name = True, None
+    # A song named where a playlist could go means the library, starting there
+    # - and it means the library even while a playlist is playing, so
+    # `play SONG` never quietly scopes itself to whatever happened to be on.
+    # Numbered or named: it is the same lookup `add` does, so the song a
+    # search just numbered is the song that plays.
+    if song:
+        song, why = song_ref(song, idx)
+        if why:
+            return fail(args.json, why, 2)
+    elif name and not find(name):
+        got, why = song_ref(name, idx)
+        if got:
+            name, song = None, got
+        elif why:
+            return fail(args.json, why, 2)
+    if library:
         name, song = None, name or song
-    else:
-        name = name or st.get("playlist")
+    elif not name:
+        # Nothing named a list, so where a song plays is worked out from where
+        # it actually is. A bare `play` carries on with the playlist that is
+        # going. A song on its own plays inside that playlist if the playlist
+        # has it - clicking a song you can see in the list you are in should
+        # not quietly drop you out of it - and in the library if it hasn't,
+        # because the song is real and being somewhere else is no reason to
+        # refuse it. A playlist named outright is never overruled by either.
+        on = find(st.get("playlist") or "")
+        if not song:
+            name = st.get("playlist")
+        elif on:
+            here = os.path.basename(song)
+            name = on if any(p["file"] == here and p["path"]
+                             for p in songs_of(on)) else None
 
     if name:
         stem = find(name)
         if not stem:
-            return fail(args.json, "no playlist '%s'" % name, 2)
+            return fail(args.json, "no playlist or song '%s'" % name
+                        + stale_number(name), 2)
         name, listed = stem, songs_of(stem)
     else:
-        listed = [{"file": n, "path": idx[n]} for n in sorted(idx)]
+        listed = [{"file": n, "path": idx[n]} for n in idx]
     where = "playlist '%s'" % name if name else "your library"
     # Only songs we can actually find go in the queue; the not-found ones stay
     # in the playlist and are simply passed over, the way a gap in a shelf is.
@@ -2019,6 +3327,10 @@ def cmd_play(args):
            "shuffle": shuffle, "step": 1, "seq": 0}
     if not start_playing(job):
         return fail(args.json, "couldn't start the player", 1)
+    # Only once it is actually sounding: a playlist that couldn't be started is
+    # not one you played, and the sidebar shouldn't lift it as though it were.
+    if name:
+        mark_played(name)
     return emit(args.json, {"playing": name or "library", "song": start,
                             "songs": len(songs), "shuffle": shuffle},
                 "playing %s: %s (%d song%s%s)"
@@ -2093,6 +3405,37 @@ def cmd_stop(args):
     return emit(args.json, {"stopped": was}, "stopped" if was else "nothing playing") or 0
 
 def cmd_search(args):
+    """Search your library, or YouTube with `--yt`.
+
+    Your own songs by default because that is the common question - have I got
+    this? - and it is answered off the disk in no time at all, where YouTube is
+    a network round trip you asked for. The window has always shown the two
+    halves in this order, its own songs above what YouTube has; this is the
+    same order on one command with a switch.
+
+    Either way the results come back numbered, and that numbering is what
+    `add`, `play`, `download` and `stream` will take in place of a name."""
+    query = " ".join(args.query).strip()
+    if not query:
+        return fail(args.json, "give me something to search for", 1)
+    return (search_youtube if args.yt else search_library)(args, query)
+
+def search_library(args, query):
+    """Your own songs, newest first. There is no ceiling unless you ask for
+    one: the whole thing is a walk you have already paid for, and `songs`
+    prints the lot as it is - a search is that list with the misses taken out."""
+    idx = index()
+    hits = hunt(query, list(idx))
+    if args.count:
+        hits = hits[:max(1, int(args.count))]
+    if not hits:
+        return fail(args.json, "nothing in your library matches '%s' "
+                    "(`search --yt %s` looks on YouTube)" % (query, query), 2)
+    lines = numbers("library", "the search for '%s'" % query, hits)
+    return emit(args.json, [{"n": i + 1, "file": n, "path": idx[n]}
+                            for i, n in enumerate(hits)], "\n".join(lines)) or 0
+
+def search_youtube(args, query):
     """Search YouTube for songs. `extract_flat` keeps this to the search page
     itself - no per-video page is ever fetched - which is the difference
     between about a second and about ten. `--count` asks for more than the
@@ -2100,9 +3443,6 @@ def cmd_search(args):
     m = ytdlp()
     if m is None:
         return fail(args.json, YTDLP_GONE, 1)
-    query = " ".join(args.query).strip()
-    if not query:
-        return fail(args.json, "give me something to search for", 1)
     n = max(1, min(int(args.count or SEARCH_N), SEARCH_MAX))
     try:
         with m.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True,
@@ -2113,14 +3453,17 @@ def cmd_search(args):
     out = []
     for e in (found or {}).get("entries") or []:
         if e and e.get("id"):
-            out.append({"id": e["id"], "title": e.get("title") or e["id"],
+            out.append({"n": len(out) + 1, "id": e["id"],
+                        "title": e.get("title") or e["id"],
                         "channel": e.get("channel") or e.get("uploader") or "",
                         "duration": e.get("duration")})
     if not out:
         return fail(args.json, "nothing found for '%s'" % query, 2)
-    text = "\n".join("%2d. %-52.52s %7s  %s" % (i + 1, s["title"],
+    remember_shown("youtube", "the YouTube search for '%s'" % query,
+                   [{"n": r["n"], "id": r["id"], "title": r["title"]} for r in out])
+    text = "\n".join("%2d. %-52.52s %7s  %s" % (s["n"], s["title"],
                                                 clock(s["duration"] or 0), s["id"])
-                     for i, s in enumerate(out))
+                     for s in out)
     return emit(args.json, out, text) or 0
 
 # A download is the one command that takes minutes, so it says how far along
@@ -2130,9 +3473,9 @@ def cmd_search(args):
 # leaves an entry that readers discard the moment they find its lock free.
 
 # Whether a fetch is still running is asked the same way playback is: by
-# taking a lock, never by looking up a pid. A fetch started inside the flatpak
-# and one started from a terminal are different pid namespaces and the same
-# filesystem, so the lock is the only thing both can see.
+# taking a lock, never by looking up a pid. A fetch started by the window and
+# one started from a terminal may share no more than a filesystem, so the lock
+# is the only thing both can be sure of seeing.
 
 def dl_lock(vid):
     return os.path.join(DLDIR, vid + ".lock")
@@ -2236,6 +3579,12 @@ def dl_opts(dest):
     `prepare_filename` answers for the template it is given, so a resolve
     under different options would name a file the download never writes."""
     return {"quiet": True, "no_warnings": True, "noprogress": True,
+            # A downloaded song dates from the download, not from whenever the
+            # video was uploaded - left to itself yt-dlp stamps the file with
+            # what the server said, which would file a song you fetched this
+            # morning under a date years old and drop it to the bottom of a
+            # library that reads newest first.
+            "updatetime": False,
             "format": "bestaudio/best", "writethumbnail": True,
             "outtmpl": {"default": os.path.join(dest, "%(title)s.%(ext)s")},
             "postprocessors": [
@@ -2268,22 +3617,21 @@ def dl_hook(vid):
             dl_report(vid, "converting")
     return hook
 
-def cmd_download(args):
-    """Download a search result into the library. The library is one flat
-    folder, so the file lands beside every other song and joins no playlist -
-    `add` is still the only thing that puts a song in one."""
+def fetch_id(vid):
+    """Fetch one video into the library, as (what landed, why not).
+
+    The work `download` does with none of the printing, so that `add` can do
+    it too and the two reach the library by exactly one road - which is what
+    makes `add PLAYLIST 3` on a YouTube result the same thing as downloading
+    it and adding it, rather than a second way of doing nearly that."""
     m = ytdlp()
     if m is None:
-        return fail(args.json, YTDLP_GONE, 1)
+        return None, YTDLP_GONE
     if m.version.__version__ < YTDLP_MIN:
-        return fail(args.json, "yt-dlp %s is too old to download from YouTube - "
-                    "update it with `simplmusik update`"
-                    % m.version.__version__, 1)
+        return None, ("yt-dlp %s is too old to download from YouTube - "
+                      "update it with `simplmusik update`" % m.version.__version__)
     if not shutil.which("ffmpeg"):
-        return fail(args.json, "ffmpeg isn't installed - it's what writes the mp3", 1)
-    vid = video_id(args.id)
-    if not vid:
-        return fail(args.json, "not a YouTube video id or link: %s" % args.id, 1)
+        return None, "ffmpeg isn't installed - it's what writes the mp3"
     dest = folder()             # new songs land in your music folder
 
     # Played a moment ago? Then the song is already on the disk and this is a
@@ -2304,11 +3652,9 @@ def cmd_download(args):
                 os.remove(os.path.join(cache_dir(), vid + ".json"))
             except OSError:
                 pass
-            return emit(args.json, {"song": ready, "id": vid, "downloaded": False},
-                        "already in the library: " + ready) or 0
+            return {"song": ready, "id": vid, "downloaded": False}, None
         promote(vid, ready)
-        return emit(args.json, {"song": ready, "id": vid, "downloaded": True,
-                                "cached": True}, "added " + ready) or 0
+        return {"song": ready, "id": vid, "downloaded": True, "cached": True}, None
 
     url = "https://www.youtube.com/watch?v=" + vid
     # Audio only, re-encoded to mp3 to match the rest of the library, with the
@@ -2326,22 +3672,55 @@ def cmd_download(args):
             # library cost a second instead of a minute.
             song = os.path.basename(os.path.splitext(y.prepare_filename(info))[0]) + ".mp3"
             if song in index():
-                return emit(args.json, {"song": song, "id": vid, "downloaded": False},
-                            "already in the library: " + song) or 0
+                return {"song": song, "id": vid, "downloaded": False}, None
             # Fetch what we just looked up rather than looking it up again.
             # Asking YouTube a second time costs as much as the first ask did
             # - about a second and a half of the eleven this used to take -
             # and it can only ever answer with what we are already holding.
             y.process_ie_result(dict(info), download=True)
     except Exception as e:
-        return fail(args.json, "download failed: %s" % e, 1)
+        return None, "download failed: %s" % e
     finally:
         dl_done(vid)            # nothing is running now, whichever way we left
     if not os.path.isfile(os.path.join(dest, song)):
-        return fail(args.json, "download finished but %s isn't there" % song, 1)
-    return emit(args.json, {"song": song, "id": vid, "downloaded": True},
-                "downloaded " + song) or 0
+        return None, "download finished but %s isn't there" % song
+    return {"song": song, "id": vid, "downloaded": True}, None
 
+def added_to(args, name, path):
+    """Put a freshly fetched song in the playlist `--to` named, as (playlist,
+    what to say about it, whether that worked).
+
+    A playlist that doesn't exist is a failure, and it still says the song is
+    in your library: half the job was done and pretending otherwise would be a
+    lie about the half that worked. Naming the library is not a failure - it
+    is where the song already went."""
+    if not args.to:
+        return None, None, True
+    stem = find(args.to)
+    if not stem:
+        if is_library(args.to):
+            return None, None, True
+        return None, "but there is no playlist '%s'" % args.to, False
+    return (stem, "and added to " + stem if join(stem, name, path)
+            else "which %s already had" % stem, True)
+
+def cmd_download(args):
+    """Download a search result into the library, and into a playlist if
+    `--to` names one. The library is one flat folder, so the file lands beside
+    every other song; `--to` is the second half of what the window's download
+    button does from inside a playlist."""
+    vid, why = video_ref(args.id)
+    if not vid:
+        return fail(args.json, why, 1)
+    got, why = fetch_id(vid)
+    if not got:
+        return fail(args.json, why, 1)
+    got["playlist"], note, ok = added_to(args, got["song"],
+                                         index().get(got["song"]))
+    said = ("already in the library: " if not got["downloaded"]
+            else "added " if got.get("cached") else "downloaded ") + got["song"]
+    emit(args.json, got, said + (" " + note if note else ""))
+    return 0 if ok else 1
 
 # ------------------------------------------------------------------ streaming
 # Downloading a song takes about eleven seconds, and nearly all of it is ffmpeg
@@ -2473,6 +3852,41 @@ def fetch(vid, song):
     dl_done(vid)
     return 0
 
+def keep(vid, song):
+    """The detached process behind `stream --to`: wait for whatever is
+    fetching this song, then move it into the library.
+
+    Streaming fills the cache and stops there - moving a song into the library
+    is `download`'s job, and the cache is swept after a day. That is the right
+    bargain for a song you only wanted to hear, and the wrong one for a song
+    you asked to have in a playlist: the row would sit there saying 'not
+    found' until the file it names was thrown away. So asking for the playlist
+    is what asks for the promote, and this is the part of it that has to
+    outlive the command.
+
+    It waits rather than fetching, because something is already fetching -
+    the process `stream` started a moment ago, or one that was running before
+    either of us. Whoever it is writes the same cache, so there is nothing to
+    do but let them finish.
+
+    A lock that isn't there yet is what the grace is for. `stream` starts that
+    fetch and this in the same breath, and they race: with no grace, an empty
+    cache and an unclaimed song would read as 'nobody is fetching this' in the
+    moment before the fetch has said otherwise."""
+    waited = 0.0
+    while waited < CACHE_WAIT:
+        if song in index():
+            return 0                # it got there by some other road
+        ready = cached_ready(vid)
+        if ready:
+            promote(vid, ready)
+            return 0
+        if waited > CACHE_GRACE and not dl_live(vid):
+            return 1                # nothing is coming, and nothing is holding it
+        time.sleep(0.5)
+        waited += 0.5
+    return 1
+
 def cached_ready(vid):
     """The song this video is cached as, if a whole copy is sitting there
     waiting to be claimed. None while it is still coming down: the name is
@@ -2517,9 +3931,9 @@ def cmd_stream(args):
                     % m.version.__version__, 1)
     if not shutil.which("mpv"):
         return fail(args.json, "mpv not found - install mpv", 1)
-    vid = video_id(args.id)
+    vid, why = video_ref(args.id)
     if not vid:
-        return fail(args.json, "not a YouTube video id or link: %s" % args.id, 1)
+        return fail(args.json, why, 1)
     sweep_cache()
     running = dl_live(vid)      # already coming down: stream it, don't re-fetch
     if not running:
@@ -2555,8 +3969,22 @@ def cmd_stream(args):
            "vid": vid}        # what to look for in the cache, if it lands
     if not start_playing(job):
         return fail(args.json, "couldn't start the player", 1)
-    return emit(args.json, {"song": song, "id": vid, "streaming": live},
-                ("streaming " if live else "playing ") + song) or 0
+    # `--to` puts it in the playlist now rather than when the bytes land. The
+    # name is already settled - `resolve` worked out what the file will be
+    # called before a byte of it arrived - and a playlist naming a song that
+    # isn't there yet is a row that says so and then stops saying it, which is
+    # the same not-found row a song you moved on the disk gets.
+    to, note, ok = added_to(args, song, index().get(song))
+    if args.to and ok and song not in index():
+        # Asked to be kept, and not kept yet. The playlist has the song in it
+        # already - the name was settled before a byte arrived - and this is
+        # what makes that row come true rather than go stale.
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_keep", vid, song],
+            start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+    emit(args.json, {"song": song, "id": vid, "streaming": live, "playlist": to},
+         ("streaming " if live else "playing ") + song + (" " + note if note else ""))
+    return 0 if ok else 1
 
 # ------------------------------------------------------------------ updating
 # The one part of this that goes stale on its own. Everything else here is
@@ -2603,18 +4031,40 @@ def cmd_update(args):
 # ---------------------------------------------------------------------- main
 # name: (help, positional args, optional flag). "?" = optional, "+" = one or more.
 
+# Every command that takes a song takes it three ways, and it is worth saying
+# so where somebody is already asking - `help add` - rather than only in the
+# notes. `download` and `stream` take a video instead, and a number there means
+# a result of the last YouTube search rather than a song you already have.
+
+BY_SONG = ("a song can be named three ways: the number beside it in the last "
+           "list you were shown\n(search, songs, list), its whole filename, or "
+           "enough of the filename to tell\nit from every other song.")
+
+BY_TOPIC = ("topics:\n"
+            "  summary     everything at a glance (the default)\n"
+            "  songs       every song, ranked - --by time, plays, skips or recent\n"
+            "  playlists   the same for the lists you played them out of\n"
+            "  skips       how far into a song you leave it, and which ones\n"
+            "  time        the hours you listen in, and your last few evenings\n"
+            "  log         the spans themselves, newest first")
+
+BY_VIDEO = ("a video can be named three ways: the number beside it in the last "
+            "`search --yt`,\nits YouTube id, or a link to it.")
+
 COMMANDS = [
     ("status",  "library + playback summary",                     "",                None),
+    ("stats",   "what you have actually listened to",             "topic?",          "top since by"),
     ("folder",  "show your music folder, or choose another",      "action? path?",   None),
-    ("songs",   "list every song in the library",                 "",                None),
-    ("list",    "list playlists, or the songs in one",            "playlist?",       None),
+    ("songs",   "list every song in the library, newest first",   "",                None),
+    ("list",    "list playlists, or the songs in one (\"%s\" is the library)"
+                % LIBRARY_NAME,                                  "playlist?",       None),
     ("create",  "make a new, empty playlist",                     "name",            "cover"),
     ("rename",  "give a playlist a different name",               "playlist name",   None),
     ("cover",   "show, set or clear a playlist's cover art",      "playlist image?", "clear"),
-    ("add",     "add songs to a playlist, importing new ones",    "playlist files+", None),
-    ("search",  "search YouTube for songs",                       "query+",          "count"),
-    ("download","download a search result into the library",      "id",              None),
-    ("stream",  "play a search result now, and fetch it as it plays", "id",          None),
+    ("add",     "add songs to a playlist, by number, name or path", "playlist files+", None),
+    ("search",  "search your library, or YouTube with --yt",      "query+",          "count yt"),
+    ("download","download a search result into the library",      "id",              "to"),
+    ("stream",  "play a search result now, and fetch it as it plays", "id",          "to"),
     ("remove",  "drop a song from a playlist, or delete it",      "playlist song?",  None),
     ("delete",  "delete a playlist (its songs stay)",             "playlist",        None),
     ("play",    "play a playlist, one song, or the library",      "playlist? song?", "shuffle library"),
@@ -2632,7 +4082,7 @@ COMMANDS = [
     ("help",    "show this help, or help for one command",        "topic?",          None),
 ]
 
-CMDS = {"status": cmd_status, "songs": cmd_songs, "list": cmd_list,
+CMDS = {"status": cmd_status, "stats": cmd_stats, "songs": cmd_songs, "list": cmd_list,
         "folder": cmd_folder, "levelling": cmd_levelling, "volume": cmd_volume,
         "target": cmd_target,
         "create": cmd_create, "add": cmd_add, "remove": cmd_remove,
@@ -2658,13 +4108,19 @@ def main(argv=None):
         return player(job) or 0
     if argv[:1] == ["_fetch"]:          # internal: the detached download that
         return fetch(argv[1], argv[2])  # runs behind a song being streamed
+    if argv[:1] == ["_keep"]:           # internal: the wait-and-promote behind
+        return keep(argv[1], argv[2])   # `stream --to`, which wants it kept
     migrate()                           # playlists moved folder once, long ago
     ap = argparse.ArgumentParser(prog="simplmusik", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, help_, positional, flag in COMMANDS:
-        p = sub.add_parser(name, help=help_)
+        p = sub.add_parser(name, help=help_,
+                           epilog={"add": BY_SONG, "play": BY_SONG,
+                                   "remove": BY_SONG, "download": BY_VIDEO,
+                                   "stream": BY_VIDEO, "stats": BY_TOPIC}.get(name),
+                           formatter_class=argparse.RawDescriptionHelpFormatter)
         for spec in positional.split():
             p.add_argument(spec.rstrip("?+"),
                            nargs={"?": "?", "+": "+"}.get(spec[-1]))
@@ -2681,9 +4137,30 @@ def main(argv=None):
                 p.add_argument("--library", action="store_true",
                                help="play the whole library, whatever is on now")
             elif f == "count":
-                p.add_argument("--count", type=int, default=SEARCH_N,
-                               help="how many results to bring back (up to %d)"
-                                    % SEARCH_MAX)
+                # No default: a library search shows everything it found,
+                # because it cost nothing to find, and only YouTube has a
+                # handful to fall back on.
+                p.add_argument("--count", type=int,
+                               help="how many results to bring back "
+                                    "(up to %d from YouTube)" % SEARCH_MAX)
+            elif f == "yt":
+                # `-yt` as well as `--yt`: it is what everybody types, and
+                # argparse will take a long option spelled with one dash.
+                p.add_argument("--yt", "-yt", action="store_true",
+                               help="search YouTube instead of your library")
+            elif f == "top":
+                p.add_argument("--count", type=int, metavar="N",
+                               help="how many rows to show")
+            elif f == "since":
+                p.add_argument("--since", metavar="WINDOW",
+                               help="only count this far back: 7d, 24h, 2w, all")
+            elif f == "by":
+                p.add_argument("--by", metavar="ORDER",
+                               help="order the tables: time (default), plays, "
+                                    "skips, recent")
+            elif f == "to":
+                p.add_argument("--to", metavar="PLAYLIST",
+                               help="put it in this playlist as well as the library")
 
     args = ap.parse_args(argv)
     if args.cmd == "help":

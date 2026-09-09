@@ -13,9 +13,11 @@ wearing - your choice in Settings, when you have made one - so the titlebar and
 the window behind the page never disagree with it.
 """
 
-import os, socket, sys, threading, webbrowser
+import glob, os, socket, sys, threading, webbrowser
 import server
 
+# Only ever a name for the desktop: it is what Gtk.Application registers
+# itself as, which is how a second launch finds the window already open.
 APP_ID = "org.simplmusik.Player"
 
 # Flatpak exports one launcher per app, named after the app id and pointed at
@@ -135,6 +137,24 @@ def theme_dark(Gtk):
     name = Gtk.Settings.get_default().get_property("gtk-theme-name") or ""
     return "dark" in name.lower()
 
+def nvidia_webkit_workaround():
+    """WebKit's DMA-BUF renderer and NVIDIA's own driver do not get along: on
+    those machines the window comes up blank, or white, or never paints at
+    all. Turning that renderer off falls back to a path that works
+    everywhere, and costs nothing here - this page is lists and cover art,
+    not video.
+
+    Only NVIDIA's proprietary driver is looked for, by the device nodes and
+    the module it alone creates, so every other machine keeps the accelerated
+    path. It has to be set before WebKit is imported, because the web process
+    reads it as it starts. An answer already in the environment is left
+    alone, which is what makes `flatpak override --env=...` - or just setting
+    it in a shell - the way out when this guesses wrong either way."""
+    if "WEBKIT_DISABLE_DMABUF_RENDERER" in os.environ:
+        return
+    if glob.glob("/dev/nvidia*") or os.path.isdir("/sys/module/nvidia"):
+        os.environ["WEBKIT_DISABLE_DMABUF_RENDERER"] = "1"
+
 # A line that says its piece over the page and then takes itself away. There
 # is nothing to press: it fades in once the page has painted, sits for a few
 # seconds and goes. Clicks fall straight through to the page underneath, so it
@@ -182,6 +202,8 @@ def toast(Gtk, Gdk, GLib, overlay, text, seconds=5):
     GLib.timeout_add(900, arrive)      # let the page paint before saying anything
 
 def app_window(fresh_path=False):
+    nvidia_webkit_workaround()
+
     import gi
     gi.require_version("Gtk", "3.0")
     gi.require_version("WebKit2", "4.1")

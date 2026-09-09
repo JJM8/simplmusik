@@ -46,6 +46,7 @@
   <symbol id="i-pen" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" d="M11.3 1.9 14.1 4.7 5.5 13.3l-3.5.7.7-3.5zM9.6 3.6l2.8 2.8"/></symbol>
   <symbol id="i-vol" viewBox="0 0 16 16"><path fill="currentColor" d="M7.4 2.2 4.2 5H2.3a.9.9 0 0 0-.9.9v4.2a.9.9 0 0 0 .9.9h1.9l3.2 2.8a.6.6 0 0 0 1-.45V2.65a.6.6 0 0 0-1-.45z"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M10.6 6.1a2.6 2.6 0 0 1 0 3.8"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M12.7 4.1a5.5 5.5 0 0 1 0 7.8"/></symbol>
   <symbol id="i-vol-off" viewBox="0 0 16 16"><path fill="currentColor" d="M7.4 2.2 4.2 5H2.3a.9.9 0 0 0-.9.9v4.2a.9.9 0 0 0 .9.9h1.9l3.2 2.8a.6.6 0 0 0 1-.45V2.65a.6.6 0 0 0-1-.45z"/><path fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" d="M10.8 6.2l3.4 3.6M14.2 6.2l-3.4 3.6"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 16 16"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M2.2 13.4h11.6M4.6 13.4V8.4M8 13.4V3.6M11.4 13.4V6.2"/></symbol>
   <symbol id="i-note" viewBox="0 0 16 16"><path fill="currentColor" d="M13 1.6 5.6 3.3v7.4a2.4 2.4 0 1 0 1.2 2V6.1l5-1.2v4.5a2.4 2.4 0 1 0 1.2 2z"/></symbol>
 </svg>
 
@@ -60,12 +61,19 @@
     <nav id="playlists"></nav>
 
     <div class="side-foot">
-      <button class="linkbtn" id="new-pl">
+      <button class="linkbtn center" id="new-pl">
         <svg class="ico" width="15" height="15"><use href="#i-plus"/></svg> New playlist
       </button>
-      <button class="linkbtn" id="settings-btn">
-        <svg class="ico" width="15" height="15"><use href="#i-gear"/></svg> Settings
-      </button>
+      <!-- The two pages, on one line. Settings is the one you go looking for
+           something in, so it keeps the room; stats is the one you glance at. -->
+      <div class="foot-row">
+        <button class="linkbtn" id="settings-btn">
+          <svg class="ico" width="15" height="15"><use href="#i-gear"/></svg> Settings
+        </button>
+        <button class="linkbtn half" id="stats-btn" title="Stats">
+          <svg class="ico" width="15" height="15"><use href="#i-chart"/></svg> Stats
+        </button>
+      </div>
     </div>
   </aside>
 
