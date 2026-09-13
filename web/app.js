@@ -53,10 +53,32 @@ const FIND_MORE = 8;     // ...and how many more each 'See more' asks for
    allowed to land - they can come back out of order - and 'See more' is the
    same search again for a longer list, which is all YouTube offers. */
 
-function ytSearch(paint) {
-  const s = { query: '', found: [], finding: false, error: null,
+/* A TikTok link, typed, pasted or shared. It isn't searched for as it stands:
+   `identify` names the song the TikTok is playing, and the name goes into the
+   box in the link's place as though you had typed it - so what follows is the
+   ordinary search, with everything that already does. */
+const TIKTOK = /https?:\/\/(?:[\w-]+\.)*tiktok\.com\/\S+/i;
+const isTiktok = q => TIKTOK.test(q);
+
+function ytSearch(paint, rename) {
+  const s = { query: '', found: [], finding: false, naming: false, error: null,
               n: FIND_N, more: false };
   let timer = null, seq = 0;
+
+  /* The song in a TikTok. A name goes back through the box the link came
+     from; anything else is the one answer there is, that nothing was found -
+     with the reason beside it when the reason is worth knowing, like having
+     no network, rather than being that the video has no song in it. */
+  async function name(link) {
+    const mine = ++seq;
+    const r = await call('identify', link);
+    if (mine !== seq) return;             // the box has moved on since
+    s.naming = false;
+    if (r.ok && r.data?.song) return rename(r.data.song);
+    s.error = 'Didn’t find anything.'
+            + (r.code === 2 || !r.error ? '' : ' (' + r.error + ')');
+    paint();
+  }
 
   async function ask(n) {
     const mine = ++seq;
@@ -86,8 +108,10 @@ function ytSearch(paint) {
     clearTimeout(timer);
     seq++;                                // whatever is in flight is now stale
     s.found = []; s.error = null; s.n = FIND_N; s.more = false;
-    s.finding = q.length >= MIN_FIND;
-    if (s.finding) timer = setTimeout(() => ask(FIND_N), 350);
+    s.naming = isTiktok(q);
+    s.finding = !s.naming && q.length >= MIN_FIND;
+    if (s.naming) timer = setTimeout(() => name(q.match(TIKTOK)[0]), 350);
+    else if (s.finding) timer = setTimeout(() => ask(FIND_N), 350);
   };
 
   // Asking for more keeps the rows you have on screen while it goes: only the
@@ -105,8 +129,12 @@ function ytSearch(paint) {
 
 /* Painting the top bar's results is a whole redraw; the add box repaints its
    own rows instead, so it never rebuilds the field you are typing into. */
-const find      = ytSearch(() => render());
-const adderFind = ytSearch(() => repaintAdder?.());
+const find      = ytSearch(() => render(),
+                           song => { q.value = song; q.oninput(); });
+const adderFind = ytSearch(() => repaintAdder?.(), song => {
+  const inp = $('#add-q');              // gone if you left the playlist meanwhile
+  if (inp) { inp.value = song; inp.oninput(); }
+});
 
 /* The row that asks for the next handful. Shown while YouTube filled the last
    request completely, which is the only sign there is more to come. */
@@ -122,10 +150,12 @@ function moreRow(s) {
 function foundRows(box, s, pl) {
   const h = el('div', 'found-head');
   // One heading either way: what is happening, or what these rows are.
-  h.append(el('strong', '', s.finding ? 'Searching YouTube\u2026'
-                                      : 'Add from YouTube'));
+  h.append(el('strong', '', s.naming       ? 'Finding the song in that TikTok\u2026'
+                          : s.finding      ? 'Searching YouTube\u2026'
+                          : isTiktok(s.query) ? 'From TikTok'
+                                           : 'Add from YouTube'));
   box.append(h);
-  if (s.finding) return;
+  if (s.naming || s.finding) return;
   // A search that failed says so. Reporting it as 'nothing found' would send
   // you off rewording a query when yt-dlp simply isn't installed.
   if (s.error)          return void box.append(el('div', 'none', s.error));
@@ -483,8 +513,11 @@ function renderHead() {
 
   if (state.query) {
     const t = el('div');
+    // A TikTok link isn't what is being searched for - the song in it is - and
+    // it is one unbroken line far wider than a phone besides.
     t.append(el('h1', '', 'Search'),
-             el('div', 'sub', `${plural(songs.length, 'result')} for “${state.query}”`));
+             el('div', 'sub', isTiktok(state.query) ? 'From a TikTok link'
+               : `${plural(songs.length, 'result')} for “${state.query}”`));
     head.append(t);
     if (songs.length) {
       const acts = el('div', 'acts');
@@ -780,7 +813,9 @@ function renderList() {
   }
 
   if (!songs.length) {
-    list.append(el('div', 'none', 'Nothing matched.'));
+    // A TikTok link matches nothing and was never going to: it is on its way
+    // to being a name, and what is under here says so.
+    if (!isTiktok(state.query)) list.append(el('div', 'none', 'Nothing matched.'));
     renderFound(list);
     return;
   }
@@ -895,7 +930,7 @@ function renderAdder(list) {
     const options = state.lib.songs.filter(s => !pl.songs.includes(s.file) && matches(s, q));
     rows.replaceChildren();
     if (options.length) options.forEach(s => rows.append(adderRow(s, pl)));
-    else rows.append(el('div', 'none',
+    else if (!isTiktok(state.addQuery)) rows.append(el('div', 'none',
       state.addQuery          ? 'Nothing matched.'
       : state.lib.songs.length ? 'Every song is already here.'
                                : 'No songs yet.'));
@@ -2040,6 +2075,16 @@ q.oninput = () => {
 };
 $('#clear-q').onclick = () => { q.value = ''; q.oninput(); q.focus(); };
 
+/* Something shared to the app from another one - on a phone, a TikTok from
+   its share sheet. It lands in the top bar exactly as though it had been
+   pasted there, whatever the window was showing: the link, when there is one
+   in what was sent, and otherwise the text, which is simply searched for. */
+window.shared = text => {
+  nav(false);
+  q.value = (String(text).match(TIKTOK)?.[0] || String(text)).trim();
+  q.oninput();
+};
+
 /* new playlist ----------------------------------------------------------- */
 
 const dlg = $('#dlg');
@@ -2109,6 +2154,9 @@ document.onkeydown = e => {
   const typing = /^(INPUT|TEXTAREA)$/.test(e.target.tagName);
   const modal = dlg.open || del.open;
   if (e.key === 'Escape' && menu) { closeMenu(); return; }
+  if (e.key === 'Escape' && $('#app').classList.contains('nav-open')) {
+    nav(false); return;
+  }
   if (e.key === '/' && !typing) { e.preventDefault(); q.focus(); }
   else if (e.key === 'Escape' && typing) {
     e.target.blur();
@@ -2132,6 +2180,29 @@ document.onkeydown = e => {
 };
 
 /* ------------------------------------------------------------------ start */
+
+/* The sidebar, on a phone.
+
+   It is the same sidebar: nothing about it is rebuilt for a narrow window,
+   and on a wide one none of this ever fires. All that changes is whether it
+   is beside the list or over it, which is a class on #app and a stylesheet.
+
+   It closes on any of the ways you would expect to leave it - the scrim, the
+   button again, Escape, or picking a playlist, since choosing one is a thing
+   you did in order to look at it. */
+const nav = open_ => {
+  $('#app').classList.toggle('nav-open', open_);
+  $('#menu-btn').setAttribute('aria-expanded', open_ ? 'true' : 'false');
+  $('#scrim').hidden = !open_;
+};
+
+$('#menu-btn').onclick = () => nav(!$('#app').classList.contains('nav-open'));
+$('#scrim').onclick = () => nav(false);
+$('#sidebar').addEventListener('click', ev => {
+  // A tap that chose something, rather than one that missed - the drawer
+  // stays put if you prodded the padding.
+  if (ev.target.closest('button, a')) nav(false);
+});
 
 $('#settings-btn').onclick = () => openPlaylist(SETTINGS);
 $('#stats-btn').onclick    = async () => {

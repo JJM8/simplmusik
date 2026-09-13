@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>simplmusik</string>
+
+	<!-- The one thing that keeps the music going with the screen off. An
+	     iPhone suspends an app it cannot see; an audio session held by an app
+	     declaring this is the exception, and it is what stands in for the
+	     foreground service the Android build needs. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
+
+	<!-- Your music folder, visible in Files under On My iPhone. Both keys are
+	     needed and they say different things: the first puts the folder on
+	     show, the second lets other apps - a sync client, say - work on the
+	     files where they lie rather than on copies of them. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<!-- The page is served by the backend over http on 127.0.0.1, which iOS
+	     otherwise refuses to load. This permits local addresses and nothing
+	     else: it is not a blanket exemption for plain http on the internet. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

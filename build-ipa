@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Build the iOS app.
+
+    ./build-ipa                  # build/Simplmusik.app, unsigned
+    ./build-ipa --install        # ...then sign it and put it on the iPhone
+    ./build-ipa --selftest       # the self-test app rather than the player
+    ./build-ipa --release        # a release build rather than a debug one
+
+Same rule as the Android build: nothing in `ios/` is a copy of anything above
+it. The CLI, the backend and the page are staged out of the repository root
+into `ios/app` at build time and read off the phone's disk from there, so a
+change to `web/app.js` is in the next build because there is no second
+`app.js` for it not to be in.
+
+What is genuinely different from a desktop lives in `ios/Sources` - a window,
+and the few lines that start the interpreter - and CPython itself, which is
+fetched rather than checked in.
+
+Three steps, and the middle one is the whole reason this script exists rather
+than a one-line `xtool dev`:
+
+  1. `xtool dev build` turns the Swift package into an unsigned `.app`, with
+     `Python.framework` already inside it.
+  2. `install_python.py` does what Xcode's own build step does on a Mac: lays
+     the standard library into the bundle and turns each compiled module into
+     the little framework iOS insists it be. Nothing may write to a signed
+     bundle, so this has to happen before signing rather than after.
+  3. `xtool install` signs the result with your Apple ID and installs it.
+
+Needs xtool with its SDK installed (`xtool setup`) and a Swift 6.1+ toolchain.
+Everything else - CPython, mutagen, yt-dlp - is fetched on the first build and
+cached in `build/` after it.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+IOS = os.path.join(HERE, "ios")
+BUILD = os.path.join(HERE, "build")
+
+# The CPython that goes in the app. Pinned rather than "latest" so that two
+# builds of the same commit are the same app; moving it is a one-line edit and
+# a deliberate one.
+PYTHON_VERSION = "3.14"
+PYTHON_BUILD = "3.14-b11"
+PYTHON_URL = ("https://github.com/beeware/Python-Apple-support/releases/"
+              "download/%s/Python-%s-iOS-support.%s.tar.gz"
+              % (PYTHON_BUILD, PYTHON_VERSION, PYTHON_BUILD.split("-")[1]))
+
+# The two things the CLI imports that are not the standard library. Both are
+# pure Python, which is the reason this port is a build and not a rewrite:
+# nothing here has to be compiled for a phone.
+PIP_PACKAGES = ["mutagen", "yt-dlp"]
+
+
+def load(filename, modname):
+    """Import a sibling script. None of them end in .py, so they are loaded by
+    path rather than found on sys.path."""
+    path = os.path.join(HERE, filename)
+    loader = importlib.machinery.SourceFileLoader(modname, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def run(cmd, **kw):
+    """A command, shown before it is run and fatal if it fails."""
+    print("+ " + " ".join(cmd), flush=True)
+    result = subprocess.run(cmd, **kw)
+    if result.returncode != 0:
+        sys.exit("failed: %s" % " ".join(cmd))
+    return result
+
+
+def xtool():
+    """Where xtool is, or a sentence about it not being here.
+
+    Checked before anything is staged: a missing toolchain is a line to read,
+    and finding out at the build step means undoing a download first."""
+    path = shutil.which("xtool") or os.path.expanduser("~/.local/bin/xtool")
+    if not os.path.isfile(path):
+        sys.exit("no xtool - install it from https://xtool.sh and run "
+                 "`xtool setup`\n(it builds the iOS SDK from an Xcode.xip; no "
+                 "Mac needed)")
+    return path
+
+
+def fetch_python():
+    """CPython for iOS, downloaded once and unpacked into `ios/`.
+
+    The archive holds `Python.xcframework`, which SwiftPM treats as a binary
+    dependency and xtool copies into the app. One change is made to it on the
+    way in, so that Swift can say `import Python` at all.
+
+    CPython ships a module map in `Headers/`, written for a project that adds
+    that folder to its header search path - which is how Xcode uses it. Swift
+    looking at a framework instead reads `Modules/module.modulemap`, so a copy
+    goes there, and the copy is edited: `module Python` becomes `framework
+    module Python`. That word is the whole of it. Without it the compiler
+    resolves `umbrella header "Python.h"` beside the module map and reports a
+    header that is plainly there as missing; with it, headers are looked up in
+    the framework's own `Headers`, which is where they are."""
+    dest = os.path.join(IOS, "Python.xcframework")
+    if os.path.isdir(dest):
+        return dest
+
+    os.makedirs(BUILD, exist_ok=True)
+    archive = os.path.join(BUILD, os.path.basename(PYTHON_URL))
+    if not os.path.isfile(archive):
+        print("fetching CPython %s for iOS" % PYTHON_VERSION, flush=True)
+        tmp = archive + ".part"
+        urllib.request.urlretrieve(PYTHON_URL, tmp)
+        os.replace(tmp, archive)
+
+    print("unpacking CPython into ios/", flush=True)
+    staging = os.path.join(BUILD, "python-apple-support")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    with tarfile.open(archive) as tar:
+        tar.extractall(staging, filter="data")
+
+    shutil.move(os.path.join(staging, "Python.xcframework"), dest)
+
+    for slice_dir in os.listdir(dest):
+        headers = os.path.join(dest, slice_dir, "Python.framework", "Headers")
+        modmap = os.path.join(headers, "module.modulemap")
+        if not os.path.isfile(modmap):
+            continue
+        modules = os.path.join(dest, slice_dir, "Python.framework", "Modules")
+        os.makedirs(modules, exist_ok=True)
+        with open(modmap) as f:
+            text = f.read()
+        with open(os.path.join(modules, "module.modulemap"), "w") as f:
+            f.write(text.replace("module Python {", "framework module Python {", 1))
+    return dest
+
+
+def pip_install(app_dir):
+    """The pure-Python dependencies, installed beside the app's own code.
+
+    `--target` rather than a virtualenv, because what is wanted is a folder of
+    modules to copy into a bundle. They are architecture-independent, so the
+    copy this desktop downloads is the copy the phone runs - the check below
+    is what makes sure that stays true, since a package that turned out to
+    carry a compiled module would need building for iOS instead."""
+    target = os.path.join(BUILD, "ios-packages")
+    if not os.path.isdir(target):
+        run([sys.executable, "-m", "pip", "install", "--upgrade",
+             "--target", target] + PIP_PACKAGES)
+
+    compiled = [os.path.join(root, f)
+                for root, _, files in os.walk(target) for f in files
+                if f.endswith((".so", ".pyd", ".dylib"))]
+    if compiled:
+        sys.exit("these packages carry compiled modules, which would have to "
+                 "be built for iOS:\n  " + "\n  ".join(compiled))
+
+    # `bin` is the console scripts pip writes for yt-dlp, and `share` its man
+    # pages; neither means anything in an app that cannot start a program and
+    # has no man command to read them. The metadata folders go for the same
+    # reason: nothing here ever asks pip what is installed.
+    for name in os.listdir(target):
+        if name.endswith((".dist-info", ".egg-info")) or name in (
+                "__pycache__", "bin", "share"):
+            continue
+        src = os.path.join(target, name)
+        dst = os.path.join(app_dir, name)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy(src, dst)
+
+
+def stage(selftest):
+    """Lay the app out in `ios/app`, out of the repository root.
+
+    Same shape as the repository, because that is what lets `server.py` find
+    the CLI beside it and the page beside that, exactly as it does on a
+    desktop. The folder is rebuilt every time: a stale file here would be a
+    version of the app nobody is looking at."""
+    app_dir = os.path.join(IOS, "app")
+    shutil.rmtree(app_dir, ignore_errors=True)
+    os.makedirs(app_dir)
+
+    for name in ("simplmusik", "server.py"):
+        shutil.copy(os.path.join(HERE, name), os.path.join(app_dir, name))
+    shutil.copytree(os.path.join(HERE, "web"), os.path.join(app_dir, "web"))
+    if selftest:
+        shutil.copy(os.path.join(IOS, "selftest.py"),
+                    os.path.join(app_dir, "selftest.py"))
+
+    pip_install(app_dir)
+
+    # A bundle is signed whole, and anything unreadable in it is a signature
+    # that will not verify. __pycache__ is also pointless here: the interpreter
+    # is started with bytecode writing off, because the bundle is read-only.
+    for root, dirs, _ in os.walk(app_dir):
+        for d in list(dirs):
+            if d == "__pycache__":
+                shutil.rmtree(os.path.join(root, d))
+                dirs.remove(d)
+    return app_dir
+
+
+def find_app():
+    """The `.app` xtool just built.
+
+    `ios/xtool` is where it puts the assembled bundle; `.build` is SwiftPM's
+    own folder underneath, which holds the library that went into it. Both are
+    looked in, newest first, because which one a version of xtool writes to is
+    its business rather than ours."""
+    candidates = []
+    for base in (os.path.join(IOS, "xtool"), os.path.join(IOS, ".build")):
+        for root, dirs, _ in os.walk(base):
+            for d in dirs:
+                if d.endswith(".app"):
+                    path = os.path.join(root, d)
+                    candidates.append((os.path.getmtime(path), path))
+    if not candidates:
+        sys.exit("xtool built no .app - see the output above")
+    return max(candidates)[1]
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--install", action="store_true")
+    parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--release", action="store_true")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+    if args.help:
+        print(__doc__)
+        return
+
+    tool = xtool()
+    version = load("build-deb", "simplmusik_build_ipa_version").VERSION
+    print("building simplmusik %s for iOS (%s)"
+          % (version, "self-test" if args.selftest else "player"), flush=True)
+
+    fetch_python()
+    stage(args.selftest)
+
+    env = dict(os.environ)
+    env.setdefault("PATH", "")
+    swiftly_env = os.path.expanduser("~/.local/share/swiftly/bin")
+    if os.path.isdir(swiftly_env):
+        env["PATH"] = swiftly_env + os.pathsep + env["PATH"]
+
+    build = [tool, "dev", "build"]
+    if args.release:
+        build += ["--configuration", "release"]
+    run(build, cwd=IOS, env=env)
+
+    app = find_app()
+    run([sys.executable, os.path.join(IOS, "install_python.py"),
+         os.path.join(IOS, "Python.xcframework"), app])
+
+    os.makedirs(BUILD, exist_ok=True)
+    out = os.path.join(BUILD, os.path.basename(app))
+    shutil.rmtree(out, ignore_errors=True)
+    shutil.copytree(app, out, symlinks=True)
+    print("\n%s" % out, flush=True)
+
+    if args.install:
+        # Signing happens here, and it is the one step that needs your Apple
+        # ID: `xtool install` provisions, signs and pushes in one go.
+        run([tool, "install", out], env=env)
+
+
+if __name__ == "__main__":
+    main()

@@ -1029,3 +1029,151 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16
   border: 3px solid transparent; background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--scroll-on); background-clip: content-box; }
+
+/* ------------------------------------------------------------------ phone */
+/* One breakpoint, and everything narrow is on the far side of it. The layout
+   above is two columns with a bar underneath; a phone has room for one column,
+   so the sidebar stops being a column and becomes a drawer over the top, and
+   the rows shed the parts of a song that were only ever there because there
+   was width going spare.
+
+   Nothing here is a second design. Every rule is a change to a measurement or
+   an arrangement, so the page a phone shows is the page - same markup, same
+   script, same palette - laid out for the space it has. */
+
+#menu-btn { display: none; }        /* the drawer's handle, on wide windows */
+#scrim    { display: none; }
+
+@media (max-width: 720px) {
+
+  /* dvh, not vh: a phone browser's bar comes and goes, and with vh the player
+     spends half its life pushed below the bottom of the screen. */
+  #app {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+    height: 100dvh;
+  }
+
+  /* --- the sidebar, as a drawer ----------------------------------------- */
+
+  #sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(84vw, 300px);
+    z-index: 40;
+    transform: translateX(-100%);
+    transition: transform .22s ease;
+    overflow-y: auto;
+    padding-top: env(safe-area-inset-top);
+  }
+  /* The shadow belongs to the drawer being over the page, so it is only worn
+     while it is. Left on all the time it spills round the edge of a drawer
+     that is otherwise off-screen, and paints a grey band down the side of an
+     app nobody has opened anything in. */
+  #app.nav-open #sidebar {
+    transform: none;
+    box-shadow: 0 0 40px rgba(0, 0, 0, .45);
+  }
+
+  /* Only while the drawer is open, and said with the class rather than left
+     to the `hidden` attribute. An author rule beats the browser's built-in
+     `[hidden] { display: none }` whatever the specificity, so a plain
+     `display: block` here left a full-screen sheet over the page for good -
+     invisible against a dark palette, and swallowing every tap on it. */
+  #app.nav-open #scrim {
+    display: block;
+    position: fixed; inset: 0;
+    z-index: 35;
+    background: rgba(0, 0, 0, .5);
+  }
+
+  #menu-btn {
+    display: grid; place-items: center;
+    width: 38px; height: 38px;
+    flex: none;
+    border-radius: 8px;
+    color: var(--dim);
+  }
+
+  #main, #player { grid-column: 1; }
+
+  /* --- the top bar ------------------------------------------------------ */
+
+  #topbar {
+    gap: 8px;
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  }
+  /* The volume slider goes. A phone has volume buttons on the side of it,
+     they are what everybody reaches for, and the levelling is the thing that
+     was supposed to stop anyone reaching at all. */
+  #vol { display: none; }
+  .search { flex: 1; min-width: 0; }
+  /* 16px, because anything smaller makes iOS zoom the page when you tap it. */
+  .search input { font-size: 16px; }
+
+  /* --- the list --------------------------------------------------------- */
+
+  #list { padding: 0 6px 16px; }
+
+  /* Cover, song, buttons. The number, the album and the running time are all
+     real information and none of them survives the cut: at this width the
+     choice is between showing them and showing the title. */
+  .track {
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    gap: 12px;
+    padding: 0 8px;
+    min-height: 60px;           /* a thumb, not a mouse pointer */
+  }
+  .head-row { display: none; }
+  .track .num, .track .album, .track .dur { display: none; }
+  .track .art { width: 40px; height: 40px; }
+  .track .title  { font-size: 15px; }
+  .track .artist { font-size: 13px; }
+
+  /* Both row buttons stay, and both get a tappable amount of room. */
+  .row-acts { gap: 2px; }
+  .row-acts .add { width: 40px; height: 40px; }
+
+  /* --- the player ------------------------------------------------------- */
+
+  /* Three across becomes three down: what is playing, then the scrubber,
+     then the controls - biggest and last, nearest the thumb. */
+  #player {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 8px;
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+  }
+
+  #now .art { width: 42px; height: 42px; }
+  #now .title  { font-size: 14px; }
+
+  /* Centred under the song rather than pushed right: `justify-self: end` is
+     what lines it up against the edge on a wide window, where it is the
+     last of three columns. Here it is the only one. */
+  #prog { order: 2; justify-self: center; }
+  #controls {
+    order: 3;
+    justify-content: center;
+    gap: 18px;
+  }
+  .ctl     { width: 46px; height: 46px; }
+  .ctl.big { width: 56px; height: 56px; }
+
+  /* A scrubber you can actually hit: the bar keeps its look and gets a
+     taller invisible target around it. */
+  .track-bar { padding: 14px 0; background-clip: content-box; }
+
+  /* --- touch ------------------------------------------------------------ */
+
+  /* Hover belongs to a pointer that can rest somewhere without pressing. A
+     touch fires it on tap and then leaves it stuck on the last thing touched,
+     so the whole page ends up wearing a highlight nobody asked for. */
+  @media (hover: none) {
+    .track:hover { background: none; }
+  }
+  * { -webkit-tap-highlight-color: transparent; }
+
+  /* The toast sits above a player that is now much taller than --player-h. */
+  #toast { bottom: auto; top: calc(12px + env(safe-area-inset-top)); }
+}

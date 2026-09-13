@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Loopback is still a socket, and Android gates every socket behind
+         this - so the page talking to the server inside the same app needs it
+         even with the phone in flight mode. Search and download need the real
+         thing when there is a connection; everything else here never leaves
+         the device. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Reading the music: the modern permission, and the old one for the
+         versions that predate it. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- And writing it. This is the heavy one, and it is asked for because
+         the alternative is a different app.
+
+         A playlist here is a small file in a hidden folder inside your music
+         folder, which is what makes syncing that folder carry your playlists
+         with it, and a download lands in a hidden folder beside it so that
+         finishing one is a rename on the same filesystem rather than a copy
+         that can be interrupted. Scoped storage permits neither: hidden
+         folders are not indexed and not writable, and an app's own private
+         storage is a different mount, which turns that rename back into a
+         copy. Taking either away would mean this port quietly worked to a
+         different design from the app it is a port of.
+
+         It is not on the Play Store and is not going to be - it is a download
+         from a releases page, like the .deb and the .flatpak beside it - so
+         the policy that makes this permission hard to obtain does not apply,
+         and the honest trade is to ask for it plainly. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.Simplmusik">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- In the share sheet: a TikTok shared here goes in the search
+                 box, and the song it is playing is looked up from there. Any
+                 other text is simply searched for. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".PlayerService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+    </application>
+</manifest>

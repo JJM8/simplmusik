@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Hand the newest APK to a phone on the same network.
+
+    ./serve-apk                 # http://<this machine>:1234/
+    ./serve-apk --port 8123     # ...somewhere else
+    ./serve-apk --dir build     # ...from another folder
+
+An Android phone cannot install anything over adb without a cable, and a
+30 MB file is a silly thing to email yourself. So this serves the APK on the
+LAN: type the address into the phone's browser, tap the link, install.
+
+Two things it does that `python3 -m http.server` does not, and they are the
+whole reason it exists:
+
+**It always offers the newest build.** The folder is read on every request
+rather than at start-up, so a build finished a moment ago is what the next tap
+downloads. Nothing has to be restarted, which is what makes this safe to run
+as a service and forget about.
+
+**It knows an arm64 APK from an x86_64 one.** `build-apk --abi x86_64` is for
+the emulator, and that build on a real phone installs and then dies on the
+first import. Both are listed, but the phone build is what the big link and
+the stable `/simplmusik.apk` address point at.
+
+It binds to every interface on purpose - a server only the machine itself can
+reach would be no use to a phone - so anyone on your network can download the
+APK while it is running. That is the same trade the .apk on a releases page
+makes, on a smaller network.
+"""
+
+import argparse
+import html
+import http.server
+import os
+import re
+import socket
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+APK_TYPE = "application/vnd.android.package-archive"
+
+# What `build-apk` writes: simplmusik_<version>.apk, with the architecture on
+# the end when it is not the phone one.
+APK = re.compile(r"^simplmusik_(?P<version>[0-9][^_]*)(?:_(?P<abi>[a-z0-9_]+))?\.apk$")
+
+
+def builds(folder):
+    """Every APK in the folder, newest first.
+
+    Sorted by the file's own timestamp rather than by the version in its name:
+    the thing you want is the one you just built, and a rebuild of 0.2.2 after
+    a test of 0.2.3 is still the newer file."""
+    found = []
+    for name in os.listdir(folder):
+        m = APK.match(name)
+        if not m:
+            continue
+        path = os.path.join(folder, name)
+        found.append({"name": name, "path": path,
+                      "abi": m.group("abi") or "arm64-v8a",
+                      "phone": m.group("abi") is None,
+                      "version": m.group("version"),
+                      "size": os.path.getsize(path),
+                      "when": os.path.getmtime(path)})
+    return sorted(found, key=lambda b: b["when"], reverse=True)
+
+
+def newest(folder):
+    """The build a phone should be given, or None.
+
+    A phone build always wins over an emulator one however new the emulator
+    one is: somebody pointing a phone at this wants something that runs on
+    it."""
+    found = builds(folder)
+    phone = [b for b in found if b["phone"]]
+    return (phone or found or [None])[0]
+
+
+def size(n):
+    return "%.1f MB" % (n / 1e6) if n >= 1e6 else "%.0f kB" % (n / 1e3)
+
+
+def when(t):
+    return time.strftime("%a %d %b, %H:%M", time.localtime(t))
+
+
+PAGE = """<!doctype html>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>simplmusik</title>
+<style>
+  :root { color-scheme: dark light; --accent: #ff7139; }
+  body { font: 16px/1.5 system-ui, -apple-system, sans-serif; margin: 0;
+         padding: 32px 20px; background: #16171a; color: #e8e8ea; }
+  h1 { font-size: 20px; margin: 0 0 2px; color: var(--accent); }
+  p.sub { margin: 0 0 24px; opacity: .6; font-size: 14px; }
+  a.get { display: block; background: var(--accent); color: #16171a;
+          text-decoration: none; font-weight: 700; text-align: center;
+          padding: 16px; border-radius: 12px; margin-bottom: 8px; }
+  p.note { opacity: .6; font-size: 13px; margin: 0 0 28px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em;
+       opacity: .5; margin: 0 0 8px; }
+  li { list-style: none; padding: 8px 0; border-top: 1px solid #2a2c31; }
+  li a { color: #e8e8ea; } ul { padding: 0; margin: 0; }
+  .meta { opacity: .55; font-size: 13px; }
+  @media (prefers-color-scheme: light) {
+    body { background: #fff; color: #16171a; } li { border-color: #e6e6e9; }
+    a.get { color: #fff; }
+  }
+</style>
+<h1>simplmusik</h1>
+<p class=sub>%(sub)s</p>
+%(main)s
+<h2>All builds</h2>
+<ul>%(rows)s</ul>
+"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "simplmusik-apk"
+
+    @property
+    def folder(self):
+        return self.server.folder
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/":
+            return self.index()
+        # One stable address for "whatever the newest phone build is", so a
+        # bookmark or a QR code on a wall goes on working after a release.
+        if path == "/simplmusik.apk":
+            build = newest(self.folder)
+            return self.send(build) if build else self.missing()
+        name = os.path.basename(path)
+        for build in builds(self.folder):
+            if build["name"] == name:
+                return self.send(build)
+        self.send_error(404, "no such build")
+
+    def index(self):
+        found = builds(self.folder)
+        best = newest(self.folder)
+        if not best:
+            return self.missing()
+
+        main = ('<a class=get href="/simplmusik.apk">Download %s &nbsp;·&nbsp; %s</a>'
+                '<p class=note>Android will ask you to allow installing from '
+                'your browser.</p>'
+                % (html.escape(best["version"]), size(best["size"])))
+        rows = "".join(
+            '<li><a href="/%s">%s</a><div class=meta>%s · %s · %s</div></li>'
+            % (html.escape(b["name"]), html.escape(b["name"]),
+               "phone" if b["phone"] else html.escape(b["abi"]),
+               size(b["size"]), when(b["when"]))
+            for b in found)
+        body = (PAGE % {"sub": "%d build%s, newest first" % (len(found),
+                                                            "" if len(found) == 1 else "s"),
+                        "main": main, "rows": rows}).encode()
+        self.reply(body, "text/html; charset=utf-8")
+
+    def missing(self):
+        body = (PAGE % {"sub": "nothing built yet", "rows": "",
+                        "main": "<p class=note>Run <code>./build-apk</code> "
+                                "and reload this page.</p>"}).encode()
+        self.reply(body, "text/html; charset=utf-8", status=404)
+
+    def send(self, build):
+        """The file itself, named so the phone saves it under its real name."""
+        try:
+            f = open(build["path"], "rb")
+        except OSError:
+            return self.send_error(404, "build went away")
+        with f:
+            self.send_response(200)
+            self.send_header("Content-Type", APK_TYPE)
+            self.send_header("Content-Length", str(build["size"]))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"' % build["name"])
+            self.end_headers()
+            try:
+                self.wfile.write(f.read())
+            except (BrokenPipeError, ConnectionResetError):
+                pass        # a phone that changed its mind halfway down
+
+    def reply(self, body, kind, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        # The page is a listing of files that change; a cached copy of it is
+        # the one thing nobody wants from this server.
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        # Straight to stdout, which under systemd is the journal:
+        # `journalctl --user -u simplmusik-apk -f` to watch a phone fetch it.
+        print("%s - %s" % (self.address_string(), fmt % args), flush=True)
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def address():
+    """This machine's address on the LAN, for the line printed at start-up.
+
+    Asked of a socket rather than of the hostname, which on a laptop is as
+    likely to answer 127.0.1.1 as anything useful. Nothing is sent: a UDP
+    socket only has to be pointed somewhere to know which interface it would
+    leave by."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))         # a documentation address; unroutable
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=1234)
+    parser.add_argument("--dir", default=os.path.join(HERE, "build"))
+    args = parser.parse_args()
+
+    folder = os.path.abspath(args.dir)
+    os.makedirs(folder, exist_ok=True)
+
+    httpd = Server(("0.0.0.0", args.port), Handler)
+    httpd.folder = folder
+    build = newest(folder)
+    print("serving %s on http://%s:%d/"
+          % (build["name"] if build else "(no APK yet)", address(), args.port),
+          flush=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

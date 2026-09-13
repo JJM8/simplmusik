@@ -122,25 +122,28 @@ for something to play.
 
     ~/Music/.simplmusik/playlists/main.json  a playlist
     ~/Music/.simplmusik/playlists/main.jpg   its cover art, if you gave it one
+    ~/Music/.simplmusik/plays-3f9a2c1e.jsonl this machine's log of what you played
     ~/.config/simplmusik/config.json         which folder is yours
 
 Only `config.json` stays behind, and it should: it holds this machine's
 folder path, which is the one thing that shouldn't travel with your music.
+(So do two small files in `~/.local/state` - this machine's name for itself,
+and the playlist it last put on - for the same reason; see below.)
 
 Choose a different music folder and the playlists move with it. Put your music on a drive that isn't plugged in and
 the playlists are on it too, so they're missing until it's back; nothing is
 lost and nothing is rewritten in the meantime.
 
 A playlist file is small and hand-editable, and names a song by its filename
-plus the folder it was last seen in:
+plus the folder it was last seen in, relative to your music folder:
 
 ```json
 {
   "name": "Road trip",
   "cover": "Road trip.jpg",
   "songs": [
-    {"file": "Killer Queen - Queen.mp3", "dir": "/home/me/Music"},
-    {"file": "Don't Stop Me Now - Queen.mp3", "dir": "/home/me/Music/rock"}
+    {"file": "Killer Queen - Queen.mp3", "dir": ""},
+    {"file": "Don't Stop Me Now - Queen.mp3", "dir": "rock"}
   ]
 }
 ```
@@ -148,7 +151,11 @@ plus the folder it was last seen in:
 `name` is what you see and is yours to change; `cover` is a picture beside the
 list, named on its own so it can only ever be one in that same folder. The
 **filename is the identity**; `dir` is only a shortcut, so the usual case
-is one `stat` rather than a search. Move a song - to another subfolder, or in
+is one `stat` rather than a search. It is relative - `""` is the music folder
+itself - because the same folder is `/home/me/Music` on a desktop and
+`/storage/emulated/0/Music` on a phone, and a relative `rock` is right on both.
+Lists written when `dir` was a full path still read, and are rewritten
+relative the first time a song in them is found. Move a song - to another subfolder, or in
 from somewhere else - and the next time anything reads the list, your music
 folder is searched once and the entry is rewritten with where it turned up. So
 a reorganised library fixes itself, and does it once rather than once per play.
@@ -160,6 +167,40 @@ A song **not in** your music folder keeps its place in the list. It shows up
 with a question mark where its cover would be and *Not found* under its name,
 and playback simply passes over it. A drive you haven't plugged in yet is no
 reason to quietly edit your playlist.
+
+### Syncing between machines
+
+Keeping the library in one folder is what makes it syncable with Syncthing or
+anything like it. What makes the sync *clean* is one rule: **a file in the
+music folder is only ever edited by one machine at a time.** A sync tool copies
+whole files. It cannot merge two edits to the same file, so when two machines
+both change one before either has seen the other's change, Syncthing keeps the
+newer and renames the older to `NAME.sync-conflict-<date>-<time>-<device>.json`
+beside it. Everything here is arranged so that doesn't happen:
+
+- **A playlist is written when you change it, and at no other time.** Reading
+  one never writes it unless what it says actually changed - `dir` being
+  relative is what makes that true on every machine at once, since a full path
+  was wrong on every machine but the one that wrote it, and each would have
+  "corrected" it back and forth forever. Pressing play doesn't write it either
+  (see below). So two machines only edit one playlist at once when you did.
+- **When you do, the newest edit wins.** Syncthing has already kept the newer
+  version under the real name; the conflict copy it set aside is deleted the
+  next time the playlists are listed, and the delete syncs back out. Left
+  there, it would be a second playlist with the same name.
+- **Each machine keeps its own play log**, `plays-<device>.jsonl`, and only that
+  machine ever writes it. Every log is read - along with `plays.jsonl`, the one
+  they all shared before this, and any conflict copy of either - and the lines
+  are sorted by time and deduplicated, so nothing needs merging.
+- **A playlist is saved whole or not at all:** written to a temporary file and
+  renamed into place. Something that caught a half-written list would read an
+  empty one, and writing that back would empty it on every machine.
+
+The device name is eight random hex digits made up on first use and kept in
+`~/.local/state/simplmusik-device` - random because a phone calls itself
+`localhost`, and in the state folder rather than the config because configs
+get copied between machines and a copied name would put two machines back on
+one log.
 
 ### Your music folder
 
@@ -463,12 +504,17 @@ window and a terminal list the same library the same way round.
   to keep beside it and no view that can disagree with the file. Lists written
   before this are the same list backwards, and are turned round once on the
   first read; `"order": "newest"` in the file is how that is known to be done.
-- **Playlists themselves** go by when you last played one, which is written to
-  the file when playback starts. One you have never played sits by the day you
-  made it (`"created"`), so a new playlist opens at the top and drifts down as
-  others are played rather than starting at the bottom of the list you made it
-  to lead. A playlist from before either date was kept falls back to the file's
-  own timestamp.
+- **Playlists themselves** go by when you last played one, which the play logs
+  already say - every line names the playlist it was played from - so every
+  synced machine reads the same order and the playlist file is never written
+  just because you pressed play. A log gains its line when a song ends, so the
+  playlist you put on a second ago is lifted straight away by a note this
+  machine keeps for itself in `~/.local/state/simplmusik-played.json`. One you
+  have never played sits by the day you made it (`"created"`), so a new
+  playlist opens at the top and drifts down as others are played rather than
+  starting at the bottom of the list you made it to lead. A `"played"` date
+  left in the file by an older version still counts, and a playlist from before
+  any date was kept falls back to the file's own timestamp.
 
 The backend exists only for what a CLI can't hand over:
 
@@ -745,6 +791,93 @@ the odd one out. `simplmusik-ui` reads the desktop's preference - through the
 portal is running - and hands it to GTK, which is also how WebKit comes to
 answer `prefers-color-scheme`. The page then posts back the palette it settled
 on, your pinned choice included, and the window follows that.
+
+## Android
+
+There is an APK, and there is no Android version of this app. Both of those
+are true, and the second one is the point.
+
+The CLI, the backend and the page inside the APK are the files in this folder.
+Gradle stages them out of the repository root at build time; `Boot.java` lays
+them on the phone's disk in the same shape they have here; and `server.py`
+reads them from there exactly as it does on a desktop, because nothing about
+what it does depends on which machine it is. Nothing in `android/` is a copy of
+anything above it, so there is no second `app.js` for a change to fail to reach
+and nothing that can quietly fall a version behind.
+
+What is in `android/` is the part with genuinely no desktop counterpart: a
+window to show the page in, a service to hold the app up while that window is
+away, and something to play the songs.
+
+### The three seams
+
+Almost none of the app knew it was on a desktop. Three places did.
+
+**Running a command.** The window used to run the CLI as a subprocess and read
+its JSON back. Inside an app there is no second interpreter to start, so
+`run_command` in the CLI does the same job in this process: `emit` writes into
+a sink rather than to stdout, and what the caller gets is the object that would
+have been printed. The window uses it too, because it is the same answer ten
+times faster - a command was costing an interpreter start-up and a yt-dlp
+import, and now costs neither.
+
+**Starting something and walking away.** The player, the download that runs
+behind a stream, and the promotion that follows it were each another copy of
+the CLI run as a process. `detach` is the one place that decides: a process on
+a desktop, a thread in an app. The player then has no process to exit at the
+end of a queue, so `finish` unwinds its thread instead and hands the lock back
+by closing it rather than by dying.
+
+**Playing a song.** There is no mpv in an app. `Backend` in `android_boot.py`
+stands where mpv stands, and is a subclass rather than a rewrite, because most
+of what the player loop wants from mpv is not about mpv: reading whole JSON
+messages, and waiting for either a song to end or a command to arrive, are
+inherited as they are. The trick that allows it is a socketpair - the loop
+still waits on a socket for a line saying how the song ended, and that line is
+now written by the code that hears the platform's player say so. Only three
+things are really different, and they are the three that touch a player:
+starting a song, sending it an order, taking it away.
+
+The player loop itself was not touched.
+
+### Levelling, without a filter chain
+
+The levelling is the same levelling. The CLI works out a gain per song, the
+quieter of "bring the average up to the target" and "keep the loudest sample
+under the ceiling", and that arithmetic runs unchanged. On a desktop the answer
+goes to mpv as `af=volume=XdB`; on a phone it goes to `GainProcessor`, forty
+lines that multiply the samples on their way out.
+
+It could not have been the player's own volume control. That is a fader between
+zero and one, and a quiet song needs to be made *louder* - a positive gain,
+which a fader cannot express. Multiplying can, the ceiling term is what stops
+it clipping, and the volume knob on top keeps mpv's cubic scale so that a 70
+means what it has always meant.
+
+### All-files access
+
+The APK asks for it, which is a lot to ask, and the alternative was a different
+app. A playlist is a small file in a hidden folder inside your music folder -
+which is what makes syncing that folder carry your playlists with it - and a
+download lands in a hidden folder beside it, so that finishing one is a rename
+on the same filesystem rather than a copy that can be interrupted. Scoped
+storage allows neither: hidden folders are not indexed and not writable, and
+the app's own private storage is a different mount, which turns that rename
+back into a copy.
+
+This is a download from a releases page, like the .deb and the .flatpak beside
+it, so the store policy that makes the permission hard to come by does not
+apply. Asking plainly was the honest trade.
+
+### Building it
+
+    ./build-apk                  # build/simplmusik_<version>.apk
+    ./build-apk --install        # ...and push it over adb
+
+`build-all` picks it up alongside the other two, and skips it with a line
+saying so where there is no Android SDK. The version comes from `build-deb`
+like everything else; the version code Android sorts upgrades by is worked out
+from it, so 0.2.1 is 201 and no second place names a version.
 
 ## Keys
 

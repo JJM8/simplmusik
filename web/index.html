@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>simplmusik</title>
 <link rel="icon" href="/favicon.png">
 <link rel="stylesheet" href="/style.css">
@@ -79,6 +79,14 @@
 
   <main id="main">
     <div id="topbar">
+      <!-- The way back to the sidebar on a phone, where the sidebar is a
+           drawer rather than a column. Not shown at all on a wide window: the
+           sidebar is already there, and a button to reveal what you can see
+           is just something else to explain. -->
+      <button id="menu-btn" aria-label="Playlists" aria-expanded="false">
+        <svg class="ico" width="18" height="18"><use href="#i-list"/></svg>
+      </button>
+
       <label class="search">
         <svg><use href="#i-search"/></svg>
         <input id="q" type="text" placeholder="Search music" autocomplete="off" spellcheck="false">
@@ -96,6 +104,10 @@
     <header id="head"></header>
     <div id="list"></div>
   </main>
+
+  <!-- Covers the list while the drawer is open, and closes it when tapped.
+       Nothing to look at on a wide window, where the drawer never opens. -->
+  <div id="scrim" hidden></div>
 
   <footer id="player">
     <div id="now">

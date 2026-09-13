@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The page paints itself, light or dark, and the window behind it must
+         not disagree with it while it loads. -->
+    <style name="Theme.Simplmusik" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/window</item>
+    </style>
+</resources>

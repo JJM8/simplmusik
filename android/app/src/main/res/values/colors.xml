@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="window">#FFFAF9F7</color>
+    <!-- The dark tile from `install`, so the launcher icon is the one the
+         desktop panel shows: the accent mark, not a flat accent square. -->
+    <color name="ic_launcher_background">#FF2E2E33</color>
+</resources>

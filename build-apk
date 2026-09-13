@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Build the Android package.
+
+    ./build-apk                  # build/simplmusik_<version>.apk
+    ./build-apk --version 0.2.0  # ...with a version of your choosing
+    ./build-apk --release        # a release build rather than a debug one
+    ./build-apk --install        # push it to the phone on the other end of adb
+    ./build-apk --abi x86_64     # ...for the emulator, which is not a phone
+
+There is no Android port of this app in the sense of a second copy of it. The
+CLI, the backend and the page are the ones in this folder, staged into the APK
+by Gradle at build time and read off the phone's disk at run time in the same
+layout they have here - which is why a change to `web/app.js` is in the next
+APK without anyone remembering to copy it, and why there is nothing in
+`android/` that can drift out of step with what the desktop is running.
+
+What is in `android/` is the part that genuinely has no counterpart on a
+desktop: a window to show the page in, a service to keep the music going when
+that window isn't on screen, and a player, because there is no mpv here.
+
+The version comes from `build-deb`, which is the one place in the tree that
+names one. The version code Android sorts upgrades by is worked out from it -
+0.2.1 becomes 201 - so it climbs on its own as long as no part goes past 99.
+
+Needs a Java 17 or newer JDK and an Android SDK. Point ANDROID_HOME or
+ANDROID_SDK_ROOT at the SDK, or let it find ~/Android/Sdk. Everything else -
+Gradle, the Android plugin, CPython, mutagen, yt-dlp - is fetched on the first
+build and cached after it.
+"""
+
+import importlib.machinery, importlib.util, os, shutil, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ANDROID = os.path.join(HERE, "android")
+BUILD = os.path.join(HERE, "build")
+
+
+def load(filename, modname):
+    """Import a sibling script. None of them end in .py, so they are loaded by
+    path rather than found on sys.path."""
+    path = os.path.join(HERE, filename)
+    loader = importlib.machinery.SourceFileLoader(modname, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def sdk():
+    """The Android SDK, or a reason there isn't one.
+
+    Checked before Gradle is started rather than after: a missing SDK is a
+    sentence to read, and Gradle's way of saying it is a stack trace."""
+    for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        d = os.environ.get(env)
+        if d and os.path.isdir(d):
+            return d
+    d = os.path.expanduser("~/Android/Sdk")
+    if os.path.isdir(d):
+        return d
+    sys.exit("no Android SDK - install one and set ANDROID_HOME, or put it in "
+             "~/Android/Sdk\n(Android Studio's SDK Manager is the easy way; "
+             "platform 36 and build-tools are what this needs)")
+
+
+def version_code(version):
+    """The number Android orders upgrades by, from the one people read.
+
+    Android will only ever install a build whose code is higher than the one
+    on the phone, and it has to be a single integer - so 0.2.1 becomes 201 and
+    the next build, 0.2.2, becomes 202. Two digits a part, which is a ceiling
+    worth knowing about: a .100 would land on top of the next .0 up."""
+    parts = (version.split("-")[0].split(".") + ["0", "0", "0"])[:3]
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        sys.exit("can't turn '%s' into an Android version code" % version)
+    if any(n > 99 for n in nums[1:]):
+        sys.exit("version %s doesn't fit: no part after the first may pass 99"
+                 % version)
+    return nums[0] * 10000 + nums[1] * 100 + nums[2]
+
+
+def main():
+    args = sys.argv[1:]
+    deb = load("build-deb", "simplmusik_build_apk_version")
+    version = deb.VERSION
+    if "--version" in args:
+        i = args.index("--version")
+        if i + 1 >= len(args):
+            sys.exit("--version needs a number, e.g. --version 0.2.0")
+        version = args[i + 1]
+
+    release = "--release" in args
+    # arm64 is what a phone is. The emulator is a desktop pretending to be a
+    # phone and needs the desktop's own architecture, or the CPython inside
+    # the APK is a library it cannot load.
+    abi = "arm64-v8a"
+    if "--abi" in args:
+        i = args.index("--abi")
+        if i + 1 >= len(args):
+            sys.exit("--abi needs an architecture, e.g. --abi x86_64")
+        abi = args[i + 1]
+    code = version_code(version)
+    root = sdk()
+
+    # Gradle reads this rather than the environment, and it is written every
+    # build: an SDK that moved is a one-line fix nobody should have to find.
+    with open(os.path.join(ANDROID, "local.properties"), "w") as f:
+        f.write("sdk.dir=%s\n" % root)
+
+    wrapper = os.path.join(ANDROID, "gradlew")
+    if not os.path.isfile(wrapper):
+        sys.exit("android/gradlew is missing - run `gradle wrapper` in android/")
+    os.chmod(wrapper, 0o755)
+
+    task = "assembleRelease" if release else "assembleDebug"
+    print("building simplmusik %s for Android (%s, code %d, %s)"
+          % (version, "release" if release else "debug", code, abi))
+    sys.stdout.flush()          # Gradle writes straight to the terminal; this
+                                # line would otherwise arrive after its output
+    started = time.time()
+    r = subprocess.run([wrapper, task,
+                        "-PversionName=%s" % version,
+                        "-PversionCode=%d" % code,
+                        "-Pabi=%s" % abi],
+                       cwd=ANDROID)
+    if r.returncode:
+        sys.exit("\nthe Android build failed - see above")
+
+    kind = "release" if release else "debug"
+    built = os.path.join(ANDROID, "app", "build", "outputs", "apk", kind,
+                         "app-%s.apk" % kind)
+    if not os.path.isfile(built):
+        sys.exit("gradle said it worked but there is no APK at %s" % built)
+
+    os.makedirs(BUILD, exist_ok=True)
+    # An emulator build sits beside the real one rather than replacing it:
+    # they are different APKs and only one of them is the thing you hand out.
+    out = os.path.join(BUILD, "simplmusik_%s%s.apk"
+                       % (version, "" if abi == "arm64-v8a" else "_" + abi))
+    shutil.copy2(built, out)
+
+    took = int(time.time() - started)
+    print("\n=== done in %s ===\n"
+          % ("%dm %ds" % divmod(took, 60) if took >= 60 else "%ds" % took))
+    print("  build/%-32s %6.1f MB"
+          % (os.path.basename(out), os.path.getsize(out) / 1e6))
+
+    if "--install" in args:
+        adb = shutil.which("adb")
+        if not adb:
+            sys.exit("\nno adb on the PATH - can't install")
+        print("\ninstalling on the phone")
+        subprocess.run([adb, "install", "-r", out])
+
+
+if __name__ == "__main__":
+    main()

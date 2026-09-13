@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Build both packages, replacing whatever is in build/.
+"""Build every package, replacing whatever is in build/.
 
-The .deb and the .flatpak are two halves of the same release, and they have to
-be cut from the same checkout or the download buttons in the README start
-handing out different apps. This runs the two builds back to back so that
-can't drift.
+The .deb, the .flatpak and the .apk are three parts of one release, and they
+have to be cut from the same checkout or the download buttons in the README
+start handing out different apps. This runs the builds back to back so that
+can't drift - which matters most for the APK, whose whole design is that there
+is no second copy of the app in it.
 
-    ./build-all                  # replace build/*.deb and build/*.flatpak
+    ./build-all                  # replace build/*.deb, *.flatpak and *.apk
     ./build-all --version 0.2.0  # ...with a version of your choosing
 
 Every build gets its own number. VERSION in build-deb is the one you are about
@@ -19,15 +20,21 @@ leaves the counter where it is.
     ./build-all --keep           # leave both build trees for a look
 
 The deb goes first because it takes seconds: anything wrong with the checkout
-surfaces there rather than twenty minutes into compiling mpv.
+surfaces there rather than twenty minutes into compiling mpv. The APK is
+skipped, with a line saying so, on a machine with no Android SDK - it is the
+one package that needs a toolchain the others don't, and not having it should
+not stop a release of the two that were always there.
+
+    ./build-all --no-apk         # skip it even where it would have worked
 
 Use --fresh when cutting a release. The yt-dlp in build/yt-dlp.cache is reused
 between builds, which is what you want while working and not what you want in
 something you hand out - YouTube retires extractors within months, and a
 package is only as current as the copy frozen into it.
 
-Needs whatever the two builds need: dpkg-deb for one, flatpak and
-flatpak-builder for the other. Each says so itself if it's missing.
+Needs whatever the builds need: dpkg-deb for one, flatpak and flatpak-builder
+for another, a JDK and an Android SDK for the third. Each says so itself if
+it's missing.
 """
 
 import importlib.machinery, importlib.util, os, subprocess, sys, time
@@ -86,9 +93,20 @@ def main():
     if "--install" in args:
         flatpak_args.append("--install")
 
-    print("building simplmusik %s - both packages" % version)
+    # The APK needs an SDK the other two don't, so whether it is being built
+    # is settled - and said - before anything starts, rather than surfacing as
+    # a failure at the end of a long run.
+    apk = "--no-apk" not in args and have_sdk()
+    print("building simplmusik %s - %s" % (version, "all three packages" if apk
+                                           else "the deb and the flatpak"))
+    if not apk and "--no-apk" not in args:
+        print("  (no Android SDK found, so no APK - set ANDROID_HOME to get one)")
     took = run("build-deb", deb_args, "the Debian package")
     took += run("build-flatpak", flatpak_args, "the flatpak")
+    if apk:
+        # Only the version: --keep is about build trees the other two leave
+        # behind, and Gradle keeps its own either way.
+        took += run("build-apk", ["--version", version], "the Android package")
 
     # Both packages are built, so this number is spent: tick it over so the
     # next build is a new version rather than a second copy of this one. A
@@ -98,10 +116,19 @@ def main():
 
     print("\n=== done in %s ===\n" % human(took))
     for name in ("simplmusik_%s_all.deb" % version,
-                 "simplmusik_%s.flatpak" % version):
+                 "simplmusik_%s.flatpak" % version,
+                 "simplmusik_%s.apk" % version):
         p = os.path.join(BUILD, name)
         if os.path.isfile(p):
             print("  build/%-32s %6.1f MB" % (name, os.path.getsize(p) / 1e6))
+
+
+def have_sdk():
+    """Whether there is an Android SDK to build the APK with."""
+    return any(os.path.isdir(d) for d in
+               [os.environ.get("ANDROID_HOME") or "",
+                os.environ.get("ANDROID_SDK_ROOT") or "",
+                os.path.expanduser("~/Android/Sdk")])
 
 
 def human(seconds):

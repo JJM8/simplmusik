@@ -5,23 +5,32 @@ Your library is the one music folder you choose, walked all the way down:
 a subfolder isn't a level you browse, it's just where a file happens to sit.
 Playlists are small JSON files in .simplmusik/playlists inside that folder -
 so syncing it between machines takes your playlists with it - naming a song by
-its filename and where it was last seen:
+its filename and the subfolder it was last seen in:
 
-    {"name": "Road trip", "created": 1730000000, "played": 1730500000,
-     "order": "newest",
-     "songs": [{"file": "Killer Queen - Queen.mp3", "dir": "/home/me/Music"}]}
+    {"name": "Road trip", "created": 1730000000, "order": "newest",
+     "songs": [{"file": "Killer Queen - Queen.mp3", "dir": "rock"}]}
 
-The filename is the identity everywhere; `dir` is only a shortcut. A song that
-has moved is looked for again under your music folder once and the list rewritten
-with where it turned up. One that is nowhere keeps its place, marked not found
-- a drive you haven't plugged in yet is no reason to edit your playlist.
+The filename is the identity everywhere; `dir` is only a shortcut, and it is
+relative to your music folder ("" is the folder itself), so it names the same
+place on every machine the folder is synced to. A song that has moved is looked
+for again under your music folder once and the list rewritten with where it
+turned up. One that is nowhere keeps its place, marked not found - a drive you
+haven't plugged in yet is no reason to edit your playlist.
+
+A playlist file is written when its list changes and at no other time - not
+because it was read, and not because it was played. That is what lets a sync
+tool like Syncthing carry it between machines: a file only one machine is
+editing is a file it simply copies. Should two edit the same list before either
+has seen the other's change, Syncthing keeps the newer and sets the older aside
+as a conflict copy, and the copy is deleted - the newest edit wins.
 
 Everything reads newest first. Songs go by the file's own timestamp - when it
 turned up in your folder - and a playlist's songs go by the order they are
 written in, which is why adding one puts it at the top: the list is stored the
-way it is read. `created` and `played` are what the sidebar sorts playlists by
-(last played, or the day you made it); `order` says the list has been put
-newest-first, and is what stops an older one being turned round twice.
+way it is read. Playlists go by when you last played one, which the play logs
+already say, or else by `created`, the day you made it; `order` says the list
+has been put newest-first, and is what stops an older one being turned round
+twice.
 
 Commands:
   status                     library + playback summary
@@ -157,11 +166,17 @@ WAS_PLAYS = os.path.expanduser("~/.local/state/simplmusik-plays.jsonl")
 DLDIR = os.path.expanduser("~/.local/state/simplmusik-downloads")
 RESOLVED = os.path.expanduser("~/.local/state/simplmusik-resolved")
 SHOWN = os.path.expanduser("~/.local/state/simplmusik-shown.json")
+# This machine's own name for itself, and the playlist it last put on - both
+# this machine's business and no part of the library, so neither travels with
+# the music folder. See `device` and `mark_played`.
+DEVICE = os.path.expanduser("~/.local/state/simplmusik-device")
+PLAYED = os.path.expanduser("~/.local/state/simplmusik-played.json")
 CACHE = os.path.expanduser("~/.cache/simplmusik.json")
 NULL = subprocess.DEVNULL
 
 CONF_DOT = ".simplmusik"            # the hidden folder playlists sit in
-PLAYS_NAME = "plays.jsonl"          # ...and the log of what you played, beside them
+PLAYS_NAME = "plays-%s.jsonl"       # ...and each machine's log of what you played
+CONFLICT = ".sync-conflict-"        # how Syncthing marks a copy it set aside
 
 # The library, named. It is not a playlist and has no file - it is every song
 # in your music folder, which is not a list anybody made - but it is the list
@@ -186,6 +201,35 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
 YTDLP_USER = os.path.expanduser("~/.local/share/simplmusik/yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+
+# ------------------------------------------------------------------ detaching
+# Three things here are started and then not waited for: the player, the
+# download that runs behind a stream, and the promotion that follows it. On a
+# desktop each is another copy of this file run as its own process, which is
+# what lets them outlive the command that started them.
+#
+# Android has no second process to start. The interpreter is embedded in the
+# app, there is no `sys.executable` to re-run, and the app itself is what
+# outlives the command - so there they are threads in this one process. Which
+# it is, is asked once here and nowhere else: `detach` takes the argv `main`
+# would have been given, and every caller is written the same way for both.
+EMBEDDED = bool(os.environ.get("SIMPLMUSIK_EMBEDDED")) or not sys.executable
+
+class PlayerDone(Exception):
+    """How the player stops when stopping the process is not an option.
+
+    A process player ends by exiting, from whichever thread noticed first.
+    Embedded there is no process to end - so the same call unwinds the thread
+    instead, and this is what it throws to do it."""
+
+def detach(*argv):
+    """Start one of the internal commands, and stop caring what becomes of it."""
+    argv = [str(a) for a in argv]
+    if EMBEDDED:
+        threading.Thread(target=main, args=(argv,), daemon=True).start()
+        return
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv,
+                     start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
 
 # --------------------------------------------------------------- the player
 # There is one player, and this is what makes it one.
@@ -229,9 +273,12 @@ def load_json(path, default):
 
 def save_json(path, obj, indent=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".tmp", "w") as f:
+    # A temporary name of this writer's own: the server answers on threads, and
+    # two writing one shared name at once could interleave into one bad file.
+    tmp = "%s.%d-%d.tmp" % (path, os.getpid(), threading.get_ident())
+    with open(tmp, "w") as f:
         json.dump(obj, f, indent=indent)
-    os.replace(path + ".tmp", path)    # atomic: no reader sees a half file
+    os.replace(tmp, path)    # atomic: no reader sees a half file
 
 # The lock is held by keeping its file open, so the descriptor has to outlive
 # the call that took it - hence a global. Closing it is the one way to let
@@ -254,6 +301,42 @@ def hold_lock():
     _LOCK_FD.append(fd)
     return True
 
+def drop_lock():
+    """Let the lock go without dying to do it.
+
+    A process player has never needed this: exiting drops the lock, and
+    exiting is what stopping meant. Embedded, the process carries on, so the
+    lock has to be handed back deliberately or the next `play` would be told
+    there is already a player - which there would be, on paper, for as long as
+    the app stayed open."""
+    while _LOCK_FD:
+        try:
+            os.close(_LOCK_FD.pop())
+        except OSError:
+            pass
+
+def dial(path, timeout):
+    """A connection to one of our own sockets, or None if nothing is there.
+
+    The close on the way out is the whole reason this exists. A socket that
+    failed to connect is still a file descriptor, and "is anything playing?"
+    is a question the window asks twice a second - so a refused connection
+    left to the garbage collector was a couple of descriptors a second, and an
+    app that ran out of them within the hour and stopped answering at all.
+
+    A desktop never saw it. Every command used to be its own process, and a
+    process takes its leaks with it when it exits; the window only became
+    somewhere a leak could accumulate when the commands moved inside it."""
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        if timeout is not None:     # None is "wait as long as it takes", which
+            s.settimeout(timeout)   # is what waiting for mpv to appear wants
+        s.connect(path)
+        return s
+    except OSError:
+        s.close()
+        return None
+
 def ask(req, timeout=2.0):
     """Put a question or an order to the player, and wait for its answer.
 
@@ -263,11 +346,8 @@ def ask(req, timeout=2.0):
     the point: this is the only test of whether anything is playing, and it
     works the same from a package or from a checkout, because a socket is a
     file and we are all looking at the same disk."""
-    try:
-        s = socket.socket(socket.AF_UNIX)
-        s.settimeout(timeout)
-        s.connect(SOCK)
-    except OSError:
+    s = dial(SOCK, timeout)
+    if s is None:
         return None
     try:
         s.sendall(json.dumps(req).encode() + b"\n")
@@ -425,12 +505,19 @@ def xdg_music():
 def default_folder():
     """The music folder for somebody who has never chosen one.
 
-    The desktop's own answer comes first, because a folder that already holds
-    your music is a better default than a name we made up - and the best
+    Somewhere without a desktop to ask - Android, where the music lives at a
+    path the app is handed rather than one it can work out - says so outright,
+    and that is the end of it.
+
+    Otherwise the desktop's own answer comes first, because a folder that
+    already holds your music is a better default than a name we made up - and the best
     folder picker is the one nobody ever has to open. It gives way to ~/Music
     in one case: simplmusik already living there, which is somebody upgrading,
     and moving a library out from under them is not a default's job. Where
     neither folder is on the disk yet, ~/Music is the name to make."""
+    told = os.environ.get("SIMPLMUSIK_FOLDER")
+    if told:
+        return os.path.abspath(os.path.expanduser(told))
     home = os.path.expanduser("~/Music")
     xdg = xdg_music()
     if not xdg or xdg == home or os.path.isdir(os.path.join(home, CONF_DOT)):
@@ -526,17 +613,69 @@ def cache_dir():
     that can be interrupted halfway."""
     return os.path.join(folder(), CONF_DOT, "cache")
 
+_device = None
+
+def device():
+    """This machine's own name for itself, made up the first time it is asked
+    and kept in its state folder - which is this machine's, and no part of any
+    library a sync would carry. It names this machine's play log.
+
+    Random rather than the hostname: a phone calls itself `localhost`, and two
+    of anything can share a name. Kept once asked, so a state folder that can't
+    be written to costs a log per run rather than a log per song."""
+    global _device
+    if _device:
+        return _device
+    try:
+        with open(DEVICE) as f:
+            got = f.read().strip()
+        if re.fullmatch(r"[0-9a-f]{8}", got):
+            _device = got
+            return got
+    except OSError:
+        pass
+    _device = os.urandom(4).hex()
+    try:
+        os.makedirs(os.path.dirname(DEVICE), exist_ok=True)
+        with open(DEVICE + ".tmp", "w") as f:
+            f.write(_device + "\n")
+        os.replace(DEVICE + ".tmp", DEVICE)
+    except OSError:
+        pass                    # this run still has a name; the next makes another
+    return _device
+
 def plays_path():
-    """Every song you have played, kept with the library rather than with this
-    machine. It is a record *of* your library - what you played and what you
-    skipped - so a folder synced between two machines should carry it along
-    the way it carries the playlists, rather than leaving each machine with
-    half a history and neither with the whole of one.
+    """Every song this machine has played, kept with the library rather than
+    with this machine. It is a record *of* your library - what you played and
+    what you skipped - so a folder synced between two machines should carry it
+    along the way it carries the playlists, rather than leaving each machine
+    with half a history and neither with the whole of one.
+
+    One per machine, named by `device`, and only ever written by that machine.
+    A sync tool copies whole files: two machines appending to one shared log
+    are two machines editing the same file, which Syncthing can only settle by
+    setting one of the two aside - and that machine's evenings with it.
+    Machines that each write their own never meet, and `read_plays` reads them
+    all.
 
     Hidden, beside the playlists, so `index` walks past it: a log is never a
     song. It is not in the cache folder next door because nothing regenerates
     it - lose it and those evenings are simply gone."""
-    return os.path.join(folder(), CONF_DOT, PLAYS_NAME)
+    return os.path.join(folder(), CONF_DOT, PLAYS_NAME % device())
+
+def plays_files():
+    """Every play log in the library: each machine's own, the one they all
+    shared before each had its own, and any copy of either a sync set aside.
+    None of them is merged into another - `read_plays` sorts lines by when
+    they happened and drops any it has already seen, so which file a line sits
+    in makes no difference to anything."""
+    d = os.path.join(folder(), CONF_DOT)
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    return [os.path.join(d, n) for n in names
+            if n.startswith("plays") and n.endswith(".jsonl")]
 
 def remote(path):
     """Whether this is something mpv fetches rather than a file on disk.
@@ -614,9 +753,9 @@ def drain_plays():
     except OSError:
         pass                        # it stays where it is, and is tried again
 
-def rehome(was, log):
-    """Follow the music folder. The playlists and the record of what you have
-    played both live inside it, so choosing a different one has to take them
+def rehome(was, logs):
+    """Follow the music folder. The playlists and the records of what you have
+    played all live inside it, so choosing a different one has to take them
     along - otherwise they are left behind in a folder nothing looks at any
     more, out of sight.
 
@@ -624,13 +763,31 @@ def rehome(was, log):
     on their way into the folder they were asked for, which is the one being
     left; there is nothing in it that the new folder is missing."""
     lift(was, playlists_dir())
-    lift(log, plays_path())
+    here = os.path.join(folder(), CONF_DOT)
+    for log in logs:
+        lift(log, os.path.join(here, os.path.basename(log)))
 
 def stems():
-    """Every playlist file, by name. One place decides what counts as one."""
+    """Every playlist file, by name. One place decides what counts as one.
+
+    A copy Syncthing set aside is not one. When two machines both change a
+    playlist before either has seen the other's change, Syncthing keeps the
+    newer as the playlist and renames the older to NAME.sync-conflict-...json
+    beside it - which, left there, is a second playlist with the same name.
+    The newer edit is the one to keep, so the copy is deleted on sight, and the
+    delete syncs out to the other machines like any other change. A cover
+    picture's copy goes the same way: nothing names it."""
     d = playlists_dir()
-    return [f for f in (sorted(os.listdir(d)) if os.path.isdir(d) else [])
-            if f.endswith(".json")]
+    out = []
+    for f in (sorted(os.listdir(d)) if os.path.isdir(d) else []):
+        if CONFLICT in f:
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass            # read-only, or gone already: still not a playlist
+        elif f.endswith(".json"):
+            out.append(f)
+    return out
 
 def playlist_file(stem):
     return os.path.join(playlists_dir(), stem + ".json")
@@ -639,21 +796,51 @@ def meta(stem):
     return load_json(playlist_file(stem), {})
 
 def write_meta(stem, m):
-    os.makedirs(playlists_dir(), exist_ok=True)
-    with open(playlist_file(stem), "w") as f:
-        json.dump(m, f, indent=2)
+    # Whole or not at all. Anything that read a half-written list would see an
+    # empty one - and `songs_of` would write that emptiness back, and a sync
+    # would carry it to every other machine.
+    save_json(playlist_file(stem), m, indent=2)
 
 def entry(e):
-    """One stored song, as (filename, the folder it was last seen in)."""
+    """One stored song, as (filename, the folder it was last seen in). The
+    folder is relative to your music folder, "" being the folder itself - or
+    absolute, in a list written before it was relative - or None when the list
+    doesn't say."""
     if isinstance(e, dict):
-        return os.path.basename(e.get("file") or ""), (e.get("dir") or "")
-    return os.path.basename(e or ""), ""    # older lists stored a bare name
+        d = e.get("dir")
+        return os.path.basename(e.get("file") or ""), (d if isinstance(d, str) else None)
+    return os.path.basename(e or ""), None  # older lists stored a bare name
 
-def store(songs):
-    """Songs on their way back into a playlist file: the name, and where it
-    was found, so looking it up next time is one stat and not a search."""
-    return [{"file": s["file"], "dir": os.path.dirname(s["path"])} if s["path"]
-            else {"file": s["file"]} for s in songs]
+def hint(was, name, root):
+    """Where a stored song ought to be, or "" if the list doesn't say - or if
+    what it says is outside your music folder. A song there is not one of
+    yours, whatever is still on the disk at that address. An absolute `was`
+    is joined as itself, so a list from before `dir` was relative still reads."""
+    if was is None:
+        return ""
+    d = os.path.normpath(os.path.join(root, was))
+    return os.path.join(d, name) if under(d, root) else ""
+
+def store(songs, m=None):
+    """Songs on their way back into a playlist file: the name, and the folder
+    it was found in, so looking it up next time is one stat and not a search.
+
+    The folder is written relative to your music folder, which is what makes
+    it the same answer on every machine the folder is synced to - so a list
+    read on any of them has nothing to correct and nothing to write back. A
+    song not found here keeps whatever `m`, the list as it stands, already said
+    about it: another machine may well have it, and what that machine wrote is
+    where it will look."""
+    root = folder()
+    old = {entry(e)[0]: e for e in (m or {}).get("songs") or [] if isinstance(e, dict)}
+    out = []
+    for s in songs:
+        if s["path"]:
+            d = os.path.relpath(os.path.dirname(s["path"]), root)
+            out.append({"file": s["file"], "dir": "" if d == os.curdir else d})
+        else:
+            out.append(old.get(s["file"]) or {"file": s["file"]})
+    return out
 
 def newest_first(stem, m):
     """Put a playlist's songs newest first, once, and say whether that changed
@@ -696,23 +883,29 @@ def songs_of(stem):
     Duplicates are, though - shuffle's 'not played lately' check reads the
     list and one name twice in it would fool that.
 
+    The file is written back only if that changed what it says. Reading is
+    not editing, and a list rewritten on every read is a list every synced
+    machine is forever editing at once - which is exactly what a sync tool
+    cannot settle.
+
     The list comes back in the order it is written in, which is newest first:
     see `newest_first`."""
     m = meta(stem)
     root, idx, out, seen = folder(), None, [], set()
-    moved = newest_first(stem, m)
+    turned = newest_first(stem, m)
     for e in m.get("songs") or []:
         name, was = entry(e)
         if not name or name in seen:
             continue
         seen.add(name)
-        path = os.path.join(was, name) if was and under(was, root) else ""
+        path = hint(was, name, root)
         if not (path and os.path.isfile(path)):
             idx = index() if idx is None else idx
-            path, moved = idx.get(name), True
+            path = idx.get(name)
         out.append({"file": name, "path": path or None})
-    if moved:
-        m["songs"] = store(out)
+    kept = store(out, m)
+    if turned or kept != (m.get("songs") or []):
+        m["songs"] = kept
         write_meta(stem, m)
     return out
 
@@ -791,33 +984,80 @@ def set_cover(stem, src):
     write_meta(stem, m)
     return dest
 
-def recency(stem, m):
+_last_played = {}
+
+def last_played():
+    """When each playlist was last put on, as {stem: time}.
+
+    Read out of the play logs, which already say which playlist every song
+    was played from. So a playlist file is never written just because it was
+    played, and every machine the library is synced to agrees on the order,
+    because they all read the same logs. A log only gains its line when a song
+    ends, though, so a playlist put on a moment ago is lifted by this machine's
+    own note of it (`mark_played`) until then.
+
+    The logs are only parsed again when one of them has changed: the window
+    asks for this every fifteen seconds, and a year of evenings is a lot to
+    read that often for an answer that moves once a song."""
+    key = []
+    for p in plays_files():
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        key.append((p, st.st_mtime_ns, st.st_size))
+    if _last_played.get("key") != key:
+        at = {}
+        for r in read_plays():
+            pl = r.get("playlist")
+            if isinstance(pl, str) and pl and r["at"] > at.get(pl, 0.0):
+                at[pl] = r["at"]
+        _last_played.update(key=key, at=at)
+    out = dict(_last_played["at"])
+    noted = load_json(PLAYED, {})
+    for stem, t in (noted.items() if isinstance(noted, dict) else ()):
+        if isinstance(t, (int, float)) and t > out.get(stem, 0.0):
+            out[stem] = float(t)
+    return out
+
+def recency(stem, m, last):
     """Where a playlist stands in the order: when you last put it on, or - if
-    you never have - when you made it.
+    you never have - when you made it. `last` is `last_played`, asked once for
+    all the playlists rather than once for each.
 
     Two dates rather than one because a playlist you have never played still
     has to sit somewhere, and the day you made it is what you know about it;
     so a new playlist opens at the top and drifts down as others are played,
     rather than starting at the bottom of a list you made it to be at the top
-    of. One kept somewhere this app has never written to has neither date, and
-    the file's own timestamp stands in for both."""
-    for k in ("played", "created"):
-        v = m.get(k)
-        if isinstance(v, (int, float)) and v > 0:
-            return float(v)
+    of. A list from when the file itself kept the day it was last played
+    still has that day in it, and it counts. One kept somewhere this app has
+    never written to has no date at all, and the file's own timestamp stands
+    in."""
+    at = [v for v in (last.get(stem), m.get("played"), m.get("created"))
+          if isinstance(v, (int, float)) and v > 0]
+    if at:
+        return float(max(at))
     try:
         return os.path.getmtime(playlist_file(stem))
     except OSError:
         return 0.0
 
 def mark_played(stem):
-    """Remember that this is the playlist you just put on - which is what
-    lifts it to the top of the sidebar. Written when playback starts and not
-    again as it runs: it is 'the last one you chose', not 'the one that has
-    been sounding longest'."""
-    m = meta(stem)
-    m["played"] = round(time.time(), 3)
-    write_meta(stem, m)
+    """Note that this is the playlist you just put on - which lifts it to the
+    top of the sidebar at once, rather than when its first song ends and the
+    log gets its line. Written when playback starts and not again as it runs:
+    it is 'the last one you chose', not 'the one that has been sounding
+    longest'.
+
+    Kept in this machine's state folder and never in the playlist. Pressing
+    play is not an edit, and a playlist written by every machine that plays it
+    is one that two machines are forever editing at once. The other machines
+    hear about it from the play log instead."""
+    noted = load_json(PLAYED, {})
+    if not isinstance(noted, dict):
+        noted = {}
+    noted[stem] = round(time.time(), 3)
+    save_json(PLAYED, noted)
 
 def playlists():
     """Every playlist, most recently played first - the order the sidebar, the
@@ -826,14 +1066,14 @@ def playlists():
 
     `songs_of` comes first because it settles the file, dates included, and
     `recency` has to read what it settled rather than what was there before."""
-    out = []
+    out, last = [], last_played()
     for f in stems():
         stem = f[:-5]
         songs = songs_of(stem)
         m = meta(stem)
         out.append({"file": stem, "name": m.get("name") or stem,
                     "cover": cover_path(stem), "songs": songs,
-                    "recent": recency(stem, m)})
+                    "recent": recency(stem, m, last)})
     out.sort(key=lambda p: (-p["recent"], p["name"].lower()))
     return out
 
@@ -906,11 +1146,38 @@ def migrate():
         if lift(old, now):
             break                   # the first one they were at is the one
 
+# A command normally prints, and whoever ran it reads its output. But the
+# window wants the object rather than the sentence, and on Android there is no
+# second process to spawn and read - so `emit` looks for a sink first. When one
+# is set, what would have been printed is put there instead and nothing reaches
+# stdout; `run_command` below is what sets one. Thread-local, because the
+# server answers on threads and two commands running at once must not land in
+# each other's answer.
+_sink = threading.local()
+
 def emit(as_json, obj, text):
+    said = getattr(_sink, "at", None)
+    if said is not None:
+        said.append(obj if as_json else text)
+        return
     if as_json:
         print(json.dumps(obj, indent=2))
     elif text:
         print(text)
+
+class Parser(argparse.ArgumentParser):
+    """argparse, with its complaining made quiet when no terminal is reading.
+
+    Bad arguments print usage and exit, which is right at a prompt and wrong
+    anywhere else: a server has no terminal to print to, and its caller wants
+    the complaint as the answer rather than in a log. So with a sink set the
+    complaint becomes the answer, the way every other failure here already
+    does, and nothing is printed at all."""
+
+    def error(self, message):
+        if getattr(_sink, "at", None) is not None:
+            raise SystemExit(fail(True, message, 2))
+        super().error(message)
 
 def parse_time(s):
     """A position in a song: seconds (83), clock time (1:23, 1:02:03), or a
@@ -1063,11 +1330,8 @@ def mpv_line(cmd, timeout=0.3):
     can ask what is playing without going anywhere near the player process.
     None if there is no mpv, or it doesn't answer promptly - either way, the
     caller's answer is that it doesn't know."""
-    try:
-        s = socket.socket(socket.AF_UNIX)
-        s.settimeout(timeout)
-        s.connect(MPVSOCK)
-    except OSError:
+    s = dial(MPVSOCK, timeout)
+    if s is None:
         return None
     try:
         s.sendall(json.dumps({"command": cmd, "request_id": 1}).encode() + b"\n")
@@ -1104,11 +1368,8 @@ def mpv_props(*names, timeout=0.3):
     Missing ones are simply absent: mpv with nothing loaded answers `duration`
     with an error, which is not a failure worth reporting anywhere."""
     out = {}
-    try:
-        s = socket.socket(socket.AF_UNIX)
-        s.settimeout(timeout)
-        s.connect(MPVSOCK)
-    except OSError:
+    s = dial(MPVSOCK, timeout)
+    if s is None:
         return out
     try:
         for i, name in enumerate(names):
@@ -1144,6 +1405,24 @@ def volume_filter(db):
     a song that needs no moving is not run through a filter that does none."""
     return "volume=%.1fdB" % db if db else ""
 
+# What plays the songs. mpv unless something has put another one here, which
+# is what Android does at start-up: an app has no mpv binary to drive, so what
+# plays there is the platform's own decoder wearing these same six calls. The
+# player loop below is written against the calls and never asks which it got.
+BACKEND = None
+
+def new_backend():
+    return BACKEND() if BACKEND else Mpv()
+
+def have_player():
+    """Whether there is anything here that can play a song.
+
+    On a desktop that is the mpv binary, and saying so before a queue is built
+    is what turns "nothing happened" into a sentence you can act on. Where a
+    backend has been installed the question is already answered - it *is* the
+    player, and there is no binary to look for."""
+    return bool(BACKEND) or bool(shutil.which("mpv"))
+
 class Mpv:
     """The mpv this player is driving.
 
@@ -1164,13 +1443,11 @@ class Mpv:
         self.buf, self.n, self.dead = b"", 0, False
         self.sock = None
         for _ in range(100):    # the socket appears a moment after mpv does
-            try:
-                s = socket.socket(socket.AF_UNIX)
-                s.connect(MPVSOCK)
+            s = dial(MPVSOCK, None)
+            if s is not None:
                 self.sock = s
                 return
-            except OSError:
-                time.sleep(0.05)
+            time.sleep(0.05)
         self.dead = True
 
     def send(self, *cmd):
@@ -1281,10 +1558,10 @@ class Mpv:
 # could deadlock instead. A line that fails to be written is lost and nothing
 # else is: the log is a record, and playback never waits on it.
 #
-# It lives in the music folder, hidden beside the playlists - see `plays_path`.
-# Appending suits that too: two machines syncing a folder between them are
-# each adding lines to the end of one file rather than rewriting it, which is
-# the shape a sync has the best chance of reconciling.
+# It lives in the music folder, hidden beside the playlists, and each machine
+# keeps its own - see `plays_path`. A sync tool copies whole files, so two
+# machines adding lines to one shared log would be two machines editing one
+# file at once, which it can only settle by setting one of them aside.
 
 # How the span ended. `eof` is mpv's own word for a song played out; the rest
 # are ours, because mpv only ever says "stop" and cannot know who asked.
@@ -1448,22 +1725,25 @@ def num(v):
     return v if v == v and v not in (float("inf"), float("-inf")) else None
 
 def read_plays(path=None, since=None):
-    """Every span, oldest first, with the damage stepped over.
+    """Every span, oldest first, with the damage stepped over. Every log the
+    library holds is read - each machine's, see `plays_files` - unless `path`
+    names just the one.
 
     Sorted rather than taken as it comes: one player appends in the order it
-    played, but two machines syncing one folder interleave, and anything that
-    reads a sequence out of this - an evening, a run of skips - would read a
-    shuffled one otherwise.
+    played, but each machine syncing the folder keeps its own log, and anything
+    that reads a sequence out of this - an evening, a run of skips - would read
+    them one machine after another otherwise.
 
     Deduplicated on the moment and the song, which together name a span: a
     sync that resolves a conflict by keeping both copies would otherwise have
     you listening to the same evening twice."""
-    try:
-        with open(path or plays_path(), "r", encoding="utf-8",
-                  errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return []                   # no log yet is not an error, it is Tuesday
+    lines = []
+    for p in [path] if path else plays_files():
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                lines += f.readlines()
+        except OSError:
+            continue                # no log yet is not an error, it is Tuesday
     rows, seen = [], set()
     for line in lines:
         line = line.strip()
@@ -2128,6 +2408,17 @@ def serve_control(job, want, guard, wake_w, finish):
     return srv
 
 def player(job):
+    """Own playback until there is none left to own.
+
+    Wrapped so that the throw `finish` ends with is where the player stops,
+    and not something the thread running it reports as a crash. A process
+    player never reaches the end of this: it has exited inside `finish`."""
+    try:
+        return _player(job)
+    except PlayerDone as e:
+        return e.args[0] if e.args else 0
+
+def _player(job):
     """The detached process that owns playback: play one song, record it,
     repeat. It owns the mpv too - one, for the whole session - so the loop is
     "hand mpv a song, wait for it to end" rather than a player per song.
@@ -2167,22 +2458,37 @@ def player(job):
     # playing still has a line to be written about it.
     live = {}
 
+    done = threading.Event()
+
     def finish(code=0):
-        """Stop being the player, and stop being a process. The lock goes when
-        this exits, which is the only thing that has to happen and the one
-        thing we cannot forget to do."""
-        # The song that was playing when you stopped is still a song you
-        # heard, and this is the last moment anything knows about it. Reached
-        # from a signal and from the socket thread as well as from the loop,
-        # so it is written with one `write` and no lock: see `log_play`.
-        close_span(live, "stop")
-        if mpv:
-            mpv.kill()
-        for path in [SOCK, MPVSOCK] + LEGACY:
-            try:
-                os.remove(path)     # ours to remove: we hold the lock
-            except OSError:
-                pass
+        """Stop being the player. On a desktop that means stopping being a
+        process too, and the lock goes when this exits - which is the only
+        thing that has to happen and the one thing we cannot forget to do.
+
+        Embedded there is no process to stop: the tearing-down is the whole of
+        it, and the lock is dropped by `kill` rather than by dying. Which is
+        why the body is guarded - reached from the socket thread and then from
+        the loop as it unwinds, it would otherwise be run twice - and why it
+        ends by throwing: unwinding the caller is what taking the player away
+        looks like when the caller is a thread."""
+        if not done.is_set():
+            done.set()
+            # The song that was playing when you stopped is still a song you
+            # heard, and this is the last moment anything knows about it.
+            # Reached from a signal and from the socket thread as well as from
+            # the loop, so it is written with one `write` and no lock: see
+            # `log_play`.
+            close_span(live, "stop")
+            if mpv:
+                mpv.kill()
+            for path in [SOCK, MPVSOCK] + LEGACY:
+                try:
+                    os.remove(path)     # ours to remove: we hold the lock
+                except OSError:
+                    pass
+            drop_lock()
+        if EMBEDDED:
+            raise PlayerDone(code)
         os._exit(code)
 
     # Counted before anything can ask, because the session starts here: the
@@ -2193,10 +2499,18 @@ def player(job):
     serve_control(job, want, guard, wake_w, finish)
     # Killed rather than asked - the sandbox torn down around us, or a plain
     # `kill` - and there is no loop left to hand it to.
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_a: finish())
+    #
+    # A process only. Signals are delivered to a process and may only be asked
+    # for from its main thread, and an embedded player is neither: it is a
+    # thread inside an app whose death it does not outlive and cannot usefully
+    # catch. Asking anyway raises, which killed the player here the moment it
+    # started - it had already told `play` it was running, so the song simply
+    # never began and nothing said why.
+    if not EMBEDDED:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_a: finish())
 
-    mpv = Mpv()
+    mpv = new_backend()
 
     def drain():
         """Carry out what the socket thread asked for. Everything here is a
@@ -2366,8 +2680,7 @@ def start_playing(job):
     # delete, each other's.
     handover = "%s.%d" % (JOB, os.getpid())
     save_json(handover, job)
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_player", handover],
-                     start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+    detach("_player", handover)
     for _ in range(60):         # up to 3s for it to be answering for itself
         if playing(0.2):
             return True
@@ -2649,7 +2962,7 @@ def join(stem, name, path):
     if any(p["file"] == name for p in songs):
         return False
     m = meta(stem)
-    m["songs"] = store([{"file": name, "path": path}] + songs)
+    m["songs"] = store([{"file": name, "path": path}] + songs, m)
     write_meta(stem, m)
     return True
 
@@ -2833,8 +3146,9 @@ def cmd_stats(args):
     rows = read_plays(since=since)
     if not rows:
         return fail(args.json, "nothing played yet%s - the log fills up as you "
-                    "listen, and lives at %s"
-                    % (" in that window" if since else "", plays_path()), 2)
+                    "listen, and lives in %s"
+                    % (" in that window" if since else "",
+                       os.path.dirname(plays_path())), 2)
     s = stats(rows)
     by = (args.by or "time").lower()
     if by not in ORDERS:
@@ -2887,9 +3201,9 @@ def cmd_folder(args):
         # it is simply nothing to do.
         return emit(args.json, {"folder": dir_, "changed": False},
                     "already your music folder: " + path) or 0
-    was, log = playlists_dir(), plays_path()   # before the change, so the
-    set_folder(path)                          # move has somewhere to follow
-    rehome(was, log)            # both live in the folder, so both go with it
+    was, logs = playlists_dir(), plays_files()  # before the change, so the
+    set_folder(path)                           # move has somewhere to follow
+    rehome(was, logs)           # all live in the folder, so all go with it
     return emit(args.json, {"folder": path, "changed": True},
                 "music folder is now " + path) or 0
 
@@ -3133,7 +3447,7 @@ def cmd_add(args):
     # library is only the import - there is no list to write.
     if not to_library and fresh:
         m = meta(stem)
-        m["songs"] = store(fresh + songs)
+        m["songs"] = store(fresh + songs, m)
         write_meta(stem, m)
     where = LIBRARY_NAME if to_library else stem
     text = "\n".join(t for t in ("added %d song(s) to %s" % (len(added), where) if added else "",
@@ -3200,7 +3514,7 @@ def cmd_remove(args):
     if not any(p["file"] == song for p in songs):
         return fail(args.json, "no song '%s' in '%s'" % (song, stem), 2)
     m = meta(stem)
-    m["songs"] = store([p for p in songs if p["file"] != song])
+    m["songs"] = store([p for p in songs if p["file"] != song], m)
     write_meta(stem, m)
     return emit(args.json, {"removed": song, "playlist": stem},
                 "removed %s from %s (the file stays in your library)" % (song, stem)) or 0
@@ -3312,7 +3626,7 @@ def cmd_play(args):
                         "'%s' isn't in your music folder" % start
                         if any(p["file"] == start for p in listed)
                         else "no song '%s' in %s" % (start, where), 2)
-    if not shutil.which("mpv"):
+    if not have_player():
         return fail(args.json, "mpv not found - install mpv", 1)
 
     # `songs` is the pool, `order` is only what has actually been played, so
@@ -3466,6 +3780,133 @@ def search_youtube(args, query):
                      for s in out)
     return emit(args.json, out, text) or 0
 
+# ------------------------------------------------------------ naming a TikTok
+# A TikTok knows what song it is playing, much of the time, and says so on its
+# own page: the sound you tap at the bottom of the video, with a title and an
+# artist. `identify` reads that and answers with a name to search for, and
+# nothing more. Finding the song is then an ordinary `search --yt`, which is
+# why the window puts the name in its search box and lets the search it
+# already has take it from there.
+#
+# The page is fetched with urllib rather than through yt-dlp. yt-dlp's TikTok
+# extractor insists on impersonating a browser, which needs curl_cffi, which is
+# native code that is not on a phone - and without it TikTok hands the
+# extractor a 536-byte stub. Asked plainly, TikTok answers with the whole page,
+# and everything the page is drawn from sits in one script tag inside it.
+#
+# A sound marked `original` is the creator's own recording and names nothing:
+# "original sound - somebody". Plenty of those are really a song, though, and
+# TikTok knows which, because it links the sound to that song on Apple Music
+# or Spotify. Either link turns back into a name through the service's own
+# public pages, with no account and no key.
+
+TIKTOK_LINK = re.compile(r"https?://(?:[\w-]+\.)*tiktok\.com/\S+", re.I)
+BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
+
+def tiktok_link(s):
+    """The TikTok link in what was pasted or shared. A share sheet sends a
+    line of text with the link somewhere in it, not the link on its own."""
+    m = TIKTOK_LINK.search(s or "")
+    return m.group(0).rstrip(".,;:!?)\"'") if m else None
+
+def web_page(url, timeout=15):
+    import urllib.request                # only naming a TikTok needs it
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+def page_json(page, script_id):
+    """The JSON in a page's `<script id=...>`, or None."""
+    m = re.search(r'<script[^>]+id="%s"[^>]*>(.*?)</script>' % script_id, page, re.S)
+    try:
+        return json.loads(m.group(1)) if m else None
+    except ValueError:
+        return None
+
+def dig(obj, *keys):
+    """obj[k1][k2]..., or None as soon as a step isn't there."""
+    for k in keys:
+        obj = obj.get(k) if isinstance(obj, dict) else None
+    return obj
+
+def lead_artist(names):
+    """The first name in a credit like `HUNTR/X & EJAE & REI AMI`. It is what
+    a search wants: the rest are as likely to lead it astray as not."""
+    return re.split(r", | & ", (names or "").strip())[0]
+
+def dsp_song(info):
+    """(artist, title) for a TikTok sound's link to a streaming service.
+
+    Platform 1 is Apple Music and 3 is Spotify, in TikTok's numbering. Apple
+    has a lookup for exactly this. Spotify's own track page is drawn in the
+    browser and has nothing in it to read, but its embeddable player is
+    rendered on the server with the track inside."""
+    import urllib.parse
+    sid = urllib.parse.quote(str(info.get("SongId") or ""))
+    if not sid:
+        return None
+    if info.get("Platform") == 1:
+        d = json.loads(web_page("https://itunes.apple.com/lookup?id=" + sid))
+        for r in d.get("results") or []:
+            if r.get("trackName"):
+                return lead_artist(r.get("artistName")), r["trackName"]
+    elif info.get("Platform") == 3:
+        t = dig(page_json(web_page("https://open.spotify.com/embed/track/" + sid),
+                          "__NEXT_DATA__"),
+                "props", "pageProps", "state", "data", "entity") or {}
+        artists = [a.get("name") for a in t.get("artists") or [] if isinstance(a, dict)]
+        if t.get("name"):
+            return (artists[0] if artists else ""), t["name"]
+    return None
+
+def tiktok_song(link):
+    """The song a TikTok is playing, as (song, None), or (None, why not).
+
+    Raises when TikTok can't be reached at all, which is a different answer
+    from a video with no song in it and is reported as one."""
+    detail = dig(page_json(web_page(link), "__UNIVERSAL_DATA_FOR_REHYDRATION__"),
+                 "__DEFAULT_SCOPE__", "webapp.video-detail")
+    if not detail:
+        # Where a short link to a deleted video ends up: TikTok's front page.
+        return None, "that link doesn't lead to a TikTok video"
+    if detail.get("statusCode"):
+        return None, "TikTok has no video at that link - it's deleted, or private"
+    music = dig(detail, "itemInfo", "itemStruct", "music") or {}
+    found = None
+    if music.get("title") and not music.get("original"):
+        found = lead_artist(music.get("authorName")), music["title"].strip(), "tiktok"
+    for info in (dig(music, "tt2dsp", "tt_to_dsp_song_infos") or []) if not found else []:
+        try:
+            got = dsp_song(info)
+        except Exception:               # one service down is no reason to skip
+            got = None                  # asking the other
+        if got and got[1]:
+            found = got + ({1: "apple music", 3: "spotify"}[info["Platform"]],)
+            break
+    if not found:
+        return None, ("that TikTok's sound is its own, and TikTok doesn't know "
+                      "of a song in it")
+    artist, title, via = found
+    return {"song": " - ".join(p for p in (artist, title) if p),
+            "artist": artist, "title": title, "via": via, "link": link}, None
+
+def cmd_identify(args):
+    """Name the song in a TikTok, as something to search for.
+
+    Exit 2 is 'no song', the way it is 'nothing found' for `search`; 1 is
+    that the question couldn't be asked - no link, or no network."""
+    link = tiktok_link(" ".join(args.link))
+    if not link:
+        return fail(args.json, "that isn't a TikTok link", 1)
+    try:
+        song, why = tiktok_song(link)
+    except Exception as e:              # urllib raises a wide family of these
+        return fail(args.json, "couldn't reach TikTok: %s" % e, 1)
+    if not song:
+        return fail(args.json, why, 2)
+    return emit(args.json, song, song["song"]) or 0
+
 # A download is the one command that takes minutes, so it says how far along
 # it is while it runs. Each download process writes its own small file named
 # after the video, which the UI reads and the process removes when it's done:
@@ -3571,27 +4012,60 @@ def dl_held(vid):
     finally:
         os.close(fd)
 
+def can_transcode():
+    """Whether there is an ffmpeg here to make an mp3 with.
+
+    Everything ffmpeg does for a download is done *after* the download: turn
+    what YouTube sent into an mp3, write the tags, put the thumbnail in. The
+    fetching itself never needed it. So its absence is a question of what a
+    downloaded song ends up being, and not of whether one can be had at all -
+    which is the difference between an Android build that can fill its library
+    from YouTube and one that cannot."""
+    return bool(shutil.which("ffmpeg"))
+
 def dl_opts(dest):
     """The options a download runs under.
 
     Shared by the fetch and by the resolve that works out what its file will
     be called, because the name is only right if both ask the same question:
     `prepare_filename` answers for the template it is given, so a resolve
-    under different options would name a file the download never writes."""
-    return {"quiet": True, "no_warnings": True, "noprogress": True,
+    under different options would name a file the download never writes.
+
+    Without an ffmpeg the whole tail of this falls away: no re-encode, no
+    tags, no cover art, and the file keeps the shape YouTube sent it in - m4a
+    where it can be had, which every player here already plays. It is a
+    plainer song than the mp3 you would otherwise get, and it is a song."""
+    opts = {"quiet": True, "no_warnings": True, "noprogress": True,
             # A downloaded song dates from the download, not from whenever the
             # video was uploaded - left to itself yt-dlp stamps the file with
             # what the server said, which would file a song you fetched this
             # morning under a date years old and drop it to the bottom of a
             # library that reads newest first.
             "updatetime": False,
-            "format": "bestaudio/best", "writethumbnail": True,
-            "outtmpl": {"default": os.path.join(dest, "%(title)s.%(ext)s")},
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                 "preferredquality": "0"},
-                {"key": "FFmpegMetadata"},
-                {"key": "EmbedThumbnail"}]}
+            "outtmpl": {"default": os.path.join(dest, "%(title)s.%(ext)s")}}
+    if not can_transcode():
+        # m4a first, because it is one audio stream in a container everything
+        # here already plays; `bestaudio` behind it, for the occasional video
+        # that has no m4a to offer.
+        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
+        return opts
+    opts.update({"format": "bestaudio/best", "writethumbnail": True,
+                 "postprocessors": [
+                     {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
+                      "preferredquality": "0"},
+                     {"key": "FFmpegMetadata"},
+                     {"key": "EmbedThumbnail"}]})
+    return opts
+
+def dl_name(y, info):
+    """What the file a download writes will be called.
+
+    One place, asked by the fetch and by the resolve that runs ahead of it,
+    because a song already in your library is recognised by its name and the
+    two have to agree about the name to recognise. With an ffmpeg it is an mp3
+    whatever arrived; without one it is whatever arrived."""
+    name = os.path.basename(y.prepare_filename(info))
+    return os.path.splitext(name)[0] + ".mp3" if can_transcode() else name
 
 def dl_hook(vid):
     """yt-dlp's progress callback, thinned to a few writes a second - it fires
@@ -3630,8 +4104,6 @@ def fetch_id(vid):
     if m.version.__version__ < YTDLP_MIN:
         return None, ("yt-dlp %s is too old to download from YouTube - "
                       "update it with `simplmusik update`" % m.version.__version__)
-    if not shutil.which("ffmpeg"):
-        return None, "ffmpeg isn't installed - it's what writes the mp3"
     dest = folder()             # new songs land in your music folder
 
     # Played a moment ago? Then the song is already on the disk and this is a
@@ -3670,7 +4142,7 @@ def fetch_id(vid):
             # What the file will be called once it is an mp3. Knowing that
             # before fetching anything is what lets a song already in the
             # library cost a second instead of a minute.
-            song = os.path.basename(os.path.splitext(y.prepare_filename(info))[0]) + ".mp3"
+            song = dl_name(y, info)
             if song in index():
                 return {"song": song, "id": vid, "downloaded": False}, None
             # Fetch what we just looked up rather than looking it up again.
@@ -3800,7 +4272,7 @@ def resolve(vid):
     with m.YoutubeDL(opts) as y:
         info = y.extract_info("https://www.youtube.com/watch?v=" + vid,
                               download=False)
-        song = os.path.basename(os.path.splitext(y.prepare_filename(info))[0]) + ".mp3"
+        song = dl_name(y, info)
     resolved_put(vid, info.get("url"), song)
     return info, info.get("url"), song
 
@@ -3929,7 +4401,7 @@ def cmd_stream(args):
         return fail(args.json, "yt-dlp %s is too old to stream from YouTube - "
                     "update it with `simplmusik update`"
                     % m.version.__version__, 1)
-    if not shutil.which("mpv"):
+    if not have_player():
         return fail(args.json, "mpv not found - install mpv", 1)
     vid, why = video_ref(args.id)
     if not vid:
@@ -3955,11 +4427,7 @@ def cmd_stream(args):
     if live:
         source = url
     if live and not running:
-        if not shutil.which("ffmpeg"):
-            return fail(args.json, "ffmpeg isn't installed - it's what writes the mp3", 1)
-        subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "_fetch", vid, song],
-            start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+        detach("_fetch", vid, song)
 
     # One song, and the queue is the same shape `play` builds - the player
     # loop can't tell this job from any other, and doesn't need to.
@@ -3979,9 +4447,7 @@ def cmd_stream(args):
         # Asked to be kept, and not kept yet. The playlist has the song in it
         # already - the name was settled before a byte arrived - and this is
         # what makes that row come true rather than go stale.
-        subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "_keep", vid, song],
-            start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+        detach("_keep", vid, song)
     emit(args.json, {"song": song, "id": vid, "streaming": live, "playlist": to},
          ("streaming " if live else "playing ") + song + (" " + note if note else ""))
     return 0 if ok else 1
@@ -4063,6 +4529,7 @@ COMMANDS = [
     ("cover",   "show, set or clear a playlist's cover art",      "playlist image?", "clear"),
     ("add",     "add songs to a playlist, by number, name or path", "playlist files+", None),
     ("search",  "search your library, or YouTube with --yt",      "query+",          "count yt"),
+    ("identify","name the song a TikTok is playing, to search for", "link+",         None),
     ("download","download a search result into the library",      "id",              "to"),
     ("stream",  "play a search result now, and fetch it as it plays", "id",          "to"),
     ("remove",  "drop a song from a playlist, or delete it",      "playlist song?",  None),
@@ -4087,13 +4554,50 @@ CMDS = {"status": cmd_status, "stats": cmd_stats, "songs": cmd_songs, "list": cm
         "target": cmd_target,
         "create": cmd_create, "add": cmd_add, "remove": cmd_remove,
         "rename": cmd_rename, "cover": cmd_cover,
-        "search": cmd_search, "download": cmd_download, "stream": cmd_stream,
+        "search": cmd_search, "identify": cmd_identify,
+        "download": cmd_download, "stream": cmd_stream,
         "delete": cmd_delete, "play": cmd_play, "shuffle": cmd_shuffle,
         "seek": cmd_seek, "stop": cmd_stop, "pause": cmd_pause,
         "resume": lambda args: cmd_pause(args, want=False),
         "skip": lambda args: cmd_move(args, "skip"),
         "back": lambda args: cmd_move(args, "back"),
         "update": cmd_update}
+
+def run_command(argv):
+    """One command, run in this process, answered as an object.
+
+    Exactly the shape the window used to get back from running the CLI as a
+    subprocess - ok, code, data, error - so that moving to this changed
+    nothing above it. `--json` is implied, because an object is what the
+    caller came for, and every command's object goes through `emit`.
+
+    This is the only way in for anything that is not a terminal. The window
+    used it to stop paying for a process per keypress; Android uses it because
+    there is no process to pay for. Both get the same answers as `simplmusik`
+    typed at a prompt, for the reason the CLI has always been imported rather
+    than re-implemented: one command, one answer, one place it is decided.
+
+    Nothing escapes. A command that fails argparse exits, which here is a
+    SystemExit to catch rather than a status to read, and a command that
+    raises is this caller's error rather than the end of the server."""
+    argv = ["--json"] + [str(a) for a in argv]
+    was, said = getattr(_sink, "at", None), []
+    _sink.at = said
+    err = None
+    try:
+        code = main(argv)
+    except SystemExit as e:             # argparse said no
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 2)
+    except PlayerDone:                  # an embedded player, stopping
+        code = 0
+    except Exception as e:
+        code, err = 1, str(e)
+    finally:
+        _sink.at = was
+    data = said[-1] if said else None
+    if err is None and isinstance(data, dict):
+        err = data.get("error")
+    return {"ok": code == 0, "code": code or 0, "data": data, "error": err}
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
@@ -4111,8 +4615,8 @@ def main(argv=None):
     if argv[:1] == ["_keep"]:           # internal: the wait-and-promote behind
         return keep(argv[1], argv[2])   # `stream --to`, which wants it kept
     migrate()                           # playlists moved folder once, long ago
-    ap = argparse.ArgumentParser(prog="simplmusik", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = Parser(prog="simplmusik", description=__doc__,
+                formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name, help_, positional, flag in COMMANDS:

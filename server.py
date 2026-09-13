@@ -31,7 +31,14 @@ import http.server, importlib.machinery, importlib.util, ipaddress, json
 import mimetypes, os, socketserver, subprocess, sys, tempfile, threading, time
 from urllib.parse import urlparse, parse_qs, quote
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# realpath, not abspath, and for the same reason the CLI resolves itself:
+# what this points at has to be the real folder, not a name that leads to it.
+# Installed, this file can be reached through a symlink; on Android it always
+# is, because an app's own storage lives at /data/user/0/<app>, which is a
+# link to /data/data/<app>. The check below asks whether a resolved path is
+# inside WEB, and a resolved path is never inside an unresolved one - so with
+# an abspath here every page in the app answered "not found".
+HERE = os.path.dirname(os.path.realpath(__file__))
 CLI = os.path.join(HERE, "simplmusik")
 WEB = os.path.join(HERE, "web")
 
@@ -57,33 +64,47 @@ threading.Thread(target=sm.ytdlp, daemon=True).start()
 ALLOWED = {"status", "folder", "songs", "list", "create", "add", "remove",
            "delete", "rename", "cover", "play", "shuffle", "levelling", "pause",
            "resume", "skip", "back", "seek", "stop", "search", "download",
-           "stream", "volume", "target", "stats"}
+           "stream", "volume", "target", "stats", "identify"}
 
-# Most commands are a file read and answer at once. These two go to the network
+# Most commands are a file read and answer at once. These go to the network
 # instead, and a download re-encodes what it fetched, so they get their own
 # ceiling rather than dragging the common one up to meet them.
 # `stream` is not one of the slow ones: it looks the song up and hands the URL
 # to mpv, and the download it starts runs on behind it in its own process - so
 # it answers in about the time a search does, not the time a download does.
-SLOW = {"search": 60, "download": 900, "folder": 900, "stream": 60}
+SLOW = {"search": 60, "download": 900, "folder": 900, "stream": 60,
+        "identify": 60}
 
 # ------------------------------------------------------------------- the CLI
 
 def cli(args, timeout=20):
-    """Run the CLI in --json mode and hand back what it said."""
+    """Run a command and hand back what it said.
+
+    In this process, through the CLI's own `run_command` - the module was
+    already imported for the sake of one answer to every question, and this is
+    that taken the rest of the way. It was a subprocess per command until the
+    Android port needed it not to be: there is no second interpreter to spawn
+    inside an app, and `sys.executable` is nothing to run. Off Android it is
+    simply faster, by an interpreter start-up and a yt-dlp import per keypress.
+
+    The timeout is the one thing a subprocess gave for free. A command that
+    hangs - a search on a machine that has lost its network, most likely - has
+    to stop being the page's problem, so it is run on a thread and waited for
+    rather than called outright. What that cannot do is kill it: the work runs
+    on until it finishes on its own. Freeing the page is the point, and the
+    thread is a daemon, so nothing waits on it at the end either."""
     if not args or args[0] not in ALLOWED:
         return {"ok": False, "error": "command not allowed: %s" % (args[:1] or "")}
-    try:
-        p = subprocess.run([sys.executable, CLI, "--json"] + [str(a) for a in args],
-                           capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as e:
-        return {"ok": False, "error": str(e)}
-    try:
-        data = json.loads(p.stdout or "null")
-    except ValueError:
-        data = p.stdout.strip() or None
-    return {"ok": p.returncode == 0, "code": p.returncode, "data": data,
-            "error": (data or {}).get("error") if isinstance(data, dict) else None}
+    box = {}
+    def run():
+        box["r"] = sm.run_command(args)
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if "r" not in box:
+        return {"ok": False, "code": 1, "data": None,
+                "error": "%s took longer than %ds" % (args[0], timeout)}
+    return box["r"]
 
 # ------------------------------------------------------------------ the disk
 # Walking your music folder is the one thing here that touches the whole disk,
@@ -507,6 +528,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # static frontend
         name = "index.html" if path == "/" else path.lstrip("/")
+        # Both sides resolved, so that the comparison is between like and
+        # like: `f` is what the name really leads to, and WEB is built from a
+        # realpath above. A `..` in a request still lands outside and is still
+        # refused, which is what this is here for.
         f = os.path.realpath(os.path.join(WEB, name))
         if not f.startswith(WEB + os.sep) or not os.path.isfile(f):
             return self.send_json({"error": "not found"}, 404)

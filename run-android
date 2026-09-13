@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Run the Android build on an emulator, and look at what it did.
+
+    ./run-android                # build, boot, install, launch, screenshot
+    ./run-android --no-build     # use the APK that is already there
+    ./run-android --shot         # just take another screenshot
+    ./run-android --log          # just print what the app has said
+    ./run-android --music DIR    # push some songs in before launching
+    ./run-android --stop         # shut the emulator down
+
+A phone is a bad place to find out that something does not work, because it
+tells you nothing when it doesn't. This is the same app on an emulator, where
+there is a log to read, a screen to capture and a way to try again in a minute
+rather than a round trip through a download.
+
+The emulator is x86_64 - it is a desktop pretending to be a phone - so the APK
+built here is too. That is the only difference between what this runs and what
+comes off `build-apk`, and it is one line in the manifest.
+"""
+
+import os, re, shutil, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BUILD = os.path.join(HERE, "build")
+SHOT = os.path.join(BUILD, "android-screen.png")
+AVD = "simplmusik"
+PKG = "org.simplmusik.player.debug"
+ABI = "x86_64"
+IMAGE = "system-images;android-34;google_apis;x86_64"
+
+
+def sdk():
+    for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        d = os.environ.get(env)
+        if d and os.path.isdir(d):
+            return d
+    d = os.path.expanduser("~/Android/Sdk")
+    if os.path.isdir(d):
+        return d
+    sys.exit("no Android SDK - see build-apk")
+
+
+ROOT = sdk()
+ADB = os.path.join(ROOT, "platform-tools", "adb")
+EMU = os.path.join(ROOT, "emulator", "emulator")
+AVDMAN = os.path.join(ROOT, "cmdline-tools", "latest", "bin", "avdmanager")
+
+
+def adb(*args, **kw):
+    return subprocess.run([ADB] + list(args), capture_output=True, text=True, **kw)
+
+
+def booted():
+    """Whether there is an emulator up and all the way through its boot."""
+    r = adb("shell", "getprop", "sys.boot_completed")
+    return r.returncode == 0 and r.stdout.strip() == "1"
+
+
+def ensure_avd():
+    if not os.path.isfile(EMU):
+        sys.exit("no emulator installed - sdkmanager --install emulator '%s'" % IMAGE)
+    r = subprocess.run([EMU, "-list-avds"], capture_output=True, text=True)
+    if AVD in r.stdout.split():
+        return
+    print("making the '%s' emulator" % AVD)
+    p = subprocess.run([AVDMAN, "create", "avd", "-n", AVD, "-k", IMAGE,
+                        "-d", "pixel_6", "--force"],
+                       input="no\n", capture_output=True, text=True)
+    if p.returncode:
+        sys.exit("could not make the emulator:\n" + (p.stderr or p.stdout))
+
+
+def start_emulator():
+    if booted():
+        return
+    ensure_avd()
+    print("booting the emulator (headless)")
+    # Software rendering, because this runs where there may be no screen at
+    # all; no snapshot, because a saved one is a state we did not choose.
+    subprocess.Popen(
+        # Audio stays on. There is nothing here to listen with, but a player
+        # with no audio device never drains its buffer and never advances its
+        # clock - so turning it off makes a playing song look like a stuck one,
+        # which is a bug report about the app rather than about the emulator.
+        [EMU, "-avd", AVD, "-no-window", "-no-boot-anim",
+         "-no-snapshot", "-gpu", "swiftshader_indirect", "-accel", "on"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    adb("wait-for-device")
+    for _ in range(180):
+        if booted():
+            print("  up")
+            return
+        time.sleep(2)
+    sys.exit("the emulator did not finish booting")
+
+
+def install(apk):
+    print("installing %s" % os.path.basename(apk))
+    # -g grants the ordinary runtime permissions, so the first run is not spent
+    # tapping dialogs. All-files access is not one of those and is set below.
+    r = adb("install", "-r", "-g", apk)
+    if r.returncode or "Success" not in (r.stdout + r.stderr):
+        sys.exit("install failed:\n" + (r.stdout + r.stderr)[-1500:])
+    # The permission that has no dialog, only a Settings page.
+    adb("shell", "appops", "set", PKG, "MANAGE_EXTERNAL_STORAGE", "allow")
+
+
+def push_music(src):
+    """Put some songs on the emulator, so the library is not empty."""
+    if not os.path.isdir(src):
+        sys.exit("no such folder: %s" % src)
+    names = [n for n in sorted(os.listdir(src))
+             if os.path.splitext(n)[1].lower() in
+             (".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac")][:8]
+    if not names:
+        print("no songs in %s - nothing pushed" % src)
+        return
+    adb("shell", "mkdir", "-p", "/sdcard/Music")
+    for n in names:
+        adb("push", os.path.join(src, n), "/sdcard/Music/")
+    print("pushed %d songs" % len(names))
+
+
+def launch():
+    adb("shell", "am", "force-stop", PKG)
+    adb("logcat", "-c")                     # a clean log for this run
+    print("launching")
+    r = adb("shell", "am", "start", "-n", "%s/org.simplmusik.player.MainActivity" % PKG)
+    if "Error" in (r.stdout + r.stderr):
+        sys.exit("could not launch:\n" + r.stdout + r.stderr)
+
+
+def screenshot(path=SHOT):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    r = subprocess.run([ADB, "exec-out", "screencap", "-p"], capture_output=True)
+    if r.returncode or not r.stdout:
+        print("no screenshot: %s" % (r.stderr.decode()[:200]))
+        return None
+    with open(path, "wb") as f:
+        f.write(r.stdout)
+    print("screenshot: %s (%.0f KB)" % (path, len(r.stdout) / 1024))
+    return path
+
+
+def log(lines=120):
+    """What the app said. Ours first, then anything that died."""
+    r = adb("logcat", "-d", "-v", "brief")
+    out = r.stdout.splitlines()
+    keep = [l for l in out if re.search(
+        r"simplmusik|AndroidRuntime|python|chaquopy|System\.err|FATAL", l, re.I)]
+    print("\n".join(keep[-lines:]) or "(nothing from the app in the log)")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--stop" in args:
+        adb("emu", "kill")
+        print("emulator stopped")
+        return
+    if "--shot" in args:
+        screenshot()
+        return
+    if "--log" in args:
+        log()
+        return
+
+    version = version_of()
+    apk = os.path.join(BUILD, "simplmusik_%s_%s.apk" % (version, ABI))
+    if "--no-build" not in args:
+        r = subprocess.run([sys.executable, os.path.join(HERE, "build-apk"),
+                            "--version", version, "--abi", ABI])
+        if r.returncode:
+            sys.exit("build failed")
+    if not os.path.isfile(apk):
+        sys.exit("no APK at %s - build one first" % apk)
+
+    start_emulator()
+    install(apk)
+    if "--music" in args:
+        push_music(args[args.index("--music") + 1])
+    launch()
+
+    # The first start is the slow one: the interpreter, then the library walk,
+    # then the page asking for it. A screenshot taken before that lands shows
+    # an empty list and looks like a bug that isn't there.
+    print("giving it a moment to start")
+    time.sleep(25)
+    screenshot()
+    print("\n--- what the app said ---")
+    log()
+
+
+def version_of():
+    """The version, from the one place that names one."""
+    with open(os.path.join(HERE, "build-deb")) as f:
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
+    return m.group(1) if m else "0.0.0"
+
+
+if __name__ == "__main__":
+    main()

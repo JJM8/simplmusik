@@ -5,3 +5,16 @@ __pycache__/
 venv/
 build/
 yt-dlp
+
+# the Android build tree; android/.gitignore covers the rest
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# the iOS build tree. `app/` is staged out of the repository root and
+# `Python.xcframework` is fetched, so neither is a thing to keep here.
+ios/.build/
+ios/xtool/
+ios/app/
+ios/Python.xcframework/
