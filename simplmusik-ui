@@ -18,7 +18,8 @@ import server
 
 # Only ever a name for the desktop: it is what Gtk.Application registers
 # itself as, which is how a second launch finds the window already open.
-APP_ID = "org.simplmusik.Player"
+APP_ID = "io.github.JJM8.simplmusik"
+OLD_APP_ID = "org.simplmusik.Player"      # what builds before 0.2.2 were called
 
 # Flatpak exports one launcher per app, named after the app id and pointed at
 # whatever the manifest's `command:` is - the window. The CLI ships in the same
@@ -38,7 +39,8 @@ def export_cli():
     bin_dir = os.path.expanduser("~/.local/bin")
     path = os.path.join(bin_dir, "simplmusik")
     try:
-        if os.path.exists(path) and open(path).read() != CLI_WRAPPER:
+        ours = (CLI_WRAPPER, CLI_WRAPPER.replace(APP_ID, OLD_APP_ID))
+        if os.path.exists(path) and open(path).read() not in ours:
             return False          # somebody else's simplmusik - leave it alone
         fresh = not os.path.isdir(bin_dir)
         os.makedirs(bin_dir, exist_ok=True)

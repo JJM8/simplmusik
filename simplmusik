@@ -202,6 +202,16 @@ YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
 YTDLP_USER = os.path.expanduser("~/.local/share/simplmusik/yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 
+# Installed from a store - a flatpak or a snap, each of which says so in the
+# environment it runs us in - the store is what updates us, yt-dlp included.
+# Code fetched past it is exactly what store review exists to stop, so there
+# only the copy shipped in the package is ever imported, and `update` points
+# at the store instead of reaching for the network.
+STORE = "flatpak" if os.environ.get("FLATPAK_ID") else \
+        "snap" if os.environ.get("SNAP") else None
+UPDATE_HINT = ("update simplmusik from your software store" if STORE
+               else "update it with `simplmusik update`")
+
 # ------------------------------------------------------------------ detaching
 # Three things here are started and then not waited for: the player, the
 # download that runs behind a stream, and the promotion that follows it. On a
@@ -1711,6 +1721,19 @@ def close_span(live, why):
 ACTIVE = ("skip", "back", "swap")
 NEUTRAL = ("stop", "error")
 JUDGED = ("eof",) + ACTIVE          # spans you expressed something about
+# What the stats page calls a skip: the button, or putting something else on.
+# `back` is going somewhere, not leaving this one, and a song that ran out
+# was never skipped.
+SKIPS = ("skip", "swap")
+
+# Under this much, a song cut short was passed over, not listened to - the
+# second it plays while you mash skip, or a misclick. Those spans still count as
+# plays and skips; they just add no listening time.
+MIN_HEARD = 10
+
+def heard(r):
+    """The listening time a span is worth. See MIN_HEARD."""
+    return r["heard"] if r["end"] == "eof" or r["heard"] >= MIN_HEARD else 0.0
 
 SESSION_GAP = 1800      # half an hour of silence is the end of an evening
 
@@ -1854,11 +1877,11 @@ def group(rows, key):
         g = out.get(name)
         if not g:
             g = out[name] = {"name": name, "heard": 0.0, "plays": 0,
-                             "finished": 0, "active": 0, "skipped": 0,
+                             "finished": 0, "active": 0, "skips": 0, "skipped": 0,
                              "swapped": 0, "backed": 0, "chosen": 0,
                              "drawn": 0, "first": r["at"], "last": r["at"],
                              "songs": set()}
-        g["heard"] += r["heard"]
+        g["heard"] += heard(r)
         g["plays"] += 1
         g["last"] = max(g["last"], r["at"])
         g["first"] = min(g["first"], r["at"])
@@ -1866,6 +1889,7 @@ def group(rows, key):
         end = r["end"]
         g["finished"] += end == "eof"
         g["active"] += end in ACTIVE
+        g["skips"] += end in SKIPS
         g["skipped"] += end == "skip"
         g["swapped"] += end == "swap"
         g["backed"] += end == "back"
@@ -1887,7 +1911,7 @@ def group(rows, key):
 # seeing it beside the time is what shows why it is the wrong column.
 ORDERS = {"time": lambda g: (-g["heard"], -g["plays"], g["name"].lower()),
           "plays": lambda g: (-g["plays"], -g["heard"], g["name"].lower()),
-          "skips": lambda g: (-g["active"], -g["plays"], g["name"].lower()),
+          "skips": lambda g: (-g["skips"], -g["plays"], g["name"].lower()),
           "recent": lambda g: (-g["last"], g["name"].lower())}
 
 def rank(groups, by="time", count=None):
@@ -1908,7 +1932,7 @@ def sessions(rows):
         # The span ended after it was heard, not when it started: an evening
         # runs to the end of its last song and not to the beginning of it.
         here["end"] = max(here["end"], span_of(r)[1])
-        here["heard"] += r["heard"]
+        here["heard"] += heard(r)
         here["plays"] += 1
     for s in out:
         s["heard"] = round(s["heard"], 1)
@@ -1963,17 +1987,18 @@ def pour(into, rec, step, span):
     listening is spread evenly across the time the song was up - exact for
     every span that ran straight through, and the honest guess for the rest."""
     at, end = span_of(rec)
-    if rec["heard"] <= 0:
+    worth = heard(rec)
+    if worth <= 0:
         return
     b, wall = bucket_start(at, step), end - at
     if wall <= 0:                   # a span with no length is a moment, not a stretch
-        into[b] = into.get(b, 0.0) + rec["heard"]
+        into[b] = into.get(b, 0.0) + worth
         return
     while b < end:
         nxt = next_bucket(b, step, span)
         lo, hi = max(at, b), min(end, nxt)
         if hi > lo:
-            into[b] = into.get(b, 0.0) + rec["heard"] * (hi - lo) / wall
+            into[b] = into.get(b, 0.0) + worth * (hi - lo) / wall
         b = nxt
 
 def series(rows, step):
@@ -2024,7 +2049,7 @@ def stats(rows):
     return {
         "spans": len(rows),
         "songs": len({r["song"] for r in rows}),
-        "heard": round(sum(r["heard"] for r in rows), 1),
+        "heard": round(sum(heard(r) for r in rows), 1),
         "first": rows[0]["at"] if rows else None,
         "last": rows[-1]["at"] if rows else None,
         "finished": len(finished),
@@ -2724,7 +2749,8 @@ CACHE_GRACE = 5             # ...and how long `stream --to` gives a fetch it
 RESOLVE_TTL = 3600          # how long a looked-up stream URL is trusted for.
                             # YouTube's own last about six hours; an hour is
                             # short enough that a stale one is never played
-YTDLP_GONE = "yt-dlp isn't installed - run `simplmusik update`"
+YTDLP_GONE = ("yt-dlp is missing from this install - reinstall simplmusik" if STORE
+              else "yt-dlp isn't installed - run `simplmusik update`")
 SEARCH_N = 8                # results a search comes back with
 SEARCH_MAX = 40             # ...and the most it will, however many you ask for
 SHOWN_TTL = 3600            # how long a printed list's numbering is worth
@@ -2751,16 +2777,22 @@ def ytdlp():
     Four places one can be: installed as a package, on the PATH, fetched by
     `update` into your own folder, or shipped beside the app. The last two are
     what let this work with nothing installed at all - and they are separate
-    because the shipped copy may belong to root, which `update` cannot write."""
+    because the shipped copy may belong to root, which `update` cannot write.
+
+    A store install looks only at the shipped copy: see STORE."""
     if _ytdlp:
         return _ytdlp[0]
-    try:
-        import yt_dlp as mod
-    except ImportError:
-        mod = None
+    mod = None
+    if not STORE:
+        try:
+            import yt_dlp as mod
+        except ImportError:
+            pass
     best = None
     newest = mod.version.__version__ if mod else None
-    for path in (shutil.which("yt-dlp"), YTDLP_USER, YTDLP_BUNDLED):
+    places = (YTDLP_BUNDLED,) if STORE else \
+             (shutil.which("yt-dlp"), YTDLP_USER, YTDLP_BUNDLED)
+    for path in places:
         zv = zipapp_version(path) if path else None
         if zv and (newest is None or zv > newest):
             best, newest = path, zv
@@ -3035,7 +3067,7 @@ def table(groups, count, head="song"):
     for g in groups[:count]:
         lines.append("  %-9s %5d %5d %5d  %s"
                      % (spell_secs(g["heard"]), g["plays"], g["finished"],
-                        g["active"], clip(g["name"], 46)))
+                        g["skips"], clip(g["name"], 46)))
     return "\n".join(lines)
 
 def summary_text(s, count):
@@ -3082,9 +3114,9 @@ def skips_text(s, count):
         n = s["bail"][b]
         if n or b != "unknown":
             out.append("  %-13s %-24s %3d" % (b, "█" * int(round(20.0 * n / worst)), n))
-    skipped = [g for g in rank(s["by_song"], "skips", None) if g["active"]]
+    skipped = [g for g in rank(s["by_song"], "skips", None) if g["skips"]]
     if skipped:
-        out.append("\nmost cut short\n" + table(skipped, count))
+        out.append("\nmost skipped\n" + table(skipped, count))
     return "\n".join(out)
 
 def time_text(s, rows, count):
@@ -3810,11 +3842,13 @@ def tiktok_link(s):
     m = TIKTOK_LINK.search(s or "")
     return m.group(0).rstrip(".,;:!?)\"'") if m else None
 
-def web_page(url, timeout=15):
+def web_page(url, timeout=15, where=False):
+    """A page's text - and with `where`, as (text, the URL it ended up at)."""
     import urllib.request                # only naming a TikTok needs it
     req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+        page = r.read().decode("utf-8", "replace")
+        return (page, r.geturl()) if where else page
 
 def page_json(page, script_id):
     """The JSON in a page's `<script id=...>`, or None."""
@@ -3860,51 +3894,313 @@ def dsp_song(info):
             return (artists[0] if artists else ""), t["name"]
     return None
 
-def tiktok_song(link):
-    """The song a TikTok is playing, as (song, None), or (None, why not).
+# ------------------------------------------------------ listening to a TikTok
+# When TikTok can't say what a sound is, Shazam usually can. The page names
+# the sound's own audio file on TikTok's CDN; a stretch of it is decoded to
+# 16 kHz mono, and a fingerprint of that stretch is what is sent - a few
+# kilobytes of frequency peaks, never the audio itself.
+#
+# The fingerprint is in Shazam's own format, which SongRec worked out
+# (github.com/marin-m/SongRec, GPL-3.0). The code that makes it here is
+# shazamio 0.4's numpy port of SongRec's - shazamio calls itself MIT, but the
+# code came from SongRec, and SongRec's licence is the one that follows it -
+# cut down to the arithmetic that turns one stretch of sound into one
+# signature. It is copied rather than installed because the shazamio of today
+# makes its fingerprints in Rust, which will not install on a phone. And it
+# is copied exactly, down to a frequency band it never fills, because that
+# exact arithmetic is what Shazam has been answering: the signature this makes
+# is byte for byte the one shazamio makes.
+#
+# Decoding is ffmpeg's job on a desktop, as it is for loudness. A phone has no
+# ffmpeg, so there `Decoder.java` asks the platform's own decoders instead,
+# at whatever rate the sound is in, and `to_16k` brings it down.
+#
+# Shazam turns away bursts of requests, so one TikTok costs at most one: the
+# fingerprint is sent only once everything TikTok itself knows has come to
+# nothing. It is *made* while that is being asked, though, which is where the
+# time goes - so asking Shazam costs a round trip, not a round trip and a
+# second of arithmetic on top.
 
-    Raises when TikTok can't be reached at all, which is a different answer
-    from a video with no song in it and is reported as one."""
-    detail = dig(page_json(web_page(link), "__UNIVERSAL_DATA_FOR_REHYDRATION__"),
+SHAZAM_TAG = ("https://amp.shazam.com/discovery/v5/en-US/GB/iphone/-/tag/%s/%s"
+              "?sync=true&webv3=true&sampling=true&connected=&shazamapiversion=v3"
+              "&sharehub=true&hubv5minorversion=v5.1&hidelb=true&video=v3")
+LISTEN_SECONDS = 12             # the stretch of a sound a fingerprint is made of
+
+# Around a candidate peak: the neighbouring frequency bins it must stand above,
+# and the earlier and later spectra it must stand above, by ring position.
+PEAK_BINS = (-10, -7, -4, -3, 1, 2, 5, 8)
+PEAK_FFTS = (-53, -45, 165, 172, 179, 186, 193, 200, 214, 221, 228, 235, 242, 249)
+
+def fingerprint(samples):
+    """A Shazam signature for 16 kHz mono samples, as (data URI, milliseconds).
+
+    Spectra 128 samples apart, each spread across its neighbours in frequency
+    and time, and the peaks that stand out in four bands (three, in practice)
+    are what is kept. It stops after LISTEN_SECONDS - or goes on past them,
+    while too few peaks have turned up to be worth sending.
+
+    shazamio does this a bin at a time in Python, which a phone takes seconds
+    over. Here the spectra stay arrays, and which bins are peaks is decided
+    for all of them at once - that part is only comparisons and maxima, so it
+    is exact. What is worked out for each peak found stays the same scalar
+    arithmetic, because an array's logarithm is allowed to differ from a
+    number's in the last place, and one place is a different signature."""
+    import numpy as np
+    hann = np.hanning(2050)[1:-1]
+    ring, rpos = np.zeros(2048, dtype=np.int64), 0
+    ffts, fpos = [None] * 256, 0        # every one read is written first
+    spread, spos, spread_written = np.zeros((256, 1025)), 0, 0
+    s = np.asarray(samples, dtype=np.int64)
+    near = np.arange(10, 1015)[:, None] + np.array(PEAK_BINS)
+    peaks, done = {}, 0
+    while len(s) - done >= 128 and (done / 16000 < LISTEN_SECONDS
+                                    or sum(map(len, peaks.values())) < 255):
+        ring[rpos:rpos + 128] = s[done:done + 128]
+        rpos = (rpos + 128) % 2048
+        done += 128
+        f = np.fft.rfft(hann * np.concatenate((ring[rpos:], ring[:rpos])))
+        last = np.maximum((f.real ** 2 + f.imag ** 2) / (1 << 17), 0.0000000001)
+        ffts[fpos], fpos = last, (fpos + 1) % 256
+
+        # Spread across frequency: each bin the loudest of itself and the two
+        # above it. Then across time, into three spectra already spread.
+        widened = last.copy()
+        widened[:1022] = np.maximum(np.maximum(last[:1022], last[1:1023]), last[2:1024])
+        i1, i2, i3 = [(spos + k) % 256 for k in (-1, -3, -6)]
+        n1 = np.maximum(widened, spread[i1])
+        n2 = np.maximum(n1, spread[i2])
+        n3 = np.maximum(n2, spread[i3])
+        spread[i1], spread[i2], spread[i3] = n1, n2, n3
+        spread[spos], spos, spread_written = widened, (spos + 1) % 256, spread_written + 1
+        if spread_written < 46:
+            continue
+
+        a = ffts[(fpos - 46) % 256]
+        b = spread[(spos - 49) % 256]
+        loud = a[10:1015]
+        around = spread[[(spos + o) % 256 for o in PEAK_FFTS]][:, 9:1014].max(axis=0)
+        bound = np.maximum(np.maximum(b[near].max(axis=1), around), 0)
+        for k in (np.nonzero((loud >= 1 / 64) & (loud >= b[9:1014]) & (loud > bound))[0] + 10).tolist():
+            v = a[k]
+            mag = np.log(max(1 / 64, v)) * 1477.3 + 6144
+            before = np.log(max(1 / 64, a[k - 1])) * 1477.3 + 6144
+            after = np.log(max(1 / 64, a[k + 1])) * 1477.3 + 6144
+            curve = mag * 2 - before - after
+            if curve <= 0:
+                continue
+            fbin = k * 64 + (after - before) * 32 / curve
+            hz = fbin * (16000 / 2 / 1024 / 64)
+            band = 0 if 250 < hz < 520 else 1 if 520 < hz < 1450 else 2 if 1450 < hz < 3500 else None
+            if band is not None:
+                peaks.setdefault(band, []).append((spread_written - 46, int(mag), int(fbin)))
+    return signature_uri(peaks, done), int(done / 16000 * 1000)
+
+def signature_uri(peaks, samples):
+    """Peaks in Shazam's binary signature format, as the data URI it is sent as."""
+    import base64, binascii, struct
+    contents = bytearray()
+    for band, found in sorted(peaks.items()):
+        buf, last = bytearray(), 0
+        for n, mag, fbin in found:
+            if n - last >= 255:
+                buf += b"\xff" + n.to_bytes(4, "little")
+                last = n
+            buf += bytes([n - last]) + mag.to_bytes(2, "little") + fbin.to_bytes(2, "little")
+            last = n
+        contents += ((0x60030040 + band).to_bytes(4, "little") + len(buf).to_bytes(4, "little")
+                     + buf + b"\0" * (-len(buf) % 4))
+    body = (0x40000000).to_bytes(4, "little") + (len(contents) + 8).to_bytes(4, "little") + contents
+    after_crc = struct.pack("<II3II2III", len(contents) + 8, 0x94119C00, 0, 0, 0, 3 << 27,
+                            0, 0, int(samples + 16000 * 0.24), (15 << 19) + 0x40000) + body
+    raw = struct.pack("<II", 0xCAFE2580, binascii.crc32(after_crc) & 0xFFFFFFFF) + after_crc
+    return "data:audio/vnd.shazam.sig;base64," + base64.b64encode(raw).decode("ascii")
+
+def to_16k(x, rate):
+    """Mono samples at any rate, brought to 16 kHz: a low-pass below the new
+    limit first, so nothing above it folds down into the bands a fingerprint
+    is made of, then the new instants read off the old ones."""
+    import numpy as np
+    if rate == 16000:
+        return x
+    taps = np.arange(127) - 63
+    h = np.sinc(2 * 7600 / rate * taps) * np.hamming(127)
+    y = np.convolve(x.astype(np.float64), h / h.sum(), mode="same")
+    t = np.arange(len(x) * 16000 // rate) * (rate / 16000)
+    return np.rint(np.interp(t, np.arange(len(x)), y)).clip(-32768, 32767).astype(np.int16)
+
+def pcm16k(path, start, seconds):
+    """A stretch of an audio file as 16 kHz mono samples, or None when there
+    is nothing here to decode it with."""
+    import numpy as np
+    if shutil.which("ffmpeg"):
+        p = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                            "-ss", str(start), "-t", str(seconds), "-i", path,
+                            "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"],
+                           capture_output=True, timeout=60)
+        return np.frombuffer(p.stdout, dtype="<i2") if p.returncode == 0 else None
+    try:
+        from java import jclass         # Android: no ffmpeg, but its own decoders
+    except ImportError:
+        return None
+    raw = path + ".pcm"
+    try:
+        rate = jclass("org.simplmusik.player.Decoder").pcm(
+            path, raw, int(start * 1000), int(seconds * 1000))
+        return to_16k(np.fromfile(raw, dtype="<i2"), rate) if rate else None
+    finally:
+        if os.path.exists(raw):
+            os.remove(raw)
+
+def listen(music, wanted=lambda: True):
+    """A fingerprint of a TikTok's sound, as ((uri, ms), None), or (None, why).
+
+    From the start of a short sound, and the middle of a long one: a sound
+    that runs on is more often a song with somebody talking over its start.
+
+    `wanted` is asked between the steps. This is started alongside TikTok's
+    own lookups, and when one of those answers, the decoding and the
+    arithmetic still to come would be a phone's battery spent on nothing."""
+    try:
+        import numpy                    # noqa: F401 - only asking if it's there
+    except ImportError:
+        return None, "numpy isn't installed, so there's nothing to listen with"
+    import tempfile, urllib.request
+    if not music.get("playUrl"):
+        return None, "TikTok gave no sound to listen to"
+    os.makedirs(cache_dir(), exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix=".sound-", dir=cache_dir())
+    try:
+        req = urllib.request.Request(music["playUrl"], headers={"User-Agent": BROWSER_UA})
+        with os.fdopen(fd, "wb") as f, urllib.request.urlopen(req, timeout=20) as r:
+            shutil.copyfileobj(r, f)
+        if not wanted():
+            return None, "answered without it"
+        length = music.get("duration") or 0
+        start = int(length / 2) - 6 if length > 36 else 0
+        # A little past the stretch: a quiet one takes longer to find its peaks.
+        samples = pcm16k(path, start, LISTEN_SECONDS + 4)
+        if samples is None:
+            return None, "there's no ffmpeg here to decode the sound with"
+        if len(samples) < 16000 * 3:
+            return None, "that TikTok's sound is too short to listen to"
+        if not wanted():
+            return None, "answered without it"
+        return fingerprint(samples), None
+    finally:
+        os.remove(path)
+
+def ask_shazam(uri, ms):
+    """(artist, title) for a fingerprint, or None when Shazam doesn't know it.
+    Raises when Shazam won't answer - including a 429, for asking too often."""
+    import urllib.request, uuid
+    body = json.dumps({"timezone": "Europe/London",
+                       "signature": {"uri": uri, "samplems": ms},
+                       "timestamp": int(time.time() * 1000),
+                       "context": {}, "geolocation": {}}).encode()
+    req = urllib.request.Request(
+        SHAZAM_TAG % (str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()),
+        data=body, headers={"Content-Type": "application/json", "Accept": "*/*",
+                            "X-Shazam-Platform": "IPHONE", "X-Shazam-AppVersion": "14.1.0",
+                            "Accept-Language": "en-US",
+                            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 6.0.1; SM-G920F Build/MMB29K)"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        track = json.load(r).get("track") or {}
+    if not track.get("title"):
+        return None
+    return lead_artist(track.get("subtitle")), track["title"].strip()
+
+def named(link, artist, title, via):
+    return {"song": " - ".join(p for p in (artist, title) if p),
+            "artist": artist, "title": title, "via": via, "link": link}
+
+def tiktok_song(link, shazam=False):
+    """The song a TikTok is playing: (song, None, 0), or (None, why not, code).
+
+    Answers are taken in the order they can be trusted. A sound TikTok ties to
+    a released song - linked to a streaming service, on an album, under
+    copyright - is that song, and is answered at once. Then the song TikTok
+    has matched an original sound to. Then Shazam. And last, a sound's title
+    with nothing behind it, which is only somebody's name for what they posted.
+
+    `shazam` skips TikTok's answers and listens regardless. Raises when TikTok
+    can't be reached at all, which is a different answer from a video with no
+    song in it and is reported as one."""
+    import urllib.error
+    page, url = web_page(link, where=True)
+    detail = dig(page_json(page, "__UNIVERSAL_DATA_FOR_REHYDRATION__"),
                  "__DEFAULT_SCOPE__", "webapp.video-detail")
+    if not detail and "/photo/" in url:
+        # A slideshow's page is drawn in the browser, with nothing in it to
+        # read. The same post asked for as a video is drawn on the server, and
+        # carries the same sound.
+        page = web_page(url.replace("/photo/", "/video/", 1))
+        detail = dig(page_json(page, "__UNIVERSAL_DATA_FOR_REHYDRATION__"),
+                     "__DEFAULT_SCOPE__", "webapp.video-detail")
     if not detail:
         # Where a short link to a deleted video ends up: TikTok's front page.
-        return None, "that link doesn't lead to a TikTok video"
+        return None, "that link doesn't lead to a TikTok video", 2
     if detail.get("statusCode"):
-        return None, "TikTok has no video at that link - it's deleted, or private"
+        return None, "TikTok has no video at that link - it's deleted, or private", 2
     music = dig(detail, "itemInfo", "itemStruct", "music") or {}
-    found = None
-    if music.get("title") and not music.get("original"):
-        found = lead_artist(music.get("authorName")), music["title"].strip(), "tiktok"
-    for info in (dig(music, "tt2dsp", "tt_to_dsp_song_infos") or []) if not found else []:
+    links = [] if shazam else dig(music, "tt2dsp", "tt_to_dsp_song_infos") or []
+    credit = None
+    if music.get("title") and not music.get("original") and not shazam:
+        credit = lead_artist(music.get("authorName")), music["title"].strip(), "tiktok"
+        if links or music.get("album") or music.get("isCopyrighted"):
+            return named(link, *credit), None, 0
+
+    heard, answered = {}, threading.Event()
+    def hear():
+        try:
+            heard["print"], heard["why"] = listen(music, lambda: not answered.is_set())
+        except Exception as e:          # a download, a decoder: none of it fatal
+            heard["print"], heard["why"] = None, "couldn't listen to the sound: %s" % e
+    ear = threading.Thread(target=hear, daemon=True)
+    ear.start()
+
+    for info in links:
         try:
             got = dsp_song(info)
         except Exception:               # one service down is no reason to skip
             got = None                  # asking the other
         if got and got[1]:
-            found = got + ({1: "apple music", 3: "spotify"}[info["Platform"]],)
-            break
-    if not found:
-        return None, ("that TikTok's sound is its own, and TikTok doesn't know "
-                      "of a song in it")
-    artist, title, via = found
-    return {"song": " - ".join(p for p in (artist, title) if p),
-            "artist": artist, "title": title, "via": via, "link": link}, None
+            answered.set()              # and the listening can stop
+            return named(link, *got, {1: "apple music", 3: "spotify"}[info["Platform"]]), None, 0
+
+    # Well inside the minute the window gives `identify`, so a sound that
+    # won't come down is reported as that rather than as the window giving up.
+    ear.join(30)
+    why, code = heard.get("why") or "the sound took too long to listen to", 2
+    if heard.get("print"):
+        try:
+            got = ask_shazam(*heard["print"])
+            if got:
+                return named(link, *got, "shazam"), None, 0
+            why = "neither TikTok nor Shazam knows of a song in that TikTok"
+        except urllib.error.HTTPError as e:
+            why, code = ("Shazam is being asked too often from here - try again in a minute"
+                         if e.code == 429 else "Shazam didn't answer: %s" % e), 1
+        except Exception as e:          # urllib raises a wide family of these
+            why, code = "couldn't reach Shazam: %s" % e, 1
+    if credit:
+        return named(link, *credit), None, 0
+    return None, why, code
 
 def cmd_identify(args):
     """Name the song in a TikTok, as something to search for.
 
     Exit 2 is 'no song', the way it is 'nothing found' for `search`; 1 is
-    that the question couldn't be asked - no link, or no network."""
+    that the question couldn't be asked - no link, no network, or a Shazam
+    that has had enough of us for now."""
     link = tiktok_link(" ".join(args.link))
     if not link:
         return fail(args.json, "that isn't a TikTok link", 1)
     try:
-        song, why = tiktok_song(link)
+        song, why, code = tiktok_song(link, args.shazam)
     except Exception as e:              # urllib raises a wide family of these
         return fail(args.json, "couldn't reach TikTok: %s" % e, 1)
     if not song:
-        return fail(args.json, why, 2)
+        return fail(args.json, why, code)
     return emit(args.json, song, song["song"]) or 0
 
 # A download is the one command that takes minutes, so it says how far along
@@ -4102,8 +4398,8 @@ def fetch_id(vid):
     if m is None:
         return None, YTDLP_GONE
     if m.version.__version__ < YTDLP_MIN:
-        return None, ("yt-dlp %s is too old to download from YouTube - "
-                      "update it with `simplmusik update`" % m.version.__version__)
+        return None, ("yt-dlp %s is too old to download from YouTube - %s"
+                      % (m.version.__version__, UPDATE_HINT))
     dest = folder()             # new songs land in your music folder
 
     # Played a moment ago? Then the song is already on the disk and this is a
@@ -4398,9 +4694,8 @@ def cmd_stream(args):
     if m is None:
         return fail(args.json, YTDLP_GONE, 1)
     if m.version.__version__ < YTDLP_MIN:
-        return fail(args.json, "yt-dlp %s is too old to stream from YouTube - "
-                    "update it with `simplmusik update`"
-                    % m.version.__version__, 1)
+        return fail(args.json, "yt-dlp %s is too old to stream from YouTube - %s"
+                    % (m.version.__version__, UPDATE_HINT), 1)
     if not have_player():
         return fail(args.json, "mpv not found - install mpv", 1)
     vid, why = video_ref(args.id)
@@ -4463,7 +4758,14 @@ def cmd_update(args):
     It lands in your own folder rather than beside the app, which is what lets
     this work the same whether simplmusik was unpacked into a folder you own
     or installed as a package owned by root. `ytdlp` prefers whichever copy is
-    newest, so the fetched one simply wins from here on."""
+    newest, so the fetched one simply wins from here on.
+
+    Not from a store install, which the store keeps current instead."""
+    if STORE:
+        return fail(args.json, "this is the %s build - yt-dlp %s ships inside it "
+                    "and is updated with the app: %s"
+                    % (STORE, zipapp_version(YTDLP_BUNDLED) or "(missing)",
+                       UPDATE_HINT), 1)
     import urllib.request                # only this command ever needs it
     was = zipapp_version(YTDLP_USER) or zipapp_version(YTDLP_BUNDLED)
     try:
@@ -4529,7 +4831,7 @@ COMMANDS = [
     ("cover",   "show, set or clear a playlist's cover art",      "playlist image?", "clear"),
     ("add",     "add songs to a playlist, by number, name or path", "playlist files+", None),
     ("search",  "search your library, or YouTube with --yt",      "query+",          "count yt"),
-    ("identify","name the song a TikTok is playing, to search for", "link+",         None),
+    ("identify","name the song a TikTok is playing, to search for", "link+",         "shazam"),
     ("download","download a search result into the library",      "id",              "to"),
     ("stream",  "play a search result now, and fetch it as it plays", "id",          "to"),
     ("remove",  "drop a song from a playlist, or delete it",      "playlist song?",  None),
@@ -4665,6 +4967,10 @@ def main(argv=None):
             elif f == "to":
                 p.add_argument("--to", metavar="PLAYLIST",
                                help="put it in this playlist as well as the library")
+            elif f == "shazam":
+                p.add_argument("--shazam", action="store_true",
+                               help="listen to the sound with Shazam, even when "
+                                    "TikTok says what it is")
 
     args = ap.parse_args(argv)
     if args.cmd == "help":

@@ -67,7 +67,11 @@ YouTube's audio any more. Press **Super**, type `music`, and it's there.
 ### Keeping downloads working
 
 YouTube changes how it hands out audio every few weeks. When downloads start
-failing, that's what it is:
+failing, that's what it is.
+
+Installed from a store (Flathub, the Snap Store), yt-dlp ships inside the app
+and updates with it - update simplmusik from your software store. Installed
+from the .deb or a checkout:
 
 ```sh
 simplmusik update
@@ -128,6 +132,7 @@ simplmusik list                          # All songs, then your playlists
 simplmusik play --shuffle
 simplmusik search wonderwall             # your library, numbered
 simplmusik search --yt wonderwall        # ...or YouTube
+simplmusik identify https://vm.tiktok.com/…  # the song a TikTok is playing
 simplmusik create "Road trip"
 simplmusik add "Road trip" 2             # the second row it just showed you
 ```

@@ -30,7 +30,7 @@ import time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
-VERSION = "0.2.2"          # what the next build will be; see bump()
+VERSION = "0.2.4"          # what the next build will be; see bump()
 PKG = "simplmusik"
 MAINTAINER = "Josh <john.mcgill@mail.com>"
 
@@ -80,6 +80,7 @@ DEPENDS = ["python3 (>= 3.10)",
            "mpv",
            "ffmpeg",
            "python3-mutagen",
+           "python3-numpy",
            "python3-gi",
            "gir1.2-webkit2-4.1"]
 
@@ -167,8 +168,11 @@ def tree(root, version, ytdlp_version):
     # Path= here: installed, the app is on the PATH and finds its own assets.
     inst = load_install()
     apps = put("usr", "share", "applications")
-    with open(os.path.join(apps, "simplmusik.desktop"), "w") as f:
+    with open(os.path.join(apps, APP_ID + ".desktop"), "w") as f:
         f.write(inst.desktop_entry("/usr/bin/simplmusik-ui"))
+    with open(os.path.join(put("usr", "share", "metainfo"),
+                           APP_ID + ".metainfo.xml"), "w") as f:
+        f.write(metainfo(version))
 
     print("  drawing icons ...", end=" ", flush=True)
     mw, mh, mask = inst.png_alpha(os.path.join(HERE, "web", "logo.png"))
@@ -192,10 +196,11 @@ def tree(root, version, ytdlp_version):
         f.write(changelog(version).encode())
 
 
-# There is no LICENSE file in the checkout, so there is nothing to copy one out
-# of. A package still has to say something, so it says so plainly rather than
-# picking a licence on your behalf - and the build prints a warning about it.
-LICENSE = "UNSET"
+# The app id, which names the menu entry and the store listing alike.
+APP_ID = "io.github.JJM8.simplmusik"
+METAINFO = os.path.join(HERE, APP_ID + ".metainfo.xml")
+
+LICENSE = "GPL-3+"          # LICENSE in the checkout; Debian's short name for it
 
 COPYRIGHT = """\
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
@@ -204,6 +209,7 @@ Upstream-Name: simplmusik
 Files: *
 Copyright: %s %s
 License: %s
+ On Debian systems the full text is in /usr/share/common-licenses/GPL-3.
 
 Files: usr/lib/simplmusik/yt-dlp
 Copyright: The yt-dlp maintainers
@@ -211,6 +217,17 @@ License: Unlicense
  yt-dlp %s is bundled here as a self-contained zipapp. It is released into
  the public domain; see https://github.com/yt-dlp/yt-dlp for the full text.
 """
+
+
+def metainfo(version):
+    """The store listing, with a <release> for `version` if it has none yet -
+    so a build is never shipped with a listing that says it is older."""
+    with open(METAINFO) as f:
+        text = f.read()
+    if 'version="%s"' % version not in text:
+        text = text.replace("<releases>", '<releases>\n    <release version="%s" date="%s"/>'
+                            % (version, time.strftime("%Y-%m-%d")), 1)
+    return text
 
 
 def changelog(version):
@@ -329,10 +346,6 @@ def main():
     # asked for by hand is yours and is left alone.
     if not pinned:
         print("\nnext build will be %s" % bump())
-    if LICENSE == "UNSET":
-        print("\nnote: there is no LICENSE file, so the package's copyright "
-              "says so.\n      Add one and set LICENSE in this script before "
-              "handing the .deb out.")
 
 
 if __name__ == "__main__":

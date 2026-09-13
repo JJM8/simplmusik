@@ -5,7 +5,7 @@ One file that installs on any distro with flatpak, because everything it needs
 - mpv, WebKit, ffmpeg, Python - is inside it rather than borrowed from your
 package manager. That is the whole reason this exists next to the .deb.
 
-The manifest is org.simplmusik.Player.yml and it does the heavy lifting. This
+The manifest is io.github.JJM8.simplmusik.yml and it does the heavy lifting. This
 script is what has to happen first: the icons are drawn from the logo art, the
 menu entry is written from the same function the other two installs use, and
 yt-dlp is fetched - the one thing no runtime can supply, because the archive
@@ -29,7 +29,7 @@ STAGE = os.path.join(BUILD, "flatpak")          # what the manifest reads
 TREE = os.path.join(BUILD, "flatpak-build")     # flatpak-builder's workspace
 REPO = os.path.join(BUILD, "flatpak-repo")      # the one-app repo it exports to
 
-APP_ID = "org.simplmusik.Player"
+APP_ID = "io.github.JJM8.simplmusik"
 MANIFEST = os.path.join(HERE, APP_ID + ".yml")
 RUNTIME, RUNTIME_VERSION = "org.gnome.Platform", "50"
 SDK = "org.gnome.Sdk"
@@ -74,7 +74,7 @@ def check_runtime():
                     "it" if len(missing) == 1 else "them", " ".join(missing)))
 
 
-def stage():
+def stage(version):
     """Everything the manifest expects to find already made."""
     if os.path.isdir(STAGE):
         shutil.rmtree(STAGE)
@@ -90,6 +90,8 @@ def stage():
     inst = load("install", "simplmusik_install")
     with open(os.path.join(STAGE, APP_ID + ".desktop"), "w") as f:
         f.write(inst.desktop_entry("/app/bin/simplmusik-ui", icon=APP_ID))
+    with open(os.path.join(STAGE, APP_ID + ".metainfo.xml"), "w") as f:
+        f.write(deb.metainfo(version))
 
     print("  drawing icons ...", end=" ", flush=True)
     mw, mh, mask = inst.png_alpha(os.path.join(HERE, "web", "logo.png"))
@@ -116,7 +118,7 @@ def main():
     check_runtime()
 
     print("building %s %s" % (APP_ID, version))
-    stage()
+    stage(version)
 
     print("  building the flatpak (mpv is compiled here - give it a while)")
     subprocess.run(build + ["--force-clean", "--disable-rofiles-fuse",

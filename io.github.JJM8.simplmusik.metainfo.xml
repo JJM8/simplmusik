@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The app's listing in software stores. The build scripts install it, adding
+     a <release> for the version being built when it isn't listed below. -->
+<component type="desktop-application">
+  <id>io.github.JJM8.simplmusik</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>simplmusik</name>
+  <summary>Play your local music library</summary>
+  <developer id="io.github.jjm8">
+    <name>JJM8</name>
+  </developer>
+
+  <description>
+    <p>
+      A simple music player for the music folder you already have. Make
+      playlists, shuffle, and play every song at the same volume.
+    </p>
+    <ul>
+      <li>Finds your music folder by itself</li>
+      <li>Playlists that sync between machines with your music folder</li>
+      <li>Even loudness across songs, without changing your files</li>
+      <li>Find songs online and add them to your library or a playlist</li>
+      <li>Listening stats: time listened, top songs and most skipped</li>
+      <li>A command line interface, with JSON output for scripts and assistants</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">io.github.JJM8.simplmusik.desktop</launchable>
+  <provides>
+    <binary>simplmusik</binary>
+    <binary>simplmusik-ui</binary>
+  </provides>
+
+  <url type="homepage">https://github.com/JJM8/simplmusik</url>
+  <url type="bugtracker">https://github.com/JJM8/simplmusik/issues</url>
+  <url type="vcs-browser">https://github.com/JJM8/simplmusik</url>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#ffb899</color>
+    <color type="primary" scheme_preference="dark">#7a2e10</color>
+  </branding>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>A playlist</caption>
+      <image>https://raw.githubusercontent.com/JJM8/simplmusik/main/screenshots/playlist.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Adding a song you don't have yet</caption>
+      <image>https://raw.githubusercontent.com/JJM8/simplmusik/main/screenshots/download.png</image>
+    </screenshot>
+  </screenshots>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>music</keyword>
+    <keyword>player</keyword>
+    <keyword>playlist</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.2.2" date="2026-09-13">
+      <description>
+        <p>Listening stats with top songs and most skipped, and a simpler settings page.</p>
+      </description>
+    </release>
+  </releases>
+</component>

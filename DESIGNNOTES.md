@@ -49,7 +49,7 @@ that cannot be a dependency - yt-dlp - rides along inside the package.
 The flatpak cannot lean on any of that, on a machine whose package manager it
 knows nothing about. The GNOME runtime turns out to cover most of it - WebKit
 4.1 by the name the window asks for, GTK 3, Python, and ffmpeg - so
-`org.simplmusik.Player.yml` builds only what is genuinely missing, which is
+`io.github.JJM8.simplmusik.yml` builds only what is genuinely missing, which is
 mpv and mutagen.
 
 mpv is built audio-only, and that is the difference between a couple of minutes
