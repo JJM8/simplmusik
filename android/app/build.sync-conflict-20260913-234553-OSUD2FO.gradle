@@ -60,7 +60,6 @@ android {
                 // port is a build and not a rewrite. Nothing here compiles.
                 install "mutagen"
                 install "yt-dlp"
-                install "numpy"      // the fingerprint `identify` sends Shazam
             }
         }
     }

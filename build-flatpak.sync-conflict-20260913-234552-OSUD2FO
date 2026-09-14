@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Build a .flatpak of simplmusik.
+
+One file that installs on any distro with flatpak, because everything it needs
+- mpv, WebKit, ffmpeg, Python - is inside it rather than borrowed from your
+package manager. That is the whole reason this exists next to the .deb.
+
+The manifest is org.simplmusik.Player.yml and it does the heavy lifting. This
+script is what has to happen first: the icons are drawn from the logo art, the
+menu entry is written from the same function the other two installs use, and
+yt-dlp is fetched - the one thing no runtime can supply, because the archive
+freezes versions and YouTube retires old extractors within months. All of it
+lands in build/flatpak, which is where the manifest looks for it.
+
+    ./build-flatpak                  # build simplmusik_<version>.flatpak
+    ./build-flatpak --version 0.2.0  # ...with a version of your choosing
+    ./build-flatpak --install        # ...and install it when it's done
+    ./build-flatpak --keep           # leave the build tree for a look
+
+Needs flatpak, and flatpak-builder either on the PATH or installed as
+org.flatpak.Builder - the build prints the command to get what's missing.
+"""
+
+import importlib.machinery, importlib.util, os, shutil, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BUILD = os.path.join(HERE, "build")
+STAGE = os.path.join(BUILD, "flatpak")          # what the manifest reads
+TREE = os.path.join(BUILD, "flatpak-build")     # flatpak-builder's workspace
+REPO = os.path.join(BUILD, "flatpak-repo")      # the one-app repo it exports to
+
+APP_ID = "org.simplmusik.Player"
+MANIFEST = os.path.join(HERE, APP_ID + ".yml")
+RUNTIME, RUNTIME_VERSION = "org.gnome.Platform", "50"
+SDK = "org.gnome.Sdk"
+SIZES = (32, 48, 64, 128, 256)
+
+
+def load(filename, modname):
+    """Import one of the sibling scripts. None of them end in .py, so they are
+    loaded by path rather than found on sys.path."""
+    path = os.path.join(HERE, filename)
+    loader = importlib.machinery.SourceFileLoader(modname, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def builder():
+    """flatpak-builder, however this machine happens to have it.
+
+    It ships as a flatpak itself now, so the packaged command is the more
+    likely of the two to be there."""
+    if shutil.which("flatpak-builder"):
+        return ["flatpak-builder"]
+    if subprocess.run(["flatpak", "info", "org.flatpak.Builder"],
+                      capture_output=True).returncode == 0:
+        return ["flatpak", "run", "org.flatpak.Builder"]
+    sys.exit("flatpak-builder isn't installed - get it with:\n"
+             "    flatpak install -y flathub org.flatpak.Builder")
+
+
+def check_runtime():
+    """The runtime and the SDK, or the line that installs them."""
+    missing = [r for r in ("%s//%s" % (RUNTIME, RUNTIME_VERSION),
+                           "%s//%s" % (SDK, RUNTIME_VERSION))
+               if subprocess.run(["flatpak", "info", r],
+                                 capture_output=True).returncode != 0]
+    if missing:
+        sys.exit("missing flatpak runtime%s - get %s with:\n    flatpak "
+                 "install -y flathub %s"
+                 % ("" if len(missing) == 1 else "s",
+                    "it" if len(missing) == 1 else "them", " ".join(missing)))
+
+
+def stage():
+    """Everything the manifest expects to find already made."""
+    if os.path.isdir(STAGE):
+        shutil.rmtree(STAGE)
+    os.makedirs(STAGE)
+
+    deb = load("build-deb", "simplmusik_build_deb")
+    ytdlp_version = deb.fetch_ytdlp(os.path.join(STAGE, "yt-dlp"))
+    print("  bundling yt-dlp %s" % ytdlp_version)
+
+    # No Path= - installed, the app is on the PATH inside the sandbox and
+    # finds its own assets. The icon is named for the app id because that is
+    # the only name a flatpak is allowed to export it under.
+    inst = load("install", "simplmusik_install")
+    with open(os.path.join(STAGE, APP_ID + ".desktop"), "w") as f:
+        f.write(inst.desktop_entry("/app/bin/simplmusik-ui", icon=APP_ID))
+
+    print("  drawing icons ...", end=" ", flush=True)
+    mw, mh, mask = inst.png_alpha(os.path.join(HERE, "web", "logo.png"))
+    accent = inst.rgb(inst.DEFAULT_ACCENT)
+    for size in SIZES:
+        inst.png_write(os.path.join(STAGE, "icon-%d.png" % size), size,
+                       inst.draw_icon(size, accent, mw, mh, mask))
+    print("%d sizes" % len(SIZES))
+    return ytdlp_version
+
+
+def main():
+    args = sys.argv[1:]
+    deb = load("build-deb", "simplmusik_build_deb_version")
+    version = deb.VERSION                       # one version, kept in build-deb
+    if "--version" in args:
+        i = args.index("--version")
+        if i + 1 >= len(args):
+            sys.exit("--version needs a number, e.g. --version 0.2.0")
+        version = args[i + 1]
+    if not shutil.which("flatpak"):
+        sys.exit("flatpak isn't installed - `sudo apt install flatpak`")
+    build = builder()
+    check_runtime()
+
+    print("building %s %s" % (APP_ID, version))
+    stage()
+
+    print("  building the flatpak (mpv is compiled here - give it a while)")
+    subprocess.run(build + ["--force-clean", "--disable-rofiles-fuse",
+                            "--repo=" + REPO, TREE, MANIFEST],
+                   check=True, cwd=HERE)
+
+    out = os.path.join(BUILD, "simplmusik_%s.flatpak" % version)
+    subprocess.run(["flatpak", "build-bundle", REPO, out, APP_ID,
+                    "--runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo"],
+                   check=True)
+    if "--keep" not in args:
+        shutil.rmtree(TREE, ignore_errors=True)
+
+    print("\n%s  (%.1f MB)" % (out, os.path.getsize(out) / 1e6))
+    if "--install" in args:
+        subprocess.run(["flatpak", "install", "--user", "-y", out], check=True)
+        print("\nInstalled. Press Super, type music.")
+    else:
+        print("\nInstall it with:\n    flatpak install --user %s" % out)
+
+
+if __name__ == "__main__":
+    main()

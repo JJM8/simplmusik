@@ -75,10 +75,8 @@ function ytSearch(paint, rename) {
     if (mine !== seq) return;             // the box has moved on since
     s.naming = false;
     if (r.ok && r.data?.song) return rename(r.data.song);
-    // Code 2 is a TikTok with no song anyone can name; anything else is that
-    // the asking went wrong, which is worth the one short reason.
-    s.error = r.code === 2 || !r.error ? 'Couldn’t find the song.'
-            : r.error.split(':')[0].replace(/^./, c => c.toUpperCase()) + '.';
+    s.error = 'Didn’t find anything.'
+            + (r.code === 2 || !r.error ? '' : ' (' + r.error + ')');
     paint();
   }
 
@@ -141,21 +139,23 @@ const adderFind = ytSearch(() => repaintAdder?.(), song => {
 /* The row that asks for the next handful. Shown while YouTube filled the last
    request completely, which is the only sign there is more to come. */
 function moreRow(s) {
-  if (s.more) return loading();
   const box = el('div', 'more');
-  const b = el('button', '', 'See more');
+  const b = el('button', '', s.more ? 'Looking\u2026' : 'See more');
+  b.disabled = s.more;
   b.onclick = () => s.showMore();
   box.append(b);
   return box;
 }
 
 function foundRows(box, s, pl) {
-  // Naming a TikTok and searching YouTube look the same from here: one wait,
-  // and then the songs. What the wait is made of is nobody's business.
-  if (s.naming || s.finding) return void box.append(loading());
   const h = el('div', 'found-head');
-  h.append(el('strong', '', 'Add from YouTube'));
+  // One heading either way: what is happening, or what these rows are.
+  h.append(el('strong', '', s.naming       ? 'Finding the song in that TikTok\u2026'
+                          : s.finding      ? 'Searching YouTube\u2026'
+                          : isTiktok(s.query) ? 'From TikTok'
+                                           : 'Add from YouTube'));
   box.append(h);
+  if (s.naming || s.finding) return;
   // A search that failed says so. Reporting it as 'nothing found' would send
   // you off rewording a query when yt-dlp simply isn't installed.
   if (s.error)          return void box.append(el('div', 'none', s.error));
@@ -515,9 +515,9 @@ function renderHead() {
     const t = el('div');
     // A TikTok link isn't what is being searched for - the song in it is - and
     // it is one unbroken line far wider than a phone besides.
-    t.append(el('h1', '', 'Search'));
-    if (!isTiktok(state.query))
-      t.append(el('div', 'sub', `${plural(songs.length, 'result')} for “${state.query}”`));
+    t.append(el('h1', '', 'Search'),
+             el('div', 'sub', isTiktok(state.query) ? 'From a TikTok link'
+               : `${plural(songs.length, 'result')} for “${state.query}”`));
     head.append(t);
     if (songs.length) {
       const acts = el('div', 'acts');
@@ -961,15 +961,8 @@ function render() {
   repaintAdder = null;          // whatever is on screen is about to be replaced
   // Typing in the search box leaves settings for the results, and clearing it
   // comes back - so the box works from here too, without a way out to find.
-  // Both are rebuilt whole - on the 15s reload too - and a rebuilt page lets
-  // the browser pick a new scroll position, so the old one is put back.
-  const page = !state.query && { [SETTINGS]: renderSettings, [STATS]: renderStats }[state.view];
-  if (page) {
-    const list = $('#list'), y = list.scrollTop;
-    page();
-    list.scrollTop = y;
-    return;
-  }
+  if (state.view === SETTINGS && !state.query) return renderSettings();
+  if (state.view === STATS && !state.query) return renderStats();
   renderHead();
   renderList();
 }
@@ -1203,7 +1196,9 @@ function renderSettings() {
     box.append(setRow(label('Use a different folder'),
                       ...folderPicker('Change\u2026')));
   }
-  page.append(box);
+  page.append(box, el('div', 'hint',
+    'Subfolders count too. Downloads and playlists land here. Changing the '
+    + 'folder moves your playlists across; no song is touched.'));
 
   page.append(el('div', 'set-sec', 'Playback'));
   const sound = el('div', 'panel');
@@ -1213,7 +1208,7 @@ function renderSettings() {
   const aim = targetRow();
   const show = on => on ? sound.append(aim) : aim.remove();
   sound.append(setRow(
-    label('Even loudness'),
+    label('Even loudness', 'Play every song at the same volume'),
     toggle(levelled, async on => {
       show(on);                 // follow the switch at once, not the round trip
       const r = await run('levelling', on ? 'on' : 'off');
@@ -1222,7 +1217,9 @@ function renderSettings() {
       return r.ok;
     })));
   show(levelled);
-  page.append(sound);
+  page.append(sound, el('div', 'hint',
+    'Songs are measured the first time you play them. Your files are never '
+    + 'changed, and nothing is ever turned up loud enough to distort.'));
 
   page.append(el('div', 'set-sec', 'Appearance'));
   const look = el('div', 'panel');
@@ -1230,7 +1227,9 @@ function renderSettings() {
     label('Theme'),
     segment([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']],
             themePick(), setTheme)));
-  page.append(look);
+  page.append(look, el('div', 'hint',
+    'System follows your desktop. This is a setting of this window on this '
+    + 'machine only.'));
 
   page.append(el('div', 'set-sec', 'Library'));
   const info = el('div', 'panel');
@@ -1239,7 +1238,9 @@ function renderSettings() {
                      el('div', 'val', String(state.lib.songs.length - missing))),
               setRow(label('Playlists'),
                      el('div', 'val', String(state.lib.playlists.length))),
-              setRow(label('Not found'), el('div', 'val', String(missing))),
+              setRow(label('Not found',
+                           missing ? 'In a playlist, not in your folder' : ''),
+                     el('div', 'val', String(missing))),
               setRow(label('Playlists folder'),
                      el('div', 'val', state.lib.playlists_dir || '')));
   page.append(info);
@@ -1259,8 +1260,8 @@ function renderSettings() {
    same one pulled back to half a year - a zoom rather than a new question. */
 
 const STEPS = [['hour', 'Hourly'], ['day', 'Daily'], ['week', 'Weekly']];
-const STEP_SUB = { hour: 'Last 48 hours', day: 'Last 30 days',
-                   week: 'Last 26 weeks' };
+const STEP_SUB = { hour: 'the last 48 hours', day: 'the last 30 days',
+                   week: 'the last 26 weeks' };
 
 /* Seconds as somebody would say them - the same wording the CLI prints, so
    one evening is never described two ways. */
@@ -1277,8 +1278,9 @@ const spellSecs = s => {
 async function loadStats() {
   const r = await call('stats');
   state.stats = r.ok ? (r.data || null) : null;
-  // The CLI refuses when there is nothing logged yet; the page only needs to
-  // know that it did, not why.
+  // The CLI refuses with a sentence when there is nothing logged yet, which is
+  // the right thing to put on an empty page, so it is kept rather than
+  // replaced with one of our own.
   state.statsWhy = r.ok ? null : (r.error || 'couldn’t read the play log');
 }
 
@@ -1342,7 +1344,6 @@ function drawChart(box, rows) {
   for (const t of ticks) {
     svg.append(node('line', { class: 'grid', x1: padL, x2: W - padR,
                               y1: y(t) + .5, y2: y(t) + .5 }));
-    if (!t) continue;               // the baseline needs no label
     const lab = node('text', { class: 'tick', x: padL - 9, y: y(t) + 4,
                                'text-anchor': 'end' });
     lab.textContent = tickText(t);
@@ -1378,11 +1379,14 @@ function drawChart(box, rows) {
   // Every hit target last, so all of them are above every bar. Interleaved
   // with the bars, a tall bar drawn after its neighbour's target would take
   // the pointer itself and the column next to it would go dead.
-  rows.forEach((_, i) => {
-    // The target is the whole column, not the bar, so a short bar is as easy
-    // to point at as a tall one.
+  rows.forEach((r, i) => {
+    // The target is the whole column of air, not the bar: an empty Tuesday has
+    // nothing to point at and is still worth being told about.
     const hit = node('rect', { class: 'hit', x: padL + i * band, y: padT,
                                width: band, height: plotH });
+    const why = node('title');
+    why.textContent = `${r.full} — ${r.heard ? spellSecs(r.heard) : 'nothing'}`;
+    hit.append(why);
     hit.dataset.i = i;
     svg.append(hit);
   });
@@ -1394,10 +1398,10 @@ function drawChart(box, rows) {
     const at = e.target.closest?.('.hit');
     if (!at) return;
     const i = +at.dataset.i, r = rows[i];
-    if (!r.heard) { tip.hidden = true; mark.setAttribute('opacity', '0'); return; }
     mark.setAttribute('x', padL + i * band);
     mark.setAttribute('opacity', '1');
-    tip.replaceChildren(el('div', 'k', r.full), el('div', 'v', spellSecs(r.heard)));
+    tip.replaceChildren(el('div', 'k', r.full),
+                        el('div', 'v', r.heard ? spellSecs(r.heard) : 'nothing'));
     tip.hidden = false;
     // Kept inside the box: near the right-hand edge it flips to the other
     // side of the column rather than hanging off the chart.
@@ -1408,24 +1412,6 @@ function drawChart(box, rows) {
   svg.onmouseleave = () => { tip.hidden = true; mark.setAttribute('opacity', '0'); };
 
   box.replaceChildren(svg, tip);
-}
-
-/* A ranked list of songs, five long, under the chart. Songs the library still
-   has wear their own title, artist and cover; one that has gone keeps its
-   filename. Nothing is drawn for a list with nothing in it. */
-function statList(page, title, groups, value) {
-  if (!groups.length) return;
-  page.append(el('div', 'set-sec', title));
-  const box = el('div', 'panel');
-  for (const g of groups.slice(0, 5)) {
-    const song = state.byFile[g.name]
-      || { title: g.name.replace(/\.[^.]+$/, ''), file: g.name, missing: true };
-    const art = el('div', 'art');
-    art.append(cover(song));
-    box.append(setRow(art, label(song.title, song.missing ? '' : song.artist),
-                      el('div', 'val', value(g))));
-  }
-  page.append(box);
 }
 
 // One observer for the page, reconnected each render: the chart is drawn at
@@ -1441,9 +1427,9 @@ function renderStats() {
   const page = el('div', 'settings');
   const s = state.stats;
   if (!s) {
-    if (!state.statsWhy) return void $('#list').replaceChildren(loading());
     const e = el('div', 'empty');
-    e.append(el('strong', '', 'Nothing to show yet'));
+    e.append(el('strong', '', state.statsWhy ? 'Nothing to show yet' : 'Reading…'));
+    if (state.statsWhy) e.append(el('div', '', state.statsWhy));
     e.style.padding = '40px 10px';
     page.append(e);
     return void $('#list').replaceChildren(page);
@@ -1457,11 +1443,11 @@ function renderStats() {
   // chart is showing - change the step and the number changes with it.
   const top = el('div', 'chart-head');
   const fig = el('div', 'fig');
-  fig.append(el('div', 'hero', total ? spellSecs(total) : 'Nothing yet'),
-             el('div', 'sub', STEP_SUB[step]));
+  fig.append(el('div', 'hero', spellSecs(total)),
+             el('div', 'sub', 'listening in ' + STEP_SUB[step]));
   top.append(fig, segment(STEPS, step, v => {
     state.statsStep = v;
-    render();
+    renderStats();
   }));
   page.append(top);
 
@@ -1470,11 +1456,10 @@ function renderStats() {
   panel.append(box);
   page.append(panel);
 
-  const songs = s.by_song || [];
-  statList(page, 'Top songs', songs.filter(g => g.heard > 0)
-    .sort((a, b) => b.heard - a.heard), g => spellSecs(g.heard));
-  statList(page, 'Most skipped', songs.filter(g => g.skips > 0)
-    .sort((a, b) => b.skips - a.skips || b.plays - a.plays), g => plural(g.skips, 'skip'));
+  page.append(el('div', 'hint',
+    'Time your ears actually did: a song paused is not counted, and a song you '
+    + 'played twice over is counted twice. Read out of the play log in your '
+    + 'music folder — `simplmusik stats` says the same in a terminal.'));
 
   $('#list').replaceChildren(page);
 
@@ -1513,14 +1498,6 @@ function ring() {
   n.innerHTML = '<circle class="rail" cx="8" cy="8" r="6.2"/>'
               + '<circle class="arc" cx="8" cy="8" r="6.2"/>';
   return n;
-}
-
-/* Anything that takes a moment says so the same way: the download's ring,
-   turning, and one word. */
-function loading() {
-  const box = el('div', 'loading');
-  box.append(ring(), el('span', '', 'Loading…'));
-  return box;
 }
 
 /* How far along a download is, or undefined until the CLI has said anything.
