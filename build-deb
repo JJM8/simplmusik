@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
 VERSION = "0.2.4"          # what the next build will be; see bump()
 PKG = "simplmusik"
-MAINTAINER = "Josh <john.mcgill@mail.com>"
+MAINTAINER = "Josh <mcgilljoshy2@gmail.com>"
 
 # Where the app lands. One folder holding the lot, because the three scripts
 # find each other and their web assets relative to their own path - so as long
@@ -95,7 +95,7 @@ DESCRIPTION = """\
 
 
 def load_install():
-    """The installer, imported for its icon drawing - it has no .py on the end
+    """The installer, imported for its menu entry - it has no .py on the end
     of it, so it is loaded by path rather than found on sys.path."""
     path = os.path.join(HERE, "install")
     loader = importlib.machinery.SourceFileLoader("simplmusik_install", path)
@@ -174,14 +174,10 @@ def tree(root, version, ytdlp_version):
                            APP_ID + ".metainfo.xml"), "w") as f:
         f.write(metainfo(version))
 
-    print("  drawing icons ...", end=" ", flush=True)
-    mw, mh, mask = inst.png_alpha(os.path.join(HERE, "web", "logo.png"))
-    accent = inst.rgb(inst.DEFAULT_ACCENT)
     for size in SIZES:
         d = put("usr", "share", "icons", "hicolor", "%dx%d" % (size, size), "apps")
-        inst.png_write(os.path.join(d, "simplmusik.png"), size,
-                       inst.draw_icon(size, accent, mw, mh, mask))
-    print("%d sizes" % len(SIZES))
+        shutil.copy2(os.path.join(HERE, "icons", "simplmusik-%d.png" % size),
+                     os.path.join(d, "simplmusik.png"))
 
     doc = put("usr", "share", "doc", PKG)
     for name in ("README.md", "DESIGNNOTES.md"):

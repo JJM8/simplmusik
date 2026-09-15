@@ -14,9 +14,12 @@
 # are here only because mpv refuses to configure without them, and they are
 # cut down to match.
 #
-# `./build-flatpak` fetches yt-dlp and draws the icons into build/flatpak
-# before running this. Build it by hand with that script, not flatpak-builder
-# on its own, or those files won't be there.
+# Every file that goes into the app is listed below with where it comes from:
+# the app's own files from this repository, and everything downloaded - yt-dlp
+# included - by URL and checksum. That is what lets Flathub build it on its
+# own servers, where there is no network once the build starts and none of
+# the scripts in this folder are run. `./build-flatpak --fresh` moves yt-dlp
+# to its newest release.
 
 app-id: io.github.JJM8.simplmusik
 runtime: org.gnome.Platform
@@ -183,7 +186,7 @@ modules:
       - install -Dm644 -t /app/share/applications io.github.JJM8.simplmusik.desktop
       - install -Dm644 -t /app/share/metainfo io.github.JJM8.simplmusik.metainfo.xml
       - install -Dm644 -t /app/share/licenses/io.github.JJM8.simplmusik LICENSE
-      - for s in 32 48 64 128 256; do install -Dm644 icon-$s.png
+      - for s in 32 48 64 128 256; do install -Dm644 icons/simplmusik-$s.png
         /app/share/icons/hicolor/${s}x${s}/apps/io.github.JJM8.simplmusik.png; done
     sources:
       - type: file
@@ -195,21 +198,24 @@ modules:
       - type: dir
         path: web
         dest: web
+      # yt-dlp, which is pure Python in one file. YouTube changes how it hands
+      # out audio every few weeks, so keep this on the newest release; the
+      # x-checker-data tells Flathub's bot to open that update for you.
       - type: file
-        path: build/flatpak/yt-dlp
+        dest-filename: yt-dlp
+        url: https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp
+        sha256: 1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6
+        x-checker-data:
+          type: json
+          url: https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest
+          version-query: .tag_name
+          url-query: .assets[] | select(.name=="yt-dlp") | .browser_download_url
       - type: file
         path: LICENSE
       - type: file
-        path: build/flatpak/io.github.JJM8.simplmusik.desktop
+        path: io.github.JJM8.simplmusik.desktop
       - type: file
-        path: build/flatpak/io.github.JJM8.simplmusik.metainfo.xml
-      - type: file
-        path: build/flatpak/icon-32.png
-      - type: file
-        path: build/flatpak/icon-48.png
-      - type: file
-        path: build/flatpak/icon-64.png
-      - type: file
-        path: build/flatpak/icon-128.png
-      - type: file
-        path: build/flatpak/icon-256.png
+        path: io.github.JJM8.simplmusik.metainfo.xml
+      - type: dir
+        path: icons
+        dest: icons

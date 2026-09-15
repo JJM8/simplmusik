@@ -27,6 +27,18 @@ not stop a release of the two that were always there.
 
     ./build-all --no-apk         # skip it even where it would have worked
 
+Once everything is built, the packages replace the ones on the latest GitHub
+release under the names without a version in them - simplmusik.flatpak,
+simplmusik_all.deb, simplmusik.apk - which are the files the README's download
+buttons point at. So a build here is what the next person to press one gets.
+`./build-apk` on its own never does this: it is for putting a build on your own
+phone, not for handing one out.
+
+    ./build-all --no-publish     # build, but leave the release alone
+
+Publishing needs the GitHub CLI, logged in (`gh auth login`). Without it the
+builds are kept and a line says nothing was uploaded.
+
 Use --fresh when cutting a release. The yt-dlp in build/yt-dlp.cache is reused
 between builds, which is what you want while working and not what you want in
 something you hand out - YouTube retires extractors within months, and a
@@ -37,7 +49,7 @@ for another, a JDK and an Android SDK for the third. Each says so itself if
 it's missing.
 """
 
-import importlib.machinery, importlib.util, os, subprocess, sys, time
+import importlib.machinery, importlib.util, os, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
@@ -92,6 +104,8 @@ def main():
     flatpak_args = list(passthrough)
     if "--install" in args:
         flatpak_args.append("--install")
+    if "--fresh" in args:
+        flatpak_args.append("--fresh")      # the flatpak pins yt-dlp in its manifest
 
     # The APK needs an SDK the other two don't, so whether it is being built
     # is settled - and said - before anything starts, rather than surfacing as
@@ -115,12 +129,59 @@ def main():
         print("next build will be %s" % deb.bump())
 
     print("\n=== done in %s ===\n" % human(took))
-    for name in ("simplmusik_%s_all.deb" % version,
-                 "simplmusik_%s.flatpak" % version,
-                 "simplmusik_%s.apk" % version):
+    built = {}
+    for name, button in (("simplmusik_%s_all.deb" % version, "simplmusik_all.deb"),
+                         ("simplmusik_%s.flatpak" % version, "simplmusik.flatpak"),
+                         ("simplmusik_%s.apk" % version, "simplmusik.apk")):
         p = os.path.join(BUILD, name)
         if os.path.isfile(p):
             print("  build/%-32s %6.1f MB" % (name, os.path.getsize(p) / 1e6))
+            built[button] = p
+
+    if "--no-publish" not in args:
+        publish(built)
+
+
+def publish(built):
+    """Replace the files the README's download buttons point at.
+
+    The buttons link to releases/latest/download/<name>, so the name has to
+    stay the same from one build to the next - the version is in the release,
+    not the filename. Staged as copies under those names because an upload is
+    named after the file it reads."""
+    if not built:
+        return
+    if not shutil.which("gh"):
+        print("\nno GitHub CLI (gh), so the release was left alone")
+        return
+    r = subprocess.run(["gh", "release", "view", "--json", "tagName", "--jq", ".tagName"],
+                       cwd=HERE, capture_output=True, text=True)
+    tag = r.stdout.strip()
+    if r.returncode or not tag:
+        print("\ncouldn't find a latest release to update, so nothing was uploaded:\n  %s"
+              % (r.stderr.strip() or "no releases yet - make one with `gh release create`"))
+        return
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                           cwd=HERE, capture_output=True, text=True).stdout.strip()
+    if dirty:
+        print("\nnote: there are uncommitted changes - this build includes them")
+
+    stage = os.path.join(BUILD, "release")
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    files = []
+    for button, src in built.items():
+        dst = os.path.join(stage, button)
+        shutil.copyfile(src, dst)
+        files.append(dst)
+
+    print("\n=== uploading to release %s ===\n" % tag, flush=True)
+    r = subprocess.run(["gh", "release", "upload", tag, "--clobber"] + files, cwd=HERE)
+    if r.returncode:
+        print("\nthe upload failed - the builds are still in build/")
+        return
+    for button in built:
+        print("  %s" % button)
 
 
 def have_sdk():

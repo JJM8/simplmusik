@@ -76,15 +76,11 @@ line wrapper in `~/.local/bin` handing its arguments back to the sandbox.
 
 ```sh
 ./install                     # adds it to the applications menu
-./install --accent '#0c75de'  # ...with the icon in a different colour
 ./install --uninstall
 ```
 
-`./install` also reports what's missing. It draws the icons itself, out of
-`zlib` and `struct` - decoding the logo's alpha, area-averaging it down, and
-writing the PNGs - rather than depending on an imaging library, because asking
-somebody to install Pillow before they can put a music player in their menu is
-a worse trade than a hundred lines.
+`./install` also reports what's missing. The icons it installs are the PNGs in
+`icons/`, the same ones the .deb and the flatpak ship.
 
 Then press **Super**, type `music`, and it's there. Nothing goes anywhere
 system-wide - just a `.desktop` entry and icons under `~/.local/share`, both
@@ -743,9 +739,8 @@ row, the progress bar - reads from that one variable, so editing it there is the
 whole job.
 
 The logo (`web/logo.png`) is the note art as an alpha mask, so it's painted with
-`--accent` rather than being a fixed-colour image. The menu icon is drawn from
-the same mask, but a PNG on disk can't follow a CSS variable, so its colour is
-baked in at install time - `./install --accent '#0c75de'` redraws it.
+`--accent` rather than being a fixed-colour image. The menu icon can't follow a
+CSS variable, so it is fixed PNGs in `icons/`, in the default orange.
 
 ### Light and dark
 

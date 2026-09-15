@@ -5,27 +5,31 @@ One file that installs on any distro with flatpak, because everything it needs
 - mpv, WebKit, ffmpeg, Python - is inside it rather than borrowed from your
 package manager. That is the whole reason this exists next to the .deb.
 
-The manifest is io.github.JJM8.simplmusik.yml and it does the heavy lifting. This
-script is what has to happen first: the icons are drawn from the logo art, the
-menu entry is written from the same function the other two installs use, and
-yt-dlp is fetched - the one thing no runtime can supply, because the archive
-freezes versions and YouTube retires old extractors within months. All of it
-lands in build/flatpak, which is where the manifest looks for it.
+The manifest is io.github.JJM8.simplmusik.yml and it does all the work: every
+file in the app is listed there, from this repository or by URL and checksum,
+which is the same manifest Flathub builds from. This script only runs it and
+packs the result into one file you can hand to someone.
 
     ./build-flatpak                  # build simplmusik_<version>.flatpak
     ./build-flatpak --version 0.2.0  # ...with a version of your choosing
+    ./build-flatpak --fresh          # ...moving yt-dlp to its newest release
     ./build-flatpak --install        # ...and install it when it's done
     ./build-flatpak --keep           # leave the build tree for a look
+
+The version being built gets a <release> in the metainfo if it has none yet,
+written into the file in this folder rather than a copy, so it is there to be
+committed for Flathub. --fresh likewise rewrites the manifest's yt-dlp URL and
+checksum in place.
 
 Needs flatpak, and flatpak-builder either on the PATH or installed as
 org.flatpak.Builder - the build prints the command to get what's missing.
 """
 
-import importlib.machinery, importlib.util, os, shutil, subprocess, sys
+import hashlib, importlib.machinery, importlib.util, json, os, re, shutil, subprocess, sys
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
-STAGE = os.path.join(BUILD, "flatpak")          # what the manifest reads
 TREE = os.path.join(BUILD, "flatpak-build")     # flatpak-builder's workspace
 REPO = os.path.join(BUILD, "flatpak-repo")      # the one-app repo it exports to
 
@@ -33,7 +37,6 @@ APP_ID = "io.github.JJM8.simplmusik"
 MANIFEST = os.path.join(HERE, APP_ID + ".yml")
 RUNTIME, RUNTIME_VERSION = "org.gnome.Platform", "50"
 SDK = "org.gnome.Sdk"
-SIZES = (32, 48, 64, 128, 256)
 
 
 def load(filename, modname):
@@ -74,33 +77,44 @@ def check_runtime():
                     "it" if len(missing) == 1 else "them", " ".join(missing)))
 
 
-def stage(version):
-    """Everything the manifest expects to find already made."""
-    if os.path.isdir(STAGE):
-        shutil.rmtree(STAGE)
-    os.makedirs(STAGE)
+def fresh_ytdlp():
+    """Point the manifest at the newest yt-dlp release, checksum and all.
 
+    The checksum is worked out from the file itself rather than taken from
+    the release page, so what goes in the manifest is what was downloaded."""
+    print("  checking for a newer yt-dlp ...", end=" ", flush=True)
+    try:
+        with urllib.request.urlopen(
+                "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+                timeout=30) as r:
+            tag = json.load(r)["tag_name"]
+        url = "https://github.com/yt-dlp/yt-dlp/releases/download/%s/yt-dlp" % tag
+        with urllib.request.urlopen(url, timeout=180) as r:
+            sha = hashlib.sha256(r.read()).hexdigest()
+    except Exception as e:
+        sys.exit("\ncouldn't check yt-dlp: %s" % e)
+    with open(MANIFEST) as f:
+        text = f.read()
+    new = re.sub(r"url: https://github.com/yt-dlp/yt-dlp/releases/download/\S+/yt-dlp\n"
+                 r"(\s*)sha256: [0-9a-f]{64}",
+                 lambda m: "url: %s\n%ssha256: %s" % (url, m.group(1), sha), text)
+    if new == text and url not in text:
+        sys.exit("\ncouldn't find the yt-dlp source in %s" % MANIFEST)
+    with open(MANIFEST, "w") as f:
+        f.write(new)
+    print(tag)
+
+
+def note_release(version):
+    """Give the metainfo a <release> for this version if it hasn't one."""
     deb = load("build-deb", "simplmusik_build_deb")
-    ytdlp_version = deb.fetch_ytdlp(os.path.join(STAGE, "yt-dlp"))
-    print("  bundling yt-dlp %s" % ytdlp_version)
-
-    # No Path= - installed, the app is on the PATH inside the sandbox and
-    # finds its own assets. The icon is named for the app id because that is
-    # the only name a flatpak is allowed to export it under.
-    inst = load("install", "simplmusik_install")
-    with open(os.path.join(STAGE, APP_ID + ".desktop"), "w") as f:
-        f.write(inst.desktop_entry("/app/bin/simplmusik-ui", icon=APP_ID))
-    with open(os.path.join(STAGE, APP_ID + ".metainfo.xml"), "w") as f:
-        f.write(deb.metainfo(version))
-
-    print("  drawing icons ...", end=" ", flush=True)
-    mw, mh, mask = inst.png_alpha(os.path.join(HERE, "web", "logo.png"))
-    accent = inst.rgb(inst.DEFAULT_ACCENT)
-    for size in SIZES:
-        inst.png_write(os.path.join(STAGE, "icon-%d.png" % size), size,
-                       inst.draw_icon(size, accent, mw, mh, mask))
-    print("%d sizes" % len(SIZES))
-    return ytdlp_version
+    text = deb.metainfo(version)
+    with open(deb.METAINFO) as f:
+        if f.read() == text:
+            return
+    with open(deb.METAINFO, "w") as f:
+        f.write(text)
+    print("  added release %s to the metainfo" % version)
 
 
 def main():
@@ -118,7 +132,9 @@ def main():
     check_runtime()
 
     print("building %s %s" % (APP_ID, version))
-    stage(version)
+    if "--fresh" in args:
+        fresh_ytdlp()
+    note_release(version)
 
     print("  building the flatpak (mpv is compiled here - give it a while)")
     subprocess.run(build + ["--force-clean", "--disable-rofiles-fuse",

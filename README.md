@@ -10,6 +10,10 @@ A local music player. Written in Python, native to Linux.
 
 [![Download the .deb](https://img.shields.io/badge/Download-.deb%20for%20Debian%20%2F%20Ubuntu-2ea44f?style=for-the-badge&logo=debian&logoColor=white)](https://github.com/JJM8/simplmusik/releases/latest/download/simplmusik_all.deb)
 
+**Android phones. Install the APK directly - you may need to allow installs from your browser or file manager.**
+
+[![Download the APK](https://img.shields.io/badge/Download-.apk%20for%20Android-3ddc84?style=for-the-badge&logo=android&logoColor=white)](https://github.com/JJM8/simplmusik/releases/latest/download/simplmusik.apk)
+
 **Anywhere else, run it straight from a checkout - `./install` puts it in your menu.**
 
 - plays the music on your own machine

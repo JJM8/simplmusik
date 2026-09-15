@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """Put simplmusik in the applications menu.
 
-Renders the app icon from the logo art in whatever accent you like, writes a
-.desktop entry pointing at this checkout, and refreshes the menu database.
-Nothing is installed system-wide; it all lands under ~/.local/share.
+Copies the app icon from icons/, writes a .desktop entry pointing at this
+checkout, and refreshes the menu database. Nothing is installed system-wide;
+it all lands under ~/.local/share.
 
-    ./install                        # install with the default orange
-    ./install --accent '#0c75de'     # ...or any colour you fancy
+    ./install
     ./install --uninstall
 """
 
-import math, os, shutil, struct, subprocess, sys, zlib
+import os, shutil, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.expanduser("~/.local/share")
 APPS = os.path.join(DATA, "applications")
 DESKTOP = os.path.join(APPS, "simplmusik.desktop")
+ICONS = os.path.join(HERE, "icons")
 SIZES = (32, 48, 64, 128, 256)
-DEFAULT_ACCENT = "#ff7139"
 
 def icon_path(size):
     return os.path.join(DATA, "icons", "hicolor", "%dx%d" % (size, size),
@@ -27,168 +26,12 @@ def installed():
     """Every file the install puts in your menu."""
     return [DESKTOP] + [icon_path(s) for s in SIZES]
 
-def rgb(hex_):
-    h = hex_.lstrip("#")
-    if len(h) != 6 or any(c not in "0123456789abcdefABCDEF" for c in h):
-        sys.exit("not a colour: %s (want something like '#ff7139')" % hex_)
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-
-# ------------------------------------------------------------------- drawing
-# The icons are drawn here rather than by an imaging library, because the whole
-# job is one rounded tile, one mask and a shrink - and asking somebody to
-# install Pillow before they can put a music player in their menu is a worse
-# trade than the hundred lines below. Nothing here is imported that Python
-# doesn't already ship with.
-
-TILE = (46, 46, 51)     # the dark tile the mark sits on
-SS = 4                  # subsamples down a pixel, where the only curve is
-
-def png_alpha(path):
-    """The alpha channel of an 8-bit RGBA PNG, as width, height and one byte a
-    pixel. Only the shape of the mark is wanted - its colours are thrown away
-    and replaced with the accent - so the other three channels are dropped."""
-    d = open(path, "rb").read()
-    if d[:8] != b"\x89PNG\r\n\x1a\n":
-        sys.exit("%s isn't a PNG" % path)
-    i, idat, hdr = 8, [], None
-    while i + 8 <= len(d):
-        ln, typ = struct.unpack(">I4s", d[i:i + 8])
-        if typ == b"IHDR":
-            hdr = struct.unpack(">IIBBBBB", d[i + 8:i + 21])
-        elif typ == b"IDAT":
-            idat.append(d[i + 8:i + 8 + ln])
-        elif typ == b"IEND":
-            break
-        i += 12 + ln
-    w, h, depth, colour, _, _, interlace = hdr
-    if (depth, colour, interlace) != (8, 6, 0):
-        sys.exit("%s must be an 8-bit RGBA PNG, not interlaced" % path)
-
-    # Undo the per-row filters. Every row is predicted from the one before it
-    # and the pixel to its left, so they can only be walked in order.
-    raw = zlib.decompress(b"".join(idat))
-    stride, bpp = w * 4, 4
-    alpha = bytearray(w * h)
-    prev, pos = bytearray(stride), 0
-    for y in range(h):
-        f = raw[pos]
-        line = bytearray(raw[pos + 1:pos + 1 + stride])
-        pos += 1 + stride
-        if f == 1:                                          # sub
-            for x in range(bpp, stride):
-                line[x] = (line[x] + line[x - bpp]) & 255
-        elif f == 2:                                        # up
-            for x in range(stride):
-                line[x] = (line[x] + prev[x]) & 255
-        elif f == 3:                                        # average
-            for x in range(stride):
-                a = line[x - bpp] if x >= bpp else 0
-                line[x] = (line[x] + ((a + prev[x]) >> 1)) & 255
-        elif f == 4:                                        # paeth
-            for x in range(stride):
-                a = line[x - bpp] if x >= bpp else 0
-                c = prev[x - bpp] if x >= bpp else 0
-                b = prev[x]
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                line[x] = (line[x] + (a if pa <= pb and pa <= pc
-                                      else b if pb <= pc else c)) & 255
-        elif f:
-            sys.exit("%s uses PNG filter %d, which this doesn't read" % (path, f))
-        alpha[y * w:(y + 1) * w] = line[3::4]
-        prev = line
-    return w, h, alpha
-
-def resample(src, w, h, nw, nh):
-    """One channel, shrunk by exact area average - every source pixel counted
-    for as much of it as lands in the target one. For shrinking a mask that is
-    the whole of what a good filter has to do, and it needs no window."""
-    sx, sy = w / nw, h / nh
-    out = bytearray(nw * nh)
-    for ny in range(nh):
-        y0, y1 = ny * sy, (ny + 1) * sy
-        acc = [0.0] * w                             # the rows this one spans
-        for y in range(int(y0), min(h, math.ceil(y1))):
-            f, base = min(y + 1, y1) - max(y, y0), y * w
-            for x in range(w):
-                acc[x] += src[base + x] * f
-        for nx in range(nw):                        # then across them
-            x0, x1 = nx * sx, (nx + 1) * sx
-            t = 0.0
-            for x in range(int(x0), min(w, math.ceil(x1))):
-                t += acc[x] * (min(x + 1, x1) - max(x, x0))
-            out[ny * nw + nx] = min(255, int(t / (sx * sy) + 0.5))
-    return out
-
-def rounded(size, radius):
-    """How much of each pixel a rounded square covers, 0-255.
-
-    A row of one is a single unbroken span, so the coverage across it is exact
-    arithmetic rather than sampling; only going down the row is there a curve
-    to sample, and %d steps of it is enough to leave no stair visible.""" % SS
-    S, R = size * SS, radius * SS
-    cov = [0.0] * (size * size)
-    for ys in range(S):
-        yc = ys + 0.5
-        if yc < R:                                  # into the top corners
-            dx = R - math.sqrt(max(0.0, R * R - (R - yc) ** 2))
-        elif yc > S - R:                            # into the bottom ones
-            dx = R - math.sqrt(max(0.0, R * R - (yc - (S - R)) ** 2))
-        else:
-            dx = 0.0                                # the straight middle
-        lo, hi, row = dx, S - dx, (ys // SS) * size
-        for c in range(int(lo // SS), min(size, math.ceil(hi / SS))):
-            a, b = c * SS, c * SS + SS
-            cov[row + c] += (min(b, hi) - max(a, lo)) / (SS * SS)
-    return bytearray(min(255, int(v * 255 + 0.5)) for v in cov)
-
-def png_write(path, size, rgba):
-    """An 8-bit RGBA PNG. The rows go unfiltered: these are small, flat images
-    and zlib alone gets them smaller than Pillow was managing."""
-    def chunk(typ, data):
-        return (struct.pack(">I", len(data)) + typ + data
-                + struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff))
-    raw = bytearray()
-    for y in range(size):
-        raw.append(0)
-        raw += rgba[y * size * 4:(y + 1) * size * 4]
-    with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)))
-        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 9)))
-        f.write(chunk(b"IEND", b""))
-
-def draw_icon(size, accent, mw, mh, mask):
-    """One icon: the mark in the accent, over the dark tile, over nothing."""
-    cov = rounded(size, size * 0.22)
-    aw = max(1, round(size * 0.62))                 # the mark, inset in the tile
-    ah = max(1, round(aw * mh / mw))
-    art = resample(mask, mw, mh, aw, ah)
-    ox, oy = (size - aw) // 2, (size - ah) // 2
-    out = bytearray(size * size * 4)
-    for y in range(size):
-        inside = oy <= y < oy + ah
-        for x in range(size):
-            c = cov[y * size + x] / 255.0
-            a = (art[(y - oy) * aw + (x - ox)] / 255.0
-                 if inside and ox <= x < ox + aw else 0.0)
-            oa = a + c * (1 - a)                    # mark over tile
-            if oa <= 0.0:
-                continue                            # already transparent black
-            k, i = c * (1 - a), (y * size + x) * 4
-            for ch in range(3):
-                out[i + ch] = int((accent[ch] * a + TILE[ch] * k) / oa + 0.5)
-            out[i + 3] = int(oa * 255 + 0.5)
-    return out
-
-def draw_icons(accent):
-    """The logo art is an alpha mask, so the mark can be painted any colour -
-    here on a dark rounded tile, which is what reads as an app icon in a menu."""
-    mw, mh, mask = png_alpha(os.path.join(HERE, "web", "logo.png"))
+def install_icons():
+    """The app icon, copied into your icon theme from icons/ in this folder."""
     for size in SIZES:
         out = icon_path(size)
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        png_write(out, size, draw_icon(size, accent, mw, mh, mask))
+        shutil.copyfile(os.path.join(ICONS, "simplmusik-%d.png" % size), out)
     return len(SIZES)
 
 def desktop_entry(exec_path, working_dir=None, icon="simplmusik"):
@@ -315,21 +158,14 @@ def main():
     args = sys.argv[1:]
     if "--uninstall" in args:
         return uninstall()
-    accent = DEFAULT_ACCENT
-    if "--accent" in args:
-        i = args.index("--accent")
-        if i + 1 >= len(args):
-            sys.exit("--accent needs a colour, e.g. --accent '#0c75de'")
-        accent = args[i + 1]
 
-    n = draw_icons(rgb(accent))
+    n = install_icons()
     write_desktop()
     refresh()
-    print("installed simplmusik: %d icon sizes in %s" % (n, accent))
+    print("installed simplmusik: %d icon sizes" % n)
     print("  %s\n" % DESKTOP)
     if check():
         print("\nPress Super and type 'music' - it should be there.")
-    print("\nTo change the icon colour later:  ./install --accent '#0c75de'")
 
 if __name__ == "__main__":
     main()

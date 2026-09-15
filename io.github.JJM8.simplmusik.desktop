@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=simplmusik
+GenericName=Music Player
+Comment=Play your music library
+Exec=simplmusik-ui %U
+Icon=io.github.JJM8.simplmusik
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=music;audio;player;playlist;song;
+StartupNotify=true
+StartupWMClass=simplmusik
