@@ -165,6 +165,21 @@ public final class Playback {
     public void seek(double seconds) { main.post(() -> player.seekTo((long) (seconds * 1000))); }
 
     /**
+     * A song's mean square and peak in dBFS, for the CLI to work its gain out
+     * from - or null if it can't be decoded. Decodes the whole file, so it
+     * runs on the caller's thread, which is the CLI's background measuring and
+     * never the player's.
+     */
+    public double[] measure(String path) {
+        try {
+            return Decoder.levels(path);
+        } catch (Exception e) {
+            Log.w(TAG, "could not measure " + path, e);
+            return null;
+        }
+    }
+
+    /**
      * Take the song away, and say that it went.
      *
      * <p>Saying so is the whole of it. mpv answers a `stop` with an end-file

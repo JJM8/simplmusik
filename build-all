@@ -27,8 +27,9 @@ not stop a release of the two that were always there.
 
     ./build-all --no-apk         # skip it even where it would have worked
 
-Once everything is built, the packages replace the ones on the latest GitHub
-release under the names without a version in them - simplmusik.flatpak,
+Once everything is built, the packages go up on the GitHub release for this
+version - v0.2.4 for 0.2.4, made if it isn't there yet and marked latest -
+under the names without a version in them - simplmusik.flatpak,
 simplmusik_all.deb, simplmusik.apk - which are the files the README's download
 buttons point at. So a build here is what the next person to press one gets.
 `./build-apk` on its own never does this: it is for putting a build on your own
@@ -139,27 +140,33 @@ def main():
             built[button] = p
 
     if "--no-publish" not in args:
-        publish(built)
+        publish(built, version)
 
 
-def publish(built):
-    """Replace the files the README's download buttons point at.
+NOTES = """\
+**Linux (any distro):** download `simplmusik.flatpak`, then
 
-    The buttons link to releases/latest/download/<name>, so the name has to
-    stay the same from one build to the next - the version is in the release,
-    not the filename. Staged as copies under those names because an upload is
-    named after the file it reads."""
+    flatpak install --user ./simplmusik.flatpak
+
+**Debian / Ubuntu / Mint:** download `simplmusik_all.deb`, then
+
+    sudo apt install ./simplmusik_all.deb
+
+**Android:** download `simplmusik.apk` and open it on your phone.
+"""
+
+
+def publish(built, version):
+    """Put the packages on the release for `version`, making it if need be.
+
+    The README's buttons link to releases/latest/download/<name>, so the name
+    has to stay the same from one build to the next - the version is in the
+    release, not the filename. Staged as copies under those names because an
+    upload is named after the file it reads."""
     if not built:
         return
     if not shutil.which("gh"):
-        print("\nno GitHub CLI (gh), so the release was left alone")
-        return
-    r = subprocess.run(["gh", "release", "view", "--json", "tagName", "--jq", ".tagName"],
-                       cwd=HERE, capture_output=True, text=True)
-    tag = r.stdout.strip()
-    if r.returncode or not tag:
-        print("\ncouldn't find a latest release to update, so nothing was uploaded:\n  %s"
-              % (r.stderr.strip() or "no releases yet - make one with `gh release create`"))
+        print("\nno GitHub CLI (gh), so nothing was uploaded")
         return
     dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
                            cwd=HERE, capture_output=True, text=True).stdout.strip()
@@ -175,9 +182,17 @@ def publish(built):
         shutil.copyfile(src, dst)
         files.append(dst)
 
-    print("\n=== uploading to release %s ===\n" % tag, flush=True)
-    r = subprocess.run(["gh", "release", "upload", tag, "--clobber"] + files, cwd=HERE)
-    if r.returncode:
+    tag = "v" + version
+    exists = subprocess.run(["gh", "release", "view", tag], cwd=HERE,
+                            capture_output=True).returncode == 0
+    print("\n=== %s release %s ===\n" % ("uploading to" if exists else "creating", tag),
+          flush=True)
+    if exists:
+        cmd = ["gh", "release", "upload", tag, "--clobber"] + files
+    else:
+        cmd = ["gh", "release", "create", tag, "--latest",
+               "--title", "simplmusik " + version, "--notes", NOTES] + files
+    if subprocess.run(cmd, cwd=HERE).returncode:
         print("\nthe upload failed - the builds are still in build/")
         return
     for button in built:

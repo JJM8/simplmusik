@@ -134,6 +134,11 @@ can clip. `target` moves where they are all aimed; only the two measurements
 are cached, never a gain, so aiming somewhere else re-measures nothing.
 Measurements are kept in ~/.cache/simplmusik.json.
 
+Measuring happens in the background, as a song arrives - downloaded, or found
+in the folder - and never when one is played. A song played before it has been
+measured is aimed at the target as a typical song would be, turned down but
+never up, and takes its own gain the next time it is played or sought in.
+
 Control: every command - stop, pause, skip, back, shuffle, seek - is a line of
 JSON to the player's socket, answered by the player. Nothing signals a pid and
 nothing looks one up, because a pid written down is only a guess by the time
@@ -145,7 +150,12 @@ Exit codes: 0 ok, 1 user error, 2 nothing found.
 import argparse, fcntl, json, os, random, re, select, shutil, signal, socket
 import subprocess, sys, threading, time, zipfile
 
-AUDIO = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac"}
+# Every kind of audio file there is a player here for. mpv plays all of them;
+# Android's player has no decoder for wma, aiff, ape, wavpack, musepack, caf
+# or DSD.
+AUDIO = {".mp3", ".m4a", ".m4b", ".aac", ".opus", ".ogg", ".oga", ".webm", ".weba",
+         ".mka", ".flac", ".wav", ".aif", ".aiff", ".aifc", ".wma", ".ape", ".wv",
+         ".mpc", ".amr", ".3gp", ".caf", ".dsf", ".dff"}
 HOME_MUSIC = os.path.expanduser("~/Music")          # where playlists once sat
 CONF = os.path.expanduser("~/.config/simplmusik")  # the simplmusik folder
 CONFIG = os.path.join(CONF, "config.json")
@@ -1233,6 +1243,13 @@ def fail(as_json, msg, code):
 # stays a little short instead, and at the default target almost none have to.
 # That is the whole of what moving the target trades: aim louder and the songs
 # with the least headroom start falling short of the rest.
+#
+# Measuring costs a decode of the whole song, so nothing that is waiting to hear
+# a song ever does it. It is done in the background, one song at a time, as
+# songs arrive; playing reads the cache and nothing else. A song played before
+# its turn gets TYPICAL's gain instead, and keeps it for as long as it plays:
+# its own gain lands at the next seek or the next play, never in the middle of
+# a bar you didn't ask to move.
 
 def shuffling():
     """Shuffle as a setting: on until you turn it off, so it outlives any one
@@ -1265,6 +1282,10 @@ TARGET = -20.0      # dBFS mean square every song is aimed at, until you move it
 TARGET_LO = -30.0   # as quiet as it goes: every song reaches this one
 TARGET_HI = -12.0   # as loud: a fair few songs have to fall short of this one
 CEILING = -0.1      # dBFS the loudest sample may reach once the gain is on
+# The median mean square of a library of 154 songs, and what a song not yet
+# measured is taken to be. A loudness rather than a gain, so it follows the
+# target; see `gain`.
+TYPICAL = -14.5
 
 def target():
     """Where levelling aims, in dBFS mean square - a setting like the volume
@@ -1283,8 +1304,16 @@ def target():
 
 def measure(path):
     """A song's mean square and its peak, both in dBFS, from one decode pass -
-    around two seconds for a three minute song, which is why it happens once.
-    None if the file can't be measured, which plays it as it is."""
+    a second or two for a three minute song, which is why it happens once, and
+    in the background. None if the file can't be measured.
+
+    Asked of whatever plays the songs, because decoding is that player's
+    platform's business: ffmpeg beside mpv, the phone's own decoders on
+    Android. What the numbers become is decided here and nowhere else."""
+    return (BACKEND or Mpv).measure(path)
+
+def ffmpeg_measure(path):
+    """`measure` for a desktop, where ffmpeg's volumedetect does the decoding."""
     try:
         out = subprocess.run(
             ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-i", path,
@@ -1299,23 +1328,119 @@ def measure(path):
 
 def gain(name, path):
     """How many dB to move this song by: what the target asks for, or what the
-    peak allows, whichever is less. 0.0 when there is nothing to go on, so a
-    song we can't measure - or levelling turned off - plays as it did before."""
-    if not levelling() or remote(path):
-        # A stream has no file to measure, and measuring one would mean
-        # fetching the whole song before a note of it played - which is the
-        # one thing streaming is for. It plays as it is, and the copy landing
-        # in the background is measured and levelled the next time it is
-        # played, by which point it is an ordinary library song.
+    peak allows, whichever is less. Read from the cache and never measured
+    here - this is asked as a song starts, and a decode would be heard as a
+    wait.
+
+    A song with no measurement - not measured yet, a stream, or a file that
+    wouldn't decode - is taken to be TYPICAL. With its peak unknown there is
+    nothing to cap a boost at, so it is only ever turned down: at a target
+    quieter than a typical song it lands near the rest, and at a louder one it
+    plays as it is."""
+    if not levelling():
         return 0.0              # off: hand mpv the song exactly as it is
-    e = cached(name, path)
-    if "rms" not in e:
-        got = measure(path)
-        if not got:
-            return 0.0
-        e = {"rms": got[0], "peak": got[1]}
-        remember(name, path, **e)
+    e = {} if remote(path) else cached(name, path)
+    if e.get("rms") is None:
+        return round(min(0.0, target() - TYPICAL), 1)
     return round(min(target() - e["rms"], CEILING - e["peak"]), 1)
+
+def levelled(name, path):
+    """Whether this song's gain is its own, rather than TYPICAL's."""
+    return not remote(path) and cached(name, path).get("rms") is not None
+
+# ------------------------------------------------------------ the measuring
+# One measurer at a time, across every process and thread, held by a lock the
+# way a download is: a window, a player and a finished download may all ask at
+# once, and two decodes side by side would only take twice the battery to
+# reach the same numbers.
+
+LEVELS_LOCK = os.path.expanduser("~/.local/state/simplmusik-levels.lock")
+
+def unmeasured(idx=None):
+    """Library songs with no measurement for the file as it is now, newest
+    first. A file that wouldn't decode has one - None - and is not asked again
+    until it changes."""
+    idx = index() if idx is None else idx
+    c = load_json(CACHE, {})
+    out = []
+    for name, path in idx.items():
+        e = c.get(name) or {}
+        if "rms" not in e or e.get("stamp") != stamp(path):
+            out.append((name, path))
+    return out
+
+def can_measure():
+    """Whether there is a decoder here to measure with at all. Without one a
+    song is left unmeasured rather than written down as undecodable, so
+    installing ffmpeg later is all it takes."""
+    return bool(BACKEND) or bool(shutil.which("ffmpeg"))
+
+def levels_busy():
+    """Whether a measurer is running. Taking the lock is the test; see
+    `dl_held`."""
+    try:
+        fd = os.open(LEVELS_LOCK, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+def level_soon(idx=None):
+    """Have anything unmeasured measured, in the background. Cheap enough to
+    ask whenever songs might have arrived: a stat per song, and nothing started
+    when there is nothing to do or somebody is already doing it."""
+    try:
+        if can_measure() and not levels_busy() and unmeasured(idx):
+            detach("_levels")
+    except OSError:
+        pass                    # a nicety: the song still plays, at TYPICAL
+
+def measure_library():
+    """The measurer: every unmeasured song, newest first, one at a time, and
+    again from the top until a pass finds none - so a song that arrives while
+    this is busy is not missed for having asked while it was."""
+    if not can_measure():
+        return 1
+    try:
+        os.makedirs(os.path.dirname(LEVELS_LOCK), exist_ok=True)
+        fd = os.open(LEVELS_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return 1
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return 0                # somebody is on it
+    if not EMBEDDED:
+        try:
+            os.nice(10)         # the song you are listening to comes first
+        except OSError:
+            pass
+    tried = set()
+    try:
+        while True:
+            # Each file as it was once tried: one that can't be remembered is
+            # not tried forever, and one that has changed since is a new file.
+            todo = [(n, p) for n, p in unmeasured()
+                    if (n, tuple(stamp(p) or ())) not in tried]
+            if not todo:
+                return 0
+            for name, path in todo:
+                was = stamp(path)
+                tried.add((name, tuple(was or ())))
+                got = measure(path)
+                if stamp(path) != was:
+                    continue    # still being copied in: measured half a song
+                remember(name, path, rms=got[0] if got else None,
+                         peak=got[1] if got else None)
+    finally:
+        os.close(fd)
 
 # ----------------------------------------------------------------------- mpv
 # One mpv plays everything, for the whole session, driven over the JSON IPC
@@ -1440,6 +1565,10 @@ class Mpv:
     leaves playback as it was, and the loop is steered by mpv's events rather
     than by its replies, so there is never an answer worth waiting for.
     """
+
+    # A song's (mean square, peak) in dBFS, or None. A backend's own because
+    # it needs a decoder, and which decoders there are depends on the platform.
+    measure = staticmethod(ffmpeg_measure)
 
     def __init__(self):
         # A killed mpv leaves both its socket and itself behind, and the next
@@ -1627,11 +1756,22 @@ def open_span(job, live):
     # changed under us while it plays.
     live["log"] = plays_path()
     live["t0"], live["held"], live["since"] = time.time(), 0.0, None
+    # The stretches the song was actually heard in, as wall clock: `run` is
+    # when the one still going began, `parts` the ones a pause or a stall has
+    # closed. See `parts_of` for why the line needs them.
+    live["parts"], live["run"] = [], live["t0"]
     live.pop("pos", None)
     live.pop("of", None)
     live.pop("seen", None)
     if job.get("paused"):       # swapped in mid-song while paused: not heard
-        live["since"] = time.time()
+        live["since"], live["run"] = time.time(), None
+
+def cut_part(live, until):
+    """Close the heard stretch that is running, at `until`."""
+    run = live.get("run")
+    if run is not None and until > run:
+        live.setdefault("parts", []).append([run, until])
+    live["run"] = None
 
 def hold_span(live, paused):
     """Start or stop counting a pause against the span. Idempotent, because
@@ -1640,9 +1780,10 @@ def hold_span(live, paused):
     now = time.time()
     if paused and live.get("since") is None:
         live["since"] = now
+        cut_part(live, now)
     elif not paused and live.get("since") is not None:
         live["held"] = live.get("held", 0.0) + now - live.pop("since")
-        live["since"] = None
+        live["since"], live["run"] = None, now
     # The sample clock starts again either way: a pause is counted here, and
     # the position standing still across one is the same pause seen twice.
     live.pop("seen", None)
@@ -1669,6 +1810,9 @@ def sample_span(live, pos):
         # all is a song that was not playing.
         if was is not None and seen is not None and abs(live["pos"] - was) < 0.05:
             live["held"] = live.get("held", 0.0) + max(0.0, now - seen)
+            # Heard up to the sample that last saw it moving, and not since.
+            cut_part(live, seen)
+            live["run"] = now
         live["seen"] = now
     if pos.get("duration") is not None:
         live["of"] = round(float(pos["duration"]), 1)
@@ -1682,21 +1826,43 @@ def close_span(live, why):
     rec = live.pop("rec", None)
     if not rec:
         return
+    now = time.time()
+    if live.get("since") is None:       # closed while playing: heard to here
+        cut_part(live, now)
     hold_span(live, False)              # a span closed while paused stops here
     of = live.get("of")
     # Played out means played to the end, whatever the last sample said: it is
     # up to a second old and the song is over by definition.
     reached = of if why == "eof" and of else live.get("pos")
-    heard = max(0.0, time.time() - live.get("t0", time.time()) - live.get("held", 0.0))
-    # `held` goes down beside `heard` because the two together are the only
-    # way to say when the listening happened: a span covers the wall clock
-    # from `at` to `at + heard + held`, and a chart of hours has to know that
-    # much to put a song on either side of the hour it ran through.
+    heard = max(0.0, now - live.get("t0", now) - live.get("held", 0.0))
     rec.update({"end": why if why in ENDS else "error",
                 "reached": round(reached, 1) if reached is not None else None,
                 "of": of, "heard": round(heard, 1),
                 "held": round(max(0.0, live.get("held", 0.0)), 1)})
+    parts = pack_parts(live.get("parts") or [], rec["at"])
+    if parts:
+        rec["parts"] = parts
     log_play(live.get("log") or plays_path(), rec)
+
+# Two heard stretches closer than this are written as one. A stream stuttering
+# on a bad connection stalls for a second at a time, and a line with a part
+# per stutter says nothing an hour of chart can use.
+PART_GAP = 5.0
+
+def pack_parts(parts, at):
+    """The heard stretches as the line keeps them: [offset from `at`, length]
+    pairs, close ones joined. Nothing at all for the usual song - one stretch
+    from the moment it came on - because that is exactly what a line without
+    them is read as, and most lines are that."""
+    out = []
+    for s, e in parts:
+        if out and s - out[-1][1] < PART_GAP:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    if len(out) == 1 and out[0][0] - at < 1.0:
+        return None
+    return [[round(max(0.0, s - at), 1), round(e - s, 1)] for s, e in out]
 
 # --------------------------------------------------------------- the record
 # The log, read back. Every span ever played is a line in it, and reading all
@@ -1791,6 +1957,7 @@ def read_plays(path=None, since=None):
         # give or take the pause nobody wrote down.
         r["held"] = max(num(r.get("held")) or 0.0, 0.0)
         r["reached"], r["of"] = num(r.get("reached")), num(r.get("of"))
+        r["parts"] = read_parts(r.get("parts"))
         # A song cannot have been heard for longer than it lasts. The player
         # no longer writes lines that say otherwise, but the log is older than
         # that and is appended to by every version that ever ran against this
@@ -1806,16 +1973,44 @@ def read_plays(path=None, since=None):
     rows.sort(key=lambda r: r["at"])
     return rows
 
-def span_of(rec):
-    """The stretch of wall clock one span covered: from the moment the song
-    came on to the moment it stopped being on. Listening plus any time it
-    stood paused, because a pause is time the song was still up - it just
-    wasn't heard.
+def read_parts(v):
+    """A line's heard stretches, or None if it has none worth trusting - in
+    which case it is read as one stretch from the start, like every line
+    written before they were kept."""
+    if not isinstance(v, list) or not v:
+        return None
+    out = []
+    for p in v:
+        o, n = (num(p[0]), num(p[1])) if isinstance(p, list) and len(p) == 2 else (None, None)
+        if o is None or n is None or o < 0 or n < 0:
+            return None
+        out.append((o, n))
+    return sorted(out)
+
+def parts_of(rec):
+    """When one span was actually heard, as (start, end) pairs of wall clock.
+
+    A pause is not listening, and it is not a smear either. A song heard for a
+    minute and left paused all afternoon was heard in that one minute, and
+    spreading its minute evenly over the afternoon is how six hours of chart
+    each came to claim eight seconds nobody listened to. So the player writes
+    down the stretches in between pauses and stalls (`pack_parts`), and a line
+    without them - the usual song, and every line from before - ran straight
+    through from the moment it came on.
 
     This is the only thing that knows a song has length. Everything that
     places listening in time goes through here, so an evening and an hour of
     the chart can never disagree about when a song was on."""
-    return rec["at"], rec["at"] + rec["heard"] + rec.get("held", 0.0)
+    at = rec["at"]
+    if rec.get("parts"):
+        return [(at + o, at + o + n) for o, n in rec["parts"]]
+    return [(at, at + rec["heard"])]
+
+def span_of(rec):
+    """From the moment the song came on to the end of the last of it heard.
+    A song left paused when you walked away ends where you stopped hearing it,
+    not when the next one came on the morning after."""
+    return rec["at"], max(e for _, e in parts_of(rec))
 
 def pool_of(rec):
     """Which list a span was played out of. The library is one of them - it is
@@ -1982,24 +2177,28 @@ def pour(into, rec, step, span):
     than an hour holds, and 62 minutes in an hour is the one number a chart of
     hours must never be able to show.
 
-    Split by how much of the span each bucket holds. Where a song stood paused
-    there is no telling which side of the boundary the pause fell, so the
-    listening is spread evenly across the time the song was up - exact for
-    every span that ran straight through, and the honest guess for the rest."""
-    at, end = span_of(rec)
+    Split by how much of the heard stretches (`parts_of`) each bucket holds,
+    so a pause puts nothing in the hours it covers. The shares are of what
+    the span is worth rather than of the stretches' own length, which differ
+    by the rounding and joining the line was written with and by a skip too
+    short to count."""
     worth = heard(rec)
     if worth <= 0:
         return
-    b, wall = bucket_start(at, step), end - at
+    parts = parts_of(rec)
+    wall = sum(e - s for s, e in parts)
     if wall <= 0:                   # a span with no length is a moment, not a stretch
+        b = bucket_start(rec["at"], step)
         into[b] = into.get(b, 0.0) + worth
         return
-    while b < end:
-        nxt = next_bucket(b, step, span)
-        lo, hi = max(at, b), min(end, nxt)
-        if hi > lo:
-            into[b] = into.get(b, 0.0) + worth * (hi - lo) / wall
-        b = nxt
+    for at, end in parts:
+        b = bucket_start(at, step)
+        while b < end:
+            nxt = next_bucket(b, step, span)
+            lo, hi = max(at, b), min(end, nxt)
+            if hi > lo:
+                into[b] = into.get(b, 0.0) + worth * (hi - lo) / wall
+            b = nxt
 
 def series(rows, step):
     """How long you listened in each of the last buckets, oldest first.
@@ -2575,19 +2774,32 @@ def _player(job):
                 # remember, and a seek while paused is still paused when it
                 # lands.
                 mpv.send("seek", at, "absolute")
+                if not job.get("levelled"):
+                    # Measured while it played: you asked for a jump, so the
+                    # gain can move with it, and nowhere else can it.
+                    relevel(job["paths"][job["song"]], only_if_measured=True)
         if todo.get("level"):
             # Levelling turned on or off mid-song, or aimed somewhere else:
             # swap the filter under the song that is playing, so it is heard
             # now and heard seamlessly. The gain is worked out again from the
-            # cache, so neither of those re-measures anything.
-            job["gain"] = gain(job["song"], job["paths"][job["song"]])
-            mpv.send("set_property", "af", volume_filter(job["gain"]))
+            # cache, so neither of those measures anything.
+            relevel(job["paths"][job["song"]])
         if todo.get("volume"):
             # mpv's own volume, left alone by everything else here, so turning
             # it down never disturbs the filter levelling is riding on.
             mpv.send("set_property", "volume", volume())
         if todo.get("stop"):
             mpv.send("stop")
+
+    def relevel(path, only_if_measured=False):
+        """Work the song's gain out again from the cache and put it under the
+        song where it stands. With `only_if_measured`, leave it be unless the
+        song has a measurement it didn't have when it started."""
+        now = levelled(job["song"], path)
+        if only_if_measured and not now:
+            return
+        job["gain"], job["levelled"] = gain(job["song"], path), now
+        mpv.send("set_property", "af", volume_filter(job["gain"]))
 
     def tick():
         """A quiet second. Read where we are in the song, because mpv forgets
@@ -2643,15 +2855,18 @@ def _player(job):
         if not resuming:
             open_span(job, live)
         path = job["paths"][job["song"]]
-        if not resuming:
-            # A song picked back up off the disk keeps the gain it was already
-            # playing at. Measuring the file costs a decode pass, which would
-            # stall the seek that asked for it - and would move the loudness
-            # halfway through a song. It is measured the next time it is
-            # played, by which point it is an ordinary library song.
+        if not resuming or not job.get("levelled"):
+            # From the cache, so starting a song never waits on a decode. A
+            # song picked back up off the disk was sought in, so a gain of its
+            # own that has turned up since can come in with the seek.
             job["gain"] = gain(job["song"], path)
+            job["levelled"] = levelled(job["song"], path)
         job["seq"] += 1         # every start, so a replayed song still counts
         mpv.load(path, job["gain"], volume(), at)
+        if not job["levelled"] and not remote(path):
+            # Here from outside the window, say. After the load and not before
+            # it: asking walks the whole folder, and the song is not to wait.
+            level_soon()
         if job["paused"]:       # swapped mid-song while paused: still paused
             mpv.send("set_property", "pause", True)
         reason = mpv.until_end(wake_r, drain, tick)
@@ -3242,9 +3457,9 @@ def cmd_folder(args):
 def cmd_levelling(args):
     """Levelling on, off, or as it stands. Changing it mid-song swaps the filter
     under the song that is playing, so the difference is heard at once, in the
-    middle of a bar, with nothing restarted. Songs are measured as they are
-    played, so turning it on doesn't stop to work through your library
-    first."""
+    middle of a bar, with nothing restarted. Songs are measured in the
+    background as they arrive, so turning it on never stops to work through
+    your library first."""
     action = (args.action or "").lower()
     if action and action not in ("on", "off"):
         return fail(args.json, "say `levelling`, `levelling on` or "
@@ -4311,13 +4526,14 @@ def dl_held(vid):
 def can_transcode():
     """Whether there is an ffmpeg here to make an mp3 with.
 
-    Everything ffmpeg does for a download is done *after* the download: turn
-    what YouTube sent into an mp3, write the tags, put the thumbnail in. The
-    fetching itself never needed it. So its absence is a question of what a
-    downloaded song ends up being, and not of whether one can be had at all -
-    which is the difference between an Android build that can fill its library
-    from YouTube and one that cannot."""
+    All ffmpeg does for a download is done *after* the download: write the
+    tags. The fetching itself never needed it. So its absence is a question of
+    what a downloaded song ends up carrying, and not of whether one can be had
+    at all - which is the difference between an Android build that can fill
+    its library from YouTube and one that cannot."""
     return bool(shutil.which("ffmpeg"))
+
+DL_FORMAT = "bestaudio[ext=m4a]/bestaudio/best"
 
 def dl_opts(dest):
     """The options a download runs under.
@@ -4327,10 +4543,17 @@ def dl_opts(dest):
     `prepare_filename` answers for the template it is given, so a resolve
     under different options would name a file the download never writes.
 
-    Without an ffmpeg the whole tail of this falls away: no re-encode, no
-    tags, no cover art, and the file keeps the shape YouTube sent it in - m4a
-    where it can be had, which every player here already plays. It is a
-    plainer song than the mp3 you would otherwise get, and it is a song."""
+    A song is kept exactly as YouTube sends it: m4a where it can be had, and
+    `bestaudio` behind it for the occasional video with no m4a to offer. It
+    used to be re-encoded to mp3, which was seven seconds of every download,
+    a bigger file, and a lossy copy of a lossy copy - and m4a is one audio
+    stream in a container every player here already plays.
+
+    ffmpeg only writes the tags, copying the audio as it is. Without one the
+    song keeps no tags beyond its name, and is a song all the same. There is
+    no thumbnail here either: yt-dlp tries YouTube's guesses at one a request
+    at a time before the audio starts, which was four seconds on its own. The
+    cover is `Art`'s job, alongside."""
     opts = {"quiet": True, "no_warnings": True, "noprogress": True,
             # A downloaded song dates from the download, not from whenever the
             # video was uploaded - left to itself yt-dlp stamps the file with
@@ -4338,30 +4561,126 @@ def dl_opts(dest):
             # morning under a date years old and drop it to the bottom of a
             # library that reads newest first.
             "updatetime": False,
+            "format": DL_FORMAT,
             "outtmpl": {"default": os.path.join(dest, "%(title)s.%(ext)s")}}
-    if not can_transcode():
-        # m4a first, because it is one audio stream in a container everything
-        # here already plays; `bestaudio` behind it, for the occasional video
-        # that has no m4a to offer.
-        opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
-        return opts
-    opts.update({"format": "bestaudio/best", "writethumbnail": True,
-                 "postprocessors": [
-                     {"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                      "preferredquality": "0"},
-                     {"key": "FFmpegMetadata"},
-                     {"key": "EmbedThumbnail"}]})
+    if can_transcode():
+        opts["postprocessors"] = [{"key": "FFmpegMetadata"}]
     return opts
+
+# ------------------------------------------------------------------ cover art
+# A song's cover is the picture in its own file - the window reads nowhere
+# else - and it is the one part of a download nobody needs before they can play
+# the song. So it is fetched beside the audio rather than ahead of it, and put
+# in whenever it arrives: before the song has landed, or a moment after.
+#
+# YouTube's covers sit at fixed addresses. The large one is missing for plenty
+# of videos, so the next size down is asked for next, and the smallest is
+# there for every video there is.
+
+ART_SIZES = ("maxresdefault", "sddefault", "hqdefault")
+
+def cover_art(vid):
+    """The biggest cover YouTube has for a video, as JPEG bytes, or None."""
+    import urllib.request
+    for size in ART_SIZES:
+        req = urllib.request.Request("https://i.ytimg.com/vi/%s/%s.jpg" % (vid, size),
+                                     headers={"User-Agent": BROWSER_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = r.read()
+        except Exception:               # a 404 is the usual answer; try smaller
+            continue
+        if data[:3] == b"\xff\xd8\xff":
+            return data
+    return None
+
+def embed_art(path, data):
+    """Put a JPEG cover into a song's own tags, in place. Only the tags are
+    rewritten, not the audio, so a song already playing plays on."""
+    try:
+        import mutagen
+        if path.lower().endswith(".mp3"):
+            from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=data))
+            tags.save(path)
+        elif path.lower().endswith((".m4a", ".mp4")):
+            from mutagen.mp4 import MP4, MP4Cover
+            f = MP4(path)
+            f["covr"] = [MP4Cover(data, imageformat=MP4Cover.FORMAT_JPEG)]
+            f.save()
+        else:
+            return False                # webm/opus: no cover worth the trouble
+        return True
+    except Exception:                   # no mutagen, or a file it can't write
+        return False
+
+class Art:
+    """A video's cover, fetched on a thread from the moment it is made, and
+    put into the song once both have arrived - whichever is first.
+
+    `landed` hands over the song's path. If the cover is already here it goes
+    in there and then; if not, the thread puts it in when it arrives. That
+    thread dies with the process, so a process about to end passes `leaving`
+    and the cover is fetched by a detached `_art` instead."""
+
+    def __init__(self, vid):
+        self.vid, self.path, self.data, self.got = vid, None, None, False
+        self.lock = threading.Lock()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        data = cover_art(self.vid)
+        with self.lock:
+            self.data, self.got, path = data, True, self.path
+        if path and data:
+            embed_art(path, data)
+
+    def landed(self, path, leaving=False):
+        with self.lock:
+            got, data = self.got, self.data
+            if not got:
+                self.path = None if leaving else path
+        if got:
+            if data:
+                embed_art(path, data)
+        elif leaving:
+            detach("_art", self.vid, path)
+
+    def wait(self, timeout):
+        self.thread.join(timeout)
+
+def art(vid, path):
+    """The detached `_art`: fetch a cover and put it into a song."""
+    data = cover_art(vid)
+    return 0 if data and embed_art(path, data) else 1
 
 def dl_name(y, info):
     """What the file a download writes will be called.
 
     One place, asked by the fetch and by the resolve that runs ahead of it,
     because a song already in your library is recognised by its name and the
-    two have to agree about the name to recognise. With an ffmpeg it is an mp3
-    whatever arrived; without one it is whatever arrived."""
-    name = os.path.basename(y.prepare_filename(info))
-    return os.path.splitext(name)[0] + ".mp3" if can_transcode() else name
+    two have to agree about the name to recognise. It is whatever arrived."""
+    return os.path.basename(y.prepare_filename(info))
+
+def owned(song, idx=None):
+    """The library's own name for a song, in whatever format it is kept, or
+    None if it isn't there.
+
+    A download is named for what YouTube sends - m4a, these days - but the
+    same song may be in the library as an mp3 from before that, or one you
+    copied in yourself. Those are the same song, and fetching it again would
+    be a second copy of it under another extension."""
+    idx = index() if idx is None else idx
+    if song in idx:
+        return song
+    stem = os.path.splitext(song)[0]
+    return next((n for n in idx if os.path.splitext(n)[0] == stem), None)
 
 def dl_hook(vid):
     """yt-dlp's progress callback, thinned to a few writes a second - it fires
@@ -4414,20 +4733,21 @@ def fetch_id(vid):
             waited += 0.25
         ready = cached_ready(vid)
     if ready:
-        if ready in index():    # it arrived by some other route in the meantime
+        have = owned(ready)     # it arrived by some other route in the meantime
+        if have:
             try:
                 os.remove(os.path.join(cache_dir(), ready))
                 os.remove(os.path.join(cache_dir(), vid + ".json"))
             except OSError:
                 pass
-            return {"song": ready, "id": vid, "downloaded": False}, None
+            return {"song": have, "id": vid, "downloaded": False}, None
         promote(vid, ready)
         return {"song": ready, "id": vid, "downloaded": True, "cached": True}, None
 
     url = "https://www.youtube.com/watch?v=" + vid
-    # Audio only, re-encoded to mp3 to match the rest of the library, with the
-    # tags and the thumbnail written into the file - which is exactly where the
-    # UI reads a song's title, artist and cover art from.
+    # Audio only, as YouTube sends it, with the tags and then the cover written
+    # into the file - which is exactly where the UI reads a song's title,
+    # artist and cover art from.
     opts = dict(dl_opts(dest), progress_hooks=[dl_hook(vid)])
     os.makedirs(dest, exist_ok=True)
     dl_hold(vid)                # this fetch is ours, for as long as it runs
@@ -4435,12 +4755,14 @@ def fetch_id(vid):
     try:
         with m.YoutubeDL(opts) as y:
             info = y.extract_info(url, download=False)
-            # What the file will be called once it is an mp3. Knowing that
-            # before fetching anything is what lets a song already in the
-            # library cost a second instead of a minute.
+            # What the file will be called. Knowing that before fetching
+            # anything is what lets a song already in the library - in this
+            # format or another - cost a second instead of a minute.
             song = dl_name(y, info)
-            if song in index():
-                return {"song": song, "id": vid, "downloaded": False}, None
+            have = owned(song)
+            if have:
+                return {"song": have, "id": vid, "downloaded": False}, None
+            cover = Art(vid)    # comes down while the audio does
             # Fetch what we just looked up rather than looking it up again.
             # Asking YouTube a second time costs as much as the first ask did
             # - about a second and a half of the eleven this used to take -
@@ -4450,8 +4772,14 @@ def fetch_id(vid):
         return None, "download failed: %s" % e
     finally:
         dl_done(vid)            # nothing is running now, whichever way we left
-    if not os.path.isfile(os.path.join(dest, song)):
+    path = os.path.join(dest, song)
+    if not os.path.isfile(path):
         return None, "download finished but %s isn't there" % song
+    # The song is done; a cover still on its way doesn't hold it up. Typed at
+    # a terminal this process ends with the command, so the cover goes
+    # elsewhere; under `run_command` - the window, a phone - the process stays.
+    cover.landed(path, leaving=getattr(_sink, "at", None) is None)
+    level_soon()                # measured now, so its first play is levelled
     return {"song": song, "id": vid, "downloaded": True}, None
 
 def added_to(args, name, path):
@@ -4509,6 +4837,9 @@ def resolved_get(vid):
         return None
     if not got.get("url") or time.time() - (got.get("at") or 0) > RESOLVE_TTL:
         return None
+    # One from when downloads were mp3s names a file no download writes now.
+    if got.get("format") != DL_FORMAT:
+        return None
     return got
 
 def resolved_put(vid, url, song):
@@ -4524,7 +4855,8 @@ def resolved_put(vid, url, song):
         os.makedirs(RESOLVED, exist_ok=True)
         path = os.path.join(RESOLVED, vid + ".json")
         with open(path + ".tmp", "w") as f:
-            json.dump({"id": vid, "url": url, "song": song, "at": time.time()}, f)
+            json.dump({"id": vid, "url": url, "song": song, "at": time.time(),
+                       "format": DL_FORMAT}, f)
         os.replace(path + ".tmp", path)     # atomic: no reader sees half a file
         sweep_resolved()
     except OSError:
@@ -4588,7 +4920,7 @@ def fetch(vid, song):
     if m is None:
         return 1
     cache = cache_dir()
-    if os.path.isfile(os.path.join(folder(), song)):
+    if owned(song):
         dl_done(vid)            # already a library song: nothing worth caching
         return 0
     got = os.path.join(cache, song)
@@ -4599,9 +4931,15 @@ def fetch(vid, song):
         with m.YoutubeDL(dl_opts(cache)) as y:
             info = y.extract_info("https://www.youtube.com/watch?v=" + vid,
                                   download=False)
+            cover = Art(vid)
             y.process_ie_result(dict(info), download=True)
         if not os.path.isfile(got):
             raise OSError("the fetch finished but %s isn't there" % song)
+        # Into the song before it is marked ready: once it is, `download` may
+        # move it, and a cover put in after that would miss it. Nobody is
+        # waiting on this fetch, so a few seconds for a slow cover cost nothing.
+        cover.wait(10)
+        cover.landed(got, leaving=True)
         # The name is written beside the file because working it out again
         # means asking YouTube, and a cache you have to make a network call to
         # use is not the thing that makes `download` quick.
@@ -4643,7 +4981,7 @@ def keep(vid, song):
     moment before the fetch has said otherwise."""
     waited = 0.0
     while waited < CACHE_WAIT:
-        if song in index():
+        if owned(song):
             return 0                # it got there by some other road
         ready = cached_ready(vid)
         if ready:
@@ -4683,6 +5021,7 @@ def promote(vid, song):
         os.remove(os.path.join(cache_dir(), vid + ".json"))
     except OSError:
         pass
+    level_soon()                # measured now, so its first play is levelled
     return final
 
 def cmd_stream(args):
@@ -4715,7 +5054,9 @@ def cmd_stream(args):
     # Three places the song might already be, in the order worth trying: the
     # library, then the cache from having played it before, then YouTube. Only
     # the last of them is a stream, and only the last is worth caching.
-    source = index().get(song)
+    idx = index()
+    song = owned(song, idx) or song     # kept as an mp3 from before, say
+    source = idx.get(song)
     if not source and cached_ready(vid) == song:
         source = os.path.join(cache_dir(), song)
     live = not source               # nothing local: play it off the network
@@ -4916,6 +5257,10 @@ def main(argv=None):
         return fetch(argv[1], argv[2])  # runs behind a song being streamed
     if argv[:1] == ["_keep"]:           # internal: the wait-and-promote behind
         return keep(argv[1], argv[2])   # `stream --to`, which wants it kept
+    if argv[:1] == ["_art"]:            # internal: a cover still to come for a
+        return art(argv[1], argv[2])    # song whose download has already ended
+    if argv[:1] == ["_levels"]:         # internal: measuring whatever arrived
+        return measure_library()
     migrate()                           # playlists moved folder once, long ago
     ap = Parser(prog="simplmusik", description=__doc__,
                 formatter_class=argparse.RawDescriptionHelpFormatter)

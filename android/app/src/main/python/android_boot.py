@@ -69,6 +69,19 @@ def _make_backend(sm, playback):
             self.proc = None            # nothing to kill: there is no process
             playback.listen(self._ended)
 
+        @staticmethod
+        def measure(path):
+            """A song's (mean square, peak) in dBFS, as `Mpv.measure` answers
+            with ffmpeg - which a phone does not have, and which used to leave
+            every gain at 0 dB and the target moving nothing. The platform's
+            decoders do the decoding instead; the arithmetic that turns the
+            numbers into a gain stays in the CLI."""
+            try:
+                got = playback.measure(str(path))
+            except Exception:
+                return None
+            return (float(got[0]), float(got[1])) if got is not None else None
+
         def _ended(self, reason):
             """Told by the player, on its own thread, how a song finished.
 

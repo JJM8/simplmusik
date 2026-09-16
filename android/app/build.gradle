@@ -17,10 +17,14 @@ def staged = layout.buildDirectory.dir("staged-assets")
 // (see `server.py`), and the page is read off the disk by the same server that
 // serves it on a desktop. Laying them out on the device exactly as they sit in
 // the repository is what lets both go on being true here.
-def stageAssets = tasks.register("stageAssets", Copy) {
+// A Sync rather than a Copy: a file gone from the repository is gone from the
+// APK too, instead of lingering in the staged folder from some earlier build.
+// Syncthing's conflict copies sit beside the real files and are never app.
+def stageAssets = tasks.register("stageAssets", Sync) {
     into staged
     from(repoRoot) { include "simplmusik", "server.py" }
     from(repoRoot) { include "web/**" }
+    exclude "**/*.sync-conflict-*"
     // A build that quietly staged nothing would produce an APK that starts and
     // then has no app in it, which is a bad way to find out.
     doLast {
@@ -97,6 +101,22 @@ tasks.configureEach { t ->
             || t.name.contains("SourceSetPaths") || t.name.contains("Manifest")) {
         t.dependsOn(stageAssets)
     }
+}
+
+// The packager puts every file it finds under the compressed assets into the
+// APK, whatever it is called. Syncthing downloads into `.syncthing.<name>.tmp`
+// beside the real file, so a half-synced `.syncthing.server.py.jar.tmp` is a
+// second `assets/server.py` and the build dies with "already contains entry
+// 'assets/server.py', cannot overwrite". `.stignore` keeps the build tree out
+// of the sync; this sweeps up anything that got in before it did.
+def sweepSyncDebris = tasks.register("sweepSyncDebris", Delete) {
+    delete fileTree(layout.buildDirectory) {
+        include "**/.syncthing.*", "**/*.sync-conflict-*", "**/~syncthing~*"
+        exclude "outputs/**"
+    }
+}
+tasks.configureEach { t ->
+    if (t.name ==~ /package(Debug|Release)/) t.dependsOn(sweepSyncDebris)
 }
 
 dependencies {

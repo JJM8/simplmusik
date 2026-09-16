@@ -116,10 +116,18 @@ _idx = {"at": 0.0, "map": {}}
 _idx_lock = threading.Lock()
 
 def index(maxage=3.0):
+    fresh = None
     with _idx_lock:
         if time.time() - _idx["at"] > maxage:
-            _idx["map"], _idx["at"] = sm.index(), time.time()
-        return _idx["map"]
+            fresh = sm.index()
+            _idx["map"], _idx["at"] = fresh, time.time()
+        found = _idx["map"]
+    if fresh is not None:
+        # A walk is where a song dragged into the folder is first seen, so it
+        # is where that song is sent off to be measured - long before anyone
+        # plays it.
+        sm.level_soon(fresh)
+    return found
 
 def restale():
     """Throw the held walk away. A command that has just changed what is on
@@ -305,7 +313,8 @@ def cover_bytes(path):
                     break
             if data is None and getattr(a, "pictures", None):   # flac / ogg
                 data = a.pictures[0].data
-            if data is None and isinstance(getattr(a, "tags", None), dict):
+            # mutagen's MP4 tags act like a dict without being one.
+            if data is None and hasattr(getattr(a, "tags", None), "get"):
                 cov = a.tags.get("covr")                   # m4a
                 if cov:
                     data = bytes(cov[0])

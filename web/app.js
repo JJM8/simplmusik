@@ -1699,6 +1699,9 @@ async function download(r, pl) {
   toast(!d.downloaded ? 'Already in your library'
         : (d.cached ? 'Added \u201c' : 'Downloaded \u201c') + d.song + '\u201d');
   loadLibrary();                    // it is a library song now: let it show up as one
+  // Its cover can land a moment after the song does; look again shortly
+  // rather than leaving it to the 15s reload.
+  if (d.downloaded) setTimeout(loadLibrary, 4000);
 }
 
 /* ------------------------------------------------------- add to playlist */
@@ -2122,6 +2125,14 @@ $('#dlg-ok').onclick     = async () => {
               toast('Created “' + name + '”'); }
 };
 dlg.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('#dlg-ok').click(); } };
+/* A click on the backdrop lands on the dialog element itself, same as one on
+   its padding, so tell them apart by position. Judged on pointerdown so a text
+   selection dragged out of the name field doesn't close it on release. */
+dlg.onpointerdown = e => {
+  if (e.target !== dlg) return;
+  const r = dlg.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) dlg.close();
+};
 
 /* delete playlist -------------------------------------------------------- */
 

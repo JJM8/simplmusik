@@ -417,13 +417,25 @@ itself. `add PLAYLIST N` on a YouTube result is the same pair in one command,
 and `stream --to` is it again for a song you want to hear now - the playlist
 gets the row straight away, because the filename is settled before a byte
 arrives, and a detached process waits for the fetch and moves the song out of
-the cache into your library so that row comes true instead of going stale. It arrives as an mp3 with its
+the cache into your library so that row comes true instead of going stale. It arrives as an m4a with its
 title, artist and cover art written into the tags, which is exactly where the
 UI reads all three from, so it looks like the rest of your library at once.
+The cover is fetched alongside the audio rather than before it and goes in
+whenever it arrives, so a slow cover never holds a song up.
+
+Downloads stay m4a, exactly as YouTube sends them. They used to be re-encoded
+to mp3, and that was the slowest part of every download - about seven seconds
+of a song that had already arrived - for a file nearly twice the size and a
+lossy copy of a lossy copy. m4a (AAC) sounds as good or better at a smaller
+size, and every player here plays it: mpv on a desktop, ExoPlayer on Android.
+The library isn't all one format, and doesn't need to be - simplmusik plays
+every kind of audio file (`AUDIO` in the CLI), with one exception: Android's
+player has no decoder for wma, aiff, ape, wavpack, musepack, caf or DSD.
 
 Downloading something you already have costs a couple of seconds and no
-bandwidth: the filename is worked out before anything is fetched, and a name
-already in the library stops there and says so. Search results don't know
+bandwidth: the filename is worked out before anything is fetched, and a song
+already in the library stops there and says so - under that name or any other
+extension, so an mp3 from before the switch isn't fetched again as an m4a. Search results don't know
 what's in your library though, so a song you own can still appear under
 Download - pressing it is harmless.
 
@@ -439,8 +451,22 @@ pip install --user -U yt-dlp     # what to run when it says that
 ```
 
 It imports yt-dlp rather than running it as a program, which is the difference
-between a search taking about two seconds and about ten. `ffmpeg` does the
-conversion to mp3 and is already needed for playback.
+between a search taking about two seconds and about ten. `ffmpeg` writes the
+tags, copying the audio as it is, and is already needed for playback.
+
+**Considered and shelved: download m4a, then swap in an mp3.** The idea was to
+play the m4a at once, build an mp3 from it in the cache, and switch once the
+mp3 was whole and the song wasn't playing: write a journal, rewrite every
+playlist entry from `X.m4a` to `X.mp3`, move the mp3 in, delete the m4a, and
+have the next command finish a switch a crash interrupted. A song's filename
+is its identity everywhere, so the switch has to reach all of it: the `file`
+in every playlist, the loudness cache key, `SHOWN`, the `song` in the cache
+and resolve notes, and a running player's queue, which holds names and paths
+and has no op to rename one. The play logs are append-only history on every
+device, so they can't be rewritten and would need a map of old names to new.
+Syncthing could also carry the short-lived m4a to another machine that adds
+it to a playlist. It was dropped once m4a turned out to be the better format
+to keep anyway; this is here in case an all-mp3 library is ever wanted.
 
 Searching is a network round trip, so it waits for a pause in your typing -
 the library filter above it stays instant regardless - and only the newest
@@ -712,8 +738,20 @@ everything can still land on the number.
 Moving it swaps the filter under the song that is playing, the same way the
 switch does, so the whole library shifts under you as you drag the slider.
 
-Measuring costs about two seconds per song and happens the first time you play
-it, so the results are cached in `~/.cache/simplmusik.json` - keyed by
+Measuring costs a decode of the whole song - a second or two - so it is never
+done when you press play. A song is measured in the background as it arrives:
+when a download lands, or when the window first sees a file you dropped into the
+folder. One measurer runs at a time, working newest first. On a phone the mean
+is taken from every 12th frame (4 kHz), which across a real library came within
+0.015 dB of every frame; the peak is still every sample.
+
+A song played before its turn is taken to be a typical one - a mean of -14.5
+dB, the median of that library - and aimed at the target on that basis, but
+only ever turned down, since there is no peak yet to cap a boost at. It keeps
+that gain while it plays; its own lands the next time you seek in it or play it,
+never mid-bar on its own.
+
+The results are cached in `~/.cache/simplmusik.json` - keyed by
 filename, stamped with the file's size and mtime, and thrown away by simply
 deleting the file. What is cached is the measurement, not the gain: the mean
 and the peak are the same two numbers whatever you aim at, so moving the target
