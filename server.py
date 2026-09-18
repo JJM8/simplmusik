@@ -240,6 +240,7 @@ def library():
             "root_shown": sm.host_path(root),   # a portal folder's real name
             "playlists": pls, "songs": ordered,
             "playlists_dir": sm.playlists_dir(), "levelling": sm.levelling(), "picker": bool(sm.chooser()),
+            "cli_setup": sm.CLI_SETUP,  # a flatpak's CLI has no name on the host yet
             "target": sm.target(),
             # The ends of the target slider, so the page can't offer a setting
             # the CLI would refuse - there is one place they are decided.
