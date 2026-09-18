@@ -2,7 +2,9 @@
 
 A local music player for Linux and Android.
 
-[![Watch the intro](screenshots/intro.jpg)](https://github.com/JJM8/simplmusik/releases/download/v0.2.5/intro.mp4)
+Please press the speaker button on the video to turn the sound on. 🔊
+
+https://github.com/user-attachments/assets/8a941465-c79c-4385-b200-c95256c1c242
 
 ![simplmusik](screenshots/playlist.png)
 
