@@ -2,6 +2,8 @@
 
 A local music player for Linux and Android.
 
+[![Watch the intro](screenshots/intro.jpg)](https://github.com/JJM8/simplmusik/releases/download/v0.2.5/intro.mp4)
+
 ![simplmusik](screenshots/playlist.png)
 
 ## Download
@@ -44,6 +46,22 @@ This builds all three packages into `build/`.
 
 ```sh
 simplmusik --help
+```
+
+## Credits
+
+Music in the intro video:
+
+```
+Rock Ain't Dead by ONLAP
+Source: https://www.youtube.com/@ONLAP
+Copyright Free Rock Song
+```
+
+```
+Music track: Thats Right by Moavii
+Source: https://freetouse.com/music
+Royalty Free Background Music
 ```
 
 ## License

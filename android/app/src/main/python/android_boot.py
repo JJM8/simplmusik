@@ -48,7 +48,7 @@ _state = {}
 
 # --------------------------------------------------------------- the backend
 
-def _make_backend(sm, playback):
+def _make_backend(sm, playback, server=None):
     """The class the CLI will build when it wants something to play with."""
 
     class Backend(sm.Mpv):
@@ -96,6 +96,11 @@ def _make_backend(sm, playback):
 
         def load(self, path, db, vol, start=0.0):
             playback.load(str(path), float(db or 0.0), int(vol), float(start or 0.0))
+            # What the song is, for the notification - after it has started,
+            # on a thread of its own, because a cover is a read off the disk
+            # and the song is not to wait for one.
+            threading.Thread(target=_describe, args=(sm, server, playback, str(path)),
+                             daemon=True, name="simplmusik-describe").start()
 
         def send(self, *cmd):
             """The player loop's whole vocabulary, which is five things.
@@ -134,6 +139,58 @@ def _make_backend(sm, playback):
                     pass
 
     return Backend
+
+
+AUDIO_EXT = re.compile(r"\.(mp3|m4a|mp4|aac|opus|ogg|oga|flac|wav|webm)$", re.I)
+
+
+def _describe(sm, server, playback, path):
+    """Tell the player what the song at `path` is: title, artist, album, cover.
+
+    The same tags and the same cover the page shows, read by the same
+    functions. A song with no tags is named for its file, which is what the
+    page calls it too - except that "Artist - Title", the shape a download is
+    named in, is taken apart, because a notification has a line for each. A
+    stream has no file to read, so it is named whatever the player says it is
+    called."""
+    info, cover = {}, None
+    if "://" not in path and server is not None:
+        try:
+            info = server.tags(path) or {}
+            cover = server.cover_bytes(path)
+        except Exception:
+            pass
+    title, artist = info.get("title"), info.get("artist")
+    if not title:
+        name = None
+        if "://" in path:
+            try:
+                name = (sm.playing(1.0) or {}).get("song")
+            except Exception:
+                pass
+        else:
+            name = os.path.basename(path)
+        name = AUDIO_EXT.sub("", name or "") or None
+        if name and not artist and " - " in name:
+            artist, name = (p.strip() for p in name.split(" - ", 1))
+        title = name
+    try:
+        playback.describe(path, title, artist or None, info.get("album") or None,
+                          bytes(cover) if cover else None)
+    except Exception:
+        pass
+
+
+def _control(sm, op, value):
+    """A button outside the window: the notification, the lock screen, a
+    headset. Put to the player loop exactly as the window would put it, so
+    the window and the notification cannot disagree about what happened."""
+    if op in ("play", "pause"):
+        sm.ask({"op": "pause", "want": op == "pause"})
+    elif op in ("skip", "back"):
+        sm.send(op)
+    elif op == "seek":
+        sm.send("seek", pos=max(0.0, float(value)))
 
 
 def _patch_props(sm, playback):
@@ -210,8 +267,9 @@ def bring_up(app_dir, home_dir, music_dir, playback):
     loader.exec_module(server)              # this imports the CLI as server.sm
 
     sm = server.sm
-    sm.BACKEND = _make_backend(sm, playback)
+    sm.BACKEND = _make_backend(sm, playback, server)
     _patch_props(sm, playback)
+    playback.controls(lambda op, value: _control(sm, op, value))
 
     # Port 0 is "whichever one is free": the page is only ever reached from
     # inside this app, so the number matters to nobody and picking one that

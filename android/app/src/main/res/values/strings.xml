@@ -3,4 +3,5 @@
     <string name="app_name">simplmusik</string>
     <string name="channel_name">Playing</string>
     <string name="starting">Starting…</string>
+    <string name="nothing_playing">Nothing playing</string>
 </resources>

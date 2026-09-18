@@ -395,9 +395,14 @@ def snapshot():
     # playing, so they are reported either way - the button and the slider in
     # the page are set by them even with nothing going, which is the whole
     # point of their being settings.
+    # Word from the player that the music stopped without being asked to - a
+    # stream whose connection died, most likely. The player is gone by the time
+    # anyone can ask it, so it leaves the note behind and this carries it to
+    # the window, which says so once and then lets it go.
+    hmm = sm.trouble()
     if not st:
         return {"playing": False, "shuffle": sm.shuffling(),
-                "volume": sm.volume(), "downloads": dls}
+                "volume": sm.volume(), "downloads": dls, "trouble": hmm}
     song = st.get("song", "")
     # The player worked out every path when the queue was built, so the file
     # it is holding open is known exactly, even if the song has since moved.
@@ -430,6 +435,7 @@ def snapshot():
             "elapsed": round(elapsed, 1),
             "duration": duration,
             "downloads": dls,
+            "trouble": hmm,
             "meta": tags(path) if path else {}}
 
 # ------------------------------------------------------------------- access

@@ -174,6 +174,11 @@ LEGACY = [os.path.expanduser("~/.local/state/simplmusik.json"),
 # the library's. `migrate` lifts it into the music folder, once.
 WAS_PLAYS = os.path.expanduser("~/.local/state/simplmusik-plays.jsonl")
 DLDIR = os.path.expanduser("~/.local/state/simplmusik-downloads")
+# Where the player leaves word that the music stopped without being asked to.
+# In the state folder with the rest of what this machine is doing, not in your
+# music folder: it is news for the next few seconds and nothing afterwards.
+TROUBLE = os.path.expanduser("~/.local/state/simplmusik-trouble.json")
+TROUBLE_TTL = 60            # after this, it is history rather than news
 RESOLVED = os.path.expanduser("~/.local/state/simplmusik-resolved")
 SHOWN = os.path.expanduser("~/.local/state/simplmusik-shown.json")
 # This machine's own name for itself, and the playlist it last put on - both
@@ -299,6 +304,18 @@ def save_json(path, obj, indent=None):
     with open(tmp, "w") as f:
         json.dump(obj, f, indent=indent)
     os.replace(tmp, path)    # atomic: no reader sees a half file
+    # On Android a rename into place is not an event Syncthing's watcher is
+    # told about - a write is - so a list changed on the phone sat unsynced
+    # until the next full rescan while its new picture went straight across.
+    # Writing the first byte back over itself is that write, and changes nothing.
+    try:
+        with open(path, "r+b") as f:
+            first = f.read(1)
+            if first:
+                f.seek(0)
+                f.write(first)
+    except OSError:
+        pass                     # it is written; it will sync on a rescan instead
 
 # The lock is held by keeping its file open, so the descriptor has to outlive
 # the call that took it - hence a global. Closing it is the one way to let
@@ -773,6 +790,65 @@ def drain_plays():
     except OSError:
         pass                        # it stays where it is, and is tried again
 
+def fold_plays():
+    """Take in the play logs no machine writes to any more, and remove them.
+
+    Those are the log every machine shared before each had its own, and any
+    copy of a log Syncthing set aside - which, for that shared log, is not a
+    stale duplicate but the other machine's half of the history. Left where
+    they are they are read well enough, but a conflict copy is also a warning
+    in Syncthing that never goes away, and a shared file some old player could
+    still write to is how the next one would start.
+
+    So their lines are appended to this machine's own log - the only file it
+    writes - skipping any already in it, and the old files are deleted, which
+    syncs out like any other change. Two machines doing this at once each
+    append the same lines to their own logs; `read_plays` drops the second
+    copy of a span, so that costs a few bytes and nothing else."""
+    now = plays_path()
+    d = os.path.dirname(now)
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return
+    old = [os.path.join(d, n) for n in names
+           if n.startswith("plays") and n.endswith(".jsonl")
+           and (n == "plays.jsonl" or CONFLICT in n)]
+    if not old:
+        return
+    have = set()
+    try:
+        with open(now, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                have.add(line.strip())
+    except OSError:
+        pass                        # no log of its own yet: everything is new
+    for p in old:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                lines = [l.strip() for l in f]
+            add = [l for l in lines if l and l not in have]
+            if add:
+                fd = os.open(now, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as f:
+                    # A last line cut short by a crash is closed first, so it
+                    # can't swallow the first good one appended after it.
+                    if f.tell() and not _ends_in_newline(now):
+                        f.write("\n")
+                    f.write("\n".join(add) + "\n")
+                have.update(add)
+            os.remove(p)            # only once its lines are safely across
+        except OSError:
+            pass                    # left for next time, and still read meanwhile
+
+def _ends_in_newline(path):
+    try:
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b"\n"
+    except OSError:
+        return True
+
 def rehome(was, logs):
     """Follow the music folder. The playlists and the records of what you have
     played all live inside it, so choosing a different one has to take them
@@ -819,6 +895,9 @@ def write_meta(stem, m):
     # Whole or not at all. Anything that read a half-written list would see an
     # empty one - and `songs_of` would write that emptiness back, and a sync
     # would carry it to every other machine.
+    # A list once named its picture; the name beside it is the link now, so
+    # the old field goes the next time the list is written for another reason.
+    m.pop("cover", None)
     save_json(playlist_file(stem), m, indent=2)
 
 def entry(e):
@@ -930,11 +1009,15 @@ def songs_of(stem):
     return out
 
 # ------------------------------------------------------------- cover art
-# A playlist's own picture, kept beside its JSON as <stem>.<kind> - so the
-# folder you sync carries the artwork along with the list, and a playlist
+# A playlist's own picture is <stem>.<kind> beside its JSON, and that is the
+# whole of the link: the list doesn't name it. So changing a cover only ever
+# writes the picture and never the list - there is no second file to arrive
+# out of step with the first, or not arrive at all, on the other end of a sync.
+# The folder you sync carries the artwork along with the list, and a playlist
 # deleted takes its picture with it rather than leaving one behind.
 
 COVER_MAX = 8 << 20             # 8 MB: a cover, not a photo library
+COVER_KINDS = ("jpg", "png", "gif", "webp")
 
 def image_kind(path):
     """What kind of image a file holds, read from the first bytes rather than
@@ -951,28 +1034,38 @@ def image_kind(path):
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":   return "webp"
     return None
 
-def cover_path(stem):
-    """Where a playlist's cover art is, or None if it hasn't any. The name in
-    the file is taken as a basename, so a playlist can only ever point at a
-    picture in the playlists folder and never anywhere else on the disk."""
-    name = os.path.basename((meta(stem).get("cover") or "").strip())
-    path = os.path.join(playlists_dir(), name) if name else ""
-    return path if path and os.path.isfile(path) else None
+def covers(stem):
+    """Every picture beside a playlist's list, newest first. Normally one; two
+    for as long as a sync has brought a new picture and not yet the removal
+    of the old one, and then the newer is the cover."""
+    out = []
+    for kind in COVER_KINDS:
+        path = os.path.join(playlists_dir(), stem + "." + kind)
+        try:
+            out.append((os.path.getmtime(path), path))
+        except OSError:
+            pass
+    return [p for _, p in sorted(out, reverse=True)]
 
-def drop_cover(stem):
-    """Take a playlist's picture off it, and delete the picture. True if there
+def cover_path(stem):
+    """Where a playlist's cover art is, or None if it hasn't any. Only a file
+    that really is a picture counts, whatever it is called."""
+    return next((p for p in covers(stem) if image_kind(p)), None)
+
+def drop_cover(stem, keep=None):
+    """Take a playlist's picture off it by deleting the picture. True if there
     was one. The file is ours - we copied it in - so removing it is not the
-    same as removing something of yours."""
-    path, m = cover_path(stem), meta(stem)
-    had = bool(m.get("cover"))
-    if path:
+    same as removing something of yours. `keep` is spared: a new cover of a
+    different kind drops the old one without dropping itself."""
+    had = False
+    for path in covers(stem):
+        if keep and os.path.abspath(path) == os.path.abspath(keep):
+            continue
+        had = True
         try:
             os.remove(path)
         except OSError:
-            pass                # gone already, or read-only: the list still lets go
-    if had:
-        m.pop("cover", None)
-        write_meta(stem, m)
+            pass                # gone already, or read-only: nothing else to do
     return had
 
 def set_cover(stem, src):
@@ -991,17 +1084,15 @@ def set_cover(stem, src):
         raise ValueError("that image is bigger than %d MB" % (COVER_MAX >> 20))
     dest = os.path.join(playlists_dir(), stem + "." + kind)
     if os.path.abspath(src) != os.path.abspath(dest):
-        drop_cover(stem)        # the old picture goes, whatever it was called
         os.makedirs(playlists_dir(), exist_ok=True)
         # The contents and nothing else. Copying the mode across would leave a
         # cover picked in the window readable only by you - it arrives here as
         # a temporary file, and those are private - while the list beside it is
         # an ordinary file. A playlist and its picture travel together, so they
-        # are written the same way.
+        # are written the same way. Written straight over any old picture of
+        # the same kind: a write is what every sync notices.
         shutil.copyfile(src, dest)
-    m = meta(stem)
-    m["cover"] = os.path.basename(dest)
-    write_meta(stem, m)
+    drop_cover(stem, keep=dest)     # then an old one of another kind goes
     return dest
 
 _last_played = {}
@@ -1161,6 +1252,7 @@ def migrate():
     # the collapse above and not before: which folder that is has only just
     # been settled.
     drain_plays()
+    fold_plays()
     now = playlists_dir()
     for old in WAS:
         if lift(old, now):
@@ -1457,7 +1549,14 @@ MPV_ARGS = ["--idle=yes",          # outlive every song, waiting for the next
             "--no-video",          # audio only, cover art included
             "--no-terminal",       # we are not a terminal it can read keys from
             "--no-config",         # nobody's mpv.conf, only ours
-            "--keep-open=no"]      # a finished song ends, rather than pausing
+            "--keep-open=no",      # a finished song ends, rather than pausing
+            # A streamed song is one long read over HTTP, and a read that
+            # drops is the end of the file as far as ffmpeg is concerned - so
+            # a stutter on the network used to end the song, and with it the
+            # music. These ask for the connection to be made again instead,
+            # which is what turns most of those back into a stutter.
+            "--stream-lavf-o=reconnect=1,reconnect_streamed=1,"
+            "reconnect_on_network_error=1,reconnect_delay_max=5"]
 
 def mpv_line(cmd, timeout=0.3):
     """One command to the running mpv, and its answer. Opens its own
@@ -2474,9 +2573,84 @@ def local_copy(job, song):
     if have:
         return have
     vid = job.get("vid")
-    if vid and cached_ready(vid) == song:
-        return os.path.join(cache_dir(), song)
-    return None
+    return cached_file(vid) if vid and cached_ready(vid) == song else None
+
+# How many times a dropped stream is picked up again before the player gives
+# up on it, and how far short of its end a song has to stop for the stop to be
+# a drop rather than an ending.
+STREAM_TRIES = 2
+STREAM_SHORT = 10
+
+def dropped(reason, live):
+    """Whether a song nobody interrupted ended before it had any business to.
+
+    mpv says "error" for a connection that failed outright, which is most of
+    them. But a stream cut off halfway can arrive as a clean end of file
+    instead - the bytes simply stopped, and ffmpeg has no way to know more
+    were coming - so the length is worth asking about too: a song that ended a
+    long way short of the length mpv itself reported did not end, it was cut
+    off. A song whose length nobody ever learned is one that died before it
+    could say, which is the same answer."""
+    if reason != "eof":
+        return True
+    of, pos = live.get("of"), live.get("pos")
+    return bool(of and pos is not None and of - pos > STREAM_SHORT)
+
+def pick_up(job, song):
+    """Somewhere to carry a dropped stream on from, or None if there is
+    nowhere left to try.
+
+    The cache first: the copy that has been filling behind the song may be
+    whole by now, and a file cannot drop a second time. Otherwise the song is
+    looked up again from scratch - the URL we were handed is the one that just
+    died, so the one we are holding is not worth trying twice."""
+    local = local_copy(job, song)
+    if local:
+        return local
+    vid = job.get("vid")
+    if not vid:
+        return None
+    try:
+        resolved_drop(vid)
+        _, url, _ = resolve(vid)
+    except Exception:           # yt-dlp raises a wide family of these
+        return None
+    return url or None
+
+def note_trouble(song, why):
+    """Leave word that the music stopped on its own.
+
+    The player exits when its queue runs out, so by the time anybody asks it
+    what went wrong there is nobody left to ask - and a window that simply
+    goes quiet is the bug this is here to stop being. The note outlives the
+    process that wrote it, the window reads it on its next poll and says so,
+    and `trouble` forgets it shortly afterwards so that it is never news
+    twice."""
+    try:
+        with open(TROUBLE + ".tmp", "w") as f:
+            json.dump({"song": song, "why": why, "at": time.time()}, f)
+        os.replace(TROUBLE + ".tmp", TROUBLE)
+    except OSError:
+        pass
+
+def trouble():
+    """What stopped the music, if it stopped on its own and did so recently
+    enough to still be worth saying."""
+    try:
+        with open(TROUBLE) as f:
+            note = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if time.time() - (note.get("at") or 0) > TROUBLE_TTL:
+        return None
+    return note
+
+def clear_trouble():
+    """Whatever went wrong last time is not what is happening now."""
+    try:
+        os.remove(TROUBLE)
+    except OSError:
+        pass
 
 def serve_control(job, want, guard, wake_w, finish):
     """The player answering for itself, on its own thread.
@@ -2807,7 +2981,7 @@ def _player(job):
         if live.get("rec") and not job.get("paused"):
             sample_span(live, mpv_props("time-pos", "duration"))
 
-    at, resuming = 0.0, False
+    at, resuming, tries, cut = 0.0, False, 0, None
     while not mpv.dead:
         # A new queue, handed to us by whoever asked for it - from the window,
         # from a terminal, or by a player that lost the race to be us. It is
@@ -2854,6 +3028,7 @@ def _player(job):
         # at the point you were at, which is the same song still playing.
         if not resuming:
             open_span(job, live)
+            tries, cut = 0, None    # a new song owes nothing to the last one
         path = job["paths"][job["song"]]
         if not resuming or not job.get("levelled"):
             # From the cache, so starting a song never waits on a decode. A
@@ -2881,6 +3056,24 @@ def _player(job):
         resuming = at is not None
         if resuming:
             continue            # same song, same span: nothing has ended
+        # Nobody asked for this to stop and the song was not over: the
+        # connection under it died. That is not an ending, so it is not
+        # treated as one - the song is picked up where it fell, off the cached
+        # copy if that has landed and off a fresh look-up if it hasn't, and
+        # the span stays open because it is the same song still playing.
+        #
+        # Twice, and then it is a stop like any other - but a stop that says
+        # so, because a stream is a queue of one and running out of one ends
+        # the music. Going quiet with nothing said is what this used to do.
+        if (why is None and not pending and dropped(reason, live)
+                and remote(job["paths"][job["song"]])):
+            where = pick_up(job, job["song"]) if tries < STREAM_TRIES else None
+            if where:
+                tries += 1
+                job["paths"][job["song"]] = where
+                at, resuming = live.get("pos") or 0.0, True
+                continue
+            cut = job["song"]   # nowhere left to pick it up from
         # mpv only ever says that it stopped; who stopped it, and why, is
         # known here and nowhere else. A song nobody interrupted ended by
         # itself, and mpv's own word for that is the one worth keeping.
@@ -2898,6 +3091,12 @@ def _player(job):
         step, job["step"] = job["step"], 1
         job["paused"] = False   # a skip while paused lands playing
         advance(job, step)
+    # Out of songs. If the last of them was cut off rather than played out -
+    # and a stream is a queue of one, so a cut off song is the end of the
+    # music - the window is told, because a window that simply goes quiet
+    # leaves you wondering what you did.
+    if cut:
+        note_trouble(cut, "the stream stopped")
     finish()                    # queue finished: nothing is playing any more
 
 def start_playing(job):
@@ -2910,6 +3109,7 @@ def start_playing(job):
     makes a sound, so the case this all exists for (two windows, or a window
     and a terminal, asking at the same moment) ends with one player playing
     what was asked for last, rather than two playing at once."""
+    clear_trouble()     # whatever went wrong last time, this is a fresh start
     if send("play", job=job):
         return True
     # Nothing playing, so start something. The queue goes in a file, not on
@@ -3200,6 +3400,25 @@ def numbers(kind, what, rows):
     numbered the same way and means the same thing afterwards."""
     remember_shown(kind, what, [{"n": i + 1, "file": r} for i, r in enumerate(rows)])
     return ["%2d. %s" % (i + 1, r) for i, r in enumerate(rows)]
+
+def refile(was, now, path):
+    """Carry a song into the playlists already naming it, under the name it
+    actually landed under.
+
+    `stream --to` writes the row before the bytes arrive - the look-up settles
+    the name long before the fetch is done, which is what lets a playlist name
+    a song that is still coming down. Whether that name was still free by the
+    time it got there is the disk's to say, and when it wasn't, this is what
+    keeps the row pointing at a file that exists."""
+    for f in stems():
+        stem = f[:-5]
+        songs = songs_of(stem)
+        if not any(p["file"] == was for p in songs):
+            continue
+        m = meta(stem)
+        m["songs"] = store([dict(p, file=now, path=path) if p["file"] == was else p
+                            for p in songs], m)
+        write_meta(stem, m)
 
 def join(stem, name, path):
     """Put one library song on the top of a playlist, and say whether that
@@ -4668,19 +4887,98 @@ def dl_name(y, info):
     two have to agree about the name to recognise. It is whatever arrived."""
     return os.path.basename(y.prepare_filename(info))
 
-def owned(song, idx=None):
+# Where a song says it came from. The metadata pass writes the watch page into
+# the file's comment as it downloads, so every song fetched here carries its
+# own video id about with it - and these are the tags it could be under, in
+# the containers this deals in.
+CAME_FROM = ("\u00a9cmt", "comment", "purl", "comm", "woas", "wxxx")
+
+# Read off the disk, so worth not reading twice. Keyed by the file and the
+# moment it was last written: a song replaced under the same name is a
+# different file and answers for itself again.
+_vids = {}
+
+def song_vid(path):
+    """The video a song came from, if the file says so, and None if it doesn't.
+
+    This is the only thing that can tell two songs of the same name apart -
+    `Hey` is `Hey` whoever made it, and the library is one flat folder of
+    names. A song you copied in yourself says nothing about where it came
+    from, and is given the benefit of the doubt wherever this is asked: it is
+    the song it is named after, the way it always was."""
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return None
+    if key in _vids:
+        return _vids[key]
+    got = None
+    try:
+        import mutagen
+        a = mutagen.File(path)
+        for k, vals in ((a.tags if a else None) or {}).items():
+            if not str(k).lower().startswith(CAME_FROM):
+                continue
+            for v in (vals if isinstance(vals, (list, tuple)) else [vals]):
+                got = video_id(str(v))
+                if got:
+                    break
+            if got:
+                break
+    except Exception:           # no mutagen, or a file it can't make sense of
+        got = None
+    _vids[key] = got
+    return got
+
+def free_name(dest, song, vid=None):
+    """What to call a song landing in `dest`, given what is already there.
+
+    The name it wants, unless another song has it - and then the same name
+    with a number after it, the way anything else numbers a second copy. Two
+    videos called the same thing used to land on top of one another: one file,
+    two songs asking for it, and whichever arrived second was the one you got
+    from then on.
+
+    A file that is this very video is not another song. It is this one,
+    already here, and the name it is already under is the right answer."""
+    stem, ext = os.path.splitext(song)
+    name, n = song, 1
+    while os.path.exists(os.path.join(dest, name)):
+        if vid and song_vid(os.path.join(dest, name)) == vid:
+            return name
+        n += 1
+        name = "%s (%d)%s" % (stem, n, ext)
+    return name
+
+def owned(song, idx=None, vid=None):
     """The library's own name for a song, in whatever format it is kept, or
     None if it isn't there.
 
     A download is named for what YouTube sends - m4a, these days - but the
     same song may be in the library as an mp3 from before that, or one you
     copied in yourself. Those are the same song, and fetching it again would
-    be a second copy of it under another extension."""
+    be a second copy of it under another extension.
+
+    `vid` is the video the caller has in mind, when it has a particular one.
+    A file that says it came from a different video is a different song that
+    happens to share a name, however well the name matches - and this video
+    may still be here under a name it had to take instead, which the file is
+    equally able to say."""
     idx = index() if idx is None else idx
-    if song in idx:
-        return song
     stem = os.path.splitext(song)[0]
-    return next((n for n in idx if os.path.splitext(n)[0] == stem), None)
+    same = [song] if song in idx else []
+    same += [n for n in idx if n != song and os.path.splitext(n)[0] == stem]
+    if not vid:
+        return same[0] if same else None
+    mine = [n for n in same if song_vid(idx[n]) in (None, vid)]
+    if mine:
+        return mine[0]
+    if not same:
+        return None
+    # The name is another song's. Walking the library to ask every file where
+    # it came from is only worth it here, where we already know the obvious
+    # answer is wrong and the alternative is fetching a song we have again.
+    return next((n for n, p in idx.items() if song_vid(p) == vid), None)
 
 def dl_hook(vid):
     """yt-dlp's progress callback, thinned to a few writes a second - it fires
@@ -4733,16 +5031,15 @@ def fetch_id(vid):
             waited += 0.25
         ready = cached_ready(vid)
     if ready:
-        have = owned(ready)     # it arrived by some other route in the meantime
+        have = owned(ready, vid=vid)    # it arrived by some other route since
         if have:
-            try:
-                os.remove(os.path.join(cache_dir(), ready))
-                os.remove(os.path.join(cache_dir(), vid + ".json"))
-            except OSError:
-                pass
+            drop_cached(vid)
             return {"song": have, "id": vid, "downloaded": False}, None
-        promote(vid, ready)
-        return {"song": ready, "id": vid, "downloaded": True, "cached": True}, None
+        final = promote(vid, ready)
+        if not final:
+            return None, "the cached copy of %s went missing" % ready
+        return ({"song": os.path.basename(final), "id": vid,
+                 "downloaded": True, "cached": True}, None)
 
     url = "https://www.youtube.com/watch?v=" + vid
     # Audio only, as YouTube sends it, with the tags and then the cover written
@@ -4759,15 +5056,27 @@ def fetch_id(vid):
             # anything is what lets a song already in the library - in this
             # format or another - cost a second instead of a minute.
             song = dl_name(y, info)
-            have = owned(song)
+            have = owned(song, vid=vid)
             if have:
                 return {"song": have, "id": vid, "downloaded": False}, None
+            # The name it wants may be another song's already. Settled before
+            # the fetch rather than after it, because yt-dlp writes where the
+            # template says and the template is read once: given the name as
+            # it stands, the download would land on top of the song that has
+            # it. A literal name, so the % in a title stays part of the title.
+            song = free_name(dest, song, vid)
+            # The second one writes where the first only worked out: the name
+            # is a literal now rather than a template, with the % in a title
+            # escaped so it stays part of the title.
+            wrote = dict(opts, outtmpl={"default": os.path.join(
+                dest, song.replace("%", "%%"))})
             cover = Art(vid)    # comes down while the audio does
             # Fetch what we just looked up rather than looking it up again.
             # Asking YouTube a second time costs as much as the first ask did
             # - about a second and a half of the eleven this used to take -
             # and it can only ever answer with what we are already holding.
-            y.process_ie_result(dict(info), download=True)
+            with m.YoutubeDL(wrote) as w:
+                w.process_ie_result(dict(info), download=True)
     except Exception as e:
         return None, "download failed: %s" % e
     finally:
@@ -4862,6 +5171,15 @@ def resolved_put(vid, url, song):
     except OSError:
         pass
 
+def resolved_drop(vid):
+    """Forget a lookup. The URL in it was good enough to start a song with and
+    then stopped being, which is the one thing the age of it cannot say - so
+    the next ask goes to YouTube rather than being handed the dead one back."""
+    try:
+        os.remove(os.path.join(RESOLVED, vid + ".json"))
+    except OSError:
+        pass
+
 def sweep_resolved():
     """Drop lookups nothing could use any more. They are small and few, so
     this rides along on writing one rather than needing a moment of its own."""
@@ -4920,15 +5238,23 @@ def fetch(vid, song):
     if m is None:
         return 1
     cache = cache_dir()
-    if owned(song):
+    if owned(song, vid=vid):
         dl_done(vid)            # already a library song: nothing worth caching
         return 0
-    got = os.path.join(cache, song)
+    # Named for the video rather than for the song. Two videos can be called
+    # the same thing, and a cache keyed by the name had the second of them
+    # land on top of the first - after which the note beside it named a file
+    # that was somebody else's song, and playing it played the wrong one. The
+    # name the song will have in the library goes in the note instead, where
+    # it is a label rather than an address.
+    got = os.path.join(cache, vid + os.path.splitext(song)[1])
+    opts = dict(dl_opts(cache))
+    opts["outtmpl"] = {"default": os.path.join(cache, "%(id)s.%(ext)s")}
     dl_hold(vid)                # this fetch is ours, for as long as it runs
     dl_report(vid, "caching")
     try:
         os.makedirs(cache, exist_ok=True)
-        with m.YoutubeDL(dl_opts(cache)) as y:
+        with m.YoutubeDL(opts) as y:
             info = y.extract_info("https://www.youtube.com/watch?v=" + vid,
                                   download=False)
             cover = Art(vid)
@@ -4944,7 +5270,8 @@ def fetch(vid, song):
         # means asking YouTube, and a cache you have to make a network call to
         # use is not the thing that makes `download` quick.
         with open(os.path.join(cache, vid + ".json"), "w") as f:
-            json.dump({"song": song, "cached": time.time()}, f)
+            json.dump({"song": song, "file": os.path.basename(got),
+                       "cached": time.time()}, f)
     except Exception:
         # Silent in, silent out. Nobody is waiting on this, and a song that
         # failed to cache simply costs a download later, the way it always did.
@@ -4981,11 +5308,17 @@ def keep(vid, song):
     moment before the fetch has said otherwise."""
     waited = 0.0
     while waited < CACHE_WAIT:
-        if owned(song):
+        if owned(song, vid=vid):
             return 0                # it got there by some other road
         ready = cached_ready(vid)
         if ready:
-            promote(vid, ready)
+            final = promote(vid, ready)
+            # The playlist was promised this song under the name the look-up
+            # settled on, before a byte of it arrived. If it had to land under
+            # another one - the first was taken - the row is what has to move,
+            # or the playlist names a song that was never written.
+            if final and os.path.basename(final) != song:
+                refile(song, os.path.basename(final), final)
             return 0
         if waited > CACHE_GRACE and not dl_live(vid):
             return 1                # nothing is coming, and nothing is holding it
@@ -4993,30 +5326,75 @@ def keep(vid, song):
         waited += 0.5
     return 1
 
-def cached_ready(vid):
-    """The song this video is cached as, if a whole copy is sitting there
-    waiting to be claimed. None while it is still coming down: the name is
-    only written once the file is complete, so a half-fetched song can never
-    be mistaken for one ready to move."""
+def cached_note(vid):
+    """What the cache says about a video, or None if it says nothing. The note
+    is written once the file is whole, so having one at all is the answer to
+    whether there is anything here to claim."""
     try:
         with open(os.path.join(cache_dir(), vid + ".json")) as f:
-            song = json.load(f).get("song")
+            note = json.load(f)
     except (OSError, ValueError):
         return None
-    return song if song and os.path.isfile(os.path.join(cache_dir(), song)) else None
+    return note if isinstance(note, dict) and note.get("song") else None
+
+def cached_file(vid):
+    """The whole copy of this video sitting in the cache, or None.
+
+    `file` is what the fetch actually wrote, which is named for the video.
+    Notes written before that was so named the song instead, and are still
+    read the way they were written - there is no reason to throw away a song
+    somebody is about to ask for."""
+    note = cached_note(vid)
+    if not note:
+        return None
+    if note.get("file"):
+        path = os.path.join(cache_dir(), note["file"])
+        return path if os.path.isfile(path) else None
+    # A note from before the cache was keyed by the video, naming the song.
+    # Two of those could name one file, and the one left holding it is not
+    # necessarily this video's - so the file is asked what it is, and answers
+    # for itself or is left where it is.
+    path = os.path.join(cache_dir(), note["song"])
+    if not os.path.isfile(path) or song_vid(path) not in (None, vid):
+        return None
+    return path
+
+def cached_ready(vid):
+    """The song this video is cached as, if a whole copy is sitting there
+    waiting to be claimed. None while it is still coming down: the note is
+    only written once the file is complete, so a half-fetched song can never
+    be mistaken for one ready to move."""
+    note = cached_note(vid)
+    return note["song"] if note and cached_file(vid) else None
+
+def drop_cached(vid):
+    """Throw away a cached copy and the note that named it. Both together: a
+    note pointing at nothing would have `download` offer a song it can no
+    longer produce."""
+    path = cached_file(vid)
+    for f in (path, os.path.join(cache_dir(), vid + ".json")):
+        if not f:
+            continue
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 def promote(vid, song):
-    """Move a cached song into the library.
+    """Move a cached song into the library, and say what it ended up called.
 
     A rename on one filesystem - the cache is inside your music folder for
     exactly this - so the song is in the cache or in the library and never
-    halfway between either. The note naming it goes too: the file it pointed
-    at has left, and a note pointing at nothing would have `download` offer a
-    song it can no longer produce."""
+    halfway between either. The name can change on the way in: another song
+    may already have it, and landing on top of that one is what this used to
+    do. The note naming it goes too, for the reason `drop_cached` gives."""
+    src = cached_file(vid)
+    if not src:
+        return None
     dest = folder()
     os.makedirs(dest, exist_ok=True)
-    final = os.path.join(dest, song)
-    os.replace(os.path.join(cache_dir(), song), final)
+    final = os.path.join(dest, free_name(dest, song, vid))
+    os.replace(src, final)
     try:
         os.remove(os.path.join(cache_dir(), vid + ".json"))
     except OSError:
@@ -5055,10 +5433,13 @@ def cmd_stream(args):
     # library, then the cache from having played it before, then YouTube. Only
     # the last of them is a stream, and only the last is worth caching.
     idx = index()
-    song = owned(song, idx) or song     # kept as an mp3 from before, say
+    # `vid`, so a song of the same name from another video is not mistaken for
+    # this one - that is a different song, and playing it would be playing the
+    # wrong one.
+    song = owned(song, idx, vid) or song    # kept as an mp3 from before, say
     source = idx.get(song)
     if not source and cached_ready(vid) == song:
-        source = os.path.join(cache_dir(), song)
+        source = cached_file(vid)
     live = not source               # nothing local: play it off the network
     if live:
         source = url
@@ -5261,7 +5642,11 @@ def main(argv=None):
         return art(argv[1], argv[2])    # song whose download has already ended
     if argv[:1] == ["_levels"]:         # internal: measuring whatever arrived
         return measure_library()
-    migrate()                           # playlists moved folder once, long ago
+    if argv[:1] == ["simplestatus"]:    # unlisted: the song, for a status bar
+        song = playing().get("song")
+        print(os.path.splitext(song)[0] if song else "simplmusik")
+        return 0
+    migrate()                          # playlists moved folder once, long ago
     ap = Parser(prog="simplmusik", description=__doc__,
                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--json", action="store_true", help="machine-readable output")

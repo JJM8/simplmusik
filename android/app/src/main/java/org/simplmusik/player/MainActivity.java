@@ -11,12 +11,16 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.view.ViewGroup;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
@@ -45,6 +49,21 @@ public class MainActivity extends AppCompatActivity {
     private int tries;
     private boolean ready;          // the app's own page is up, script and all
     private String shared;          // shared to us, and not yet handed over
+    private ValueCallback<Uri[]> choosing;  // the page's file input, waiting on a pick
+
+    /**
+     * Whatever came back from the system's own picker, handed to the page's
+     * file input. Nothing picked is an answer too: the input has to be told,
+     * or it never opens again.
+     */
+    private final ActivityResultLauncher<Intent> picker = registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(), r -> {
+                if (choosing == null) return;
+                Uri got = r.getData() == null ? null : r.getData().getData();
+                choosing.onReceiveValue(r.getResultCode() == RESULT_OK && got != null
+                        ? new Uri[]{got} : null);
+                choosing = null;
+            });
 
     @Override
     protected void onCreate(Bundle state) {
@@ -85,6 +104,27 @@ public class MainActivity extends AppCompatActivity {
             public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
                 // The server is still starting: the first load can beat it.
                 if (r.isForMainFrame()) main.postDelayed(MainActivity.this::show, 300);
+            }
+        });
+        // A WebView ignores <input type=file> unless something here answers
+        // it - which is why picking cover art did nothing. The page only ever
+        // asks for a picture, so Android's own image picker is the answer.
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (choosing != null) choosing.onReceiveValue(null);
+                choosing = callback;
+                Intent i = new Intent(Intent.ACTION_GET_CONTENT)
+                        .addCategory(Intent.CATEGORY_OPENABLE)
+                        .setType("image/*");
+                try {
+                    picker.launch(i);
+                } catch (Exception e) {
+                    choosing = null;
+                    return false;       // no picker on this phone: the input is told no
+                }
+                return true;
             }
         });
         setContentView(web);

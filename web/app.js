@@ -449,7 +449,9 @@ function pickCover(pl) {
    own `cover` command, so what the window does here a terminal could do too. */
 async function setCover(pl, file) {
   if (!file) return;
-  if (!/^image\//.test(file.type)) return toast('That isn\'t an image');
+  // A phone's picker can hand over a picture with no type on it at all. The
+  // CLI reads the bytes and decides, so only a type that says otherwise stops it.
+  if (file.type && !/^image\//.test(file.type)) return toast('That isn\'t an image');
   // The ceiling is the CLI's, sent with the library: turning a picture away
   // here only saves the trip, it isn't this side's rule to make.
   const max = state.lib.cover_max || 8 << 20;
@@ -838,7 +840,6 @@ function renderList() {
 
   renderAdder(list);
   renderFound(list);
-  markNowPlaying();
 }
 
 /* --------------------------------------------------- adding from the library */
@@ -939,6 +940,9 @@ function renderAdder(list) {
     // the difference being that these land in this playlist.
     yt.replaceChildren();
     if (state.addQuery.length >= MIN_FIND) foundRows(yt, adderFind, pl);
+    // Typing in this box repaints these rows without going through `render`,
+    // so the mark has to be asked for here as well - same reason as there.
+    markNowPlaying();
   };
   repaintAdder = paint;
 
@@ -972,6 +976,14 @@ function render() {
   }
   renderHead();
   renderList();
+  // Every render rebuilds the rows that aren't kept in `trackRows` - which is
+  // all of the YouTube ones - and a row built from scratch has no idea it is
+  // the one playing. This is here rather than at the end of `renderList`
+  // because that has three ways out and only one of them used to mark: a
+  // search matching nothing in the library left the results underneath it
+  // white until the next poll, so the 15s reload took the colour off a
+  // streamed song's row for a third of a second, every fifteen seconds.
+  markNowPlaying();
 }
 
 /* ------------------------------------------------------------------ theme */
@@ -1911,11 +1923,29 @@ async function loadLibrary() {
   render();
 }
 
+/* The music stopping on its own is the one thing that happens here without
+   anyone asking for it, so it is the one thing that has to say so: a stream
+   whose connection died used to leave the window quietly showing nothing
+   playing, which reads as the song having ended. The player leaves the note
+   behind as it goes and the poll picks it up; `at` is what makes it one
+   toast rather than one every half second, and the note ages out on the
+   server, so a window opened later doesn't start with old news. */
+let toldOf = null;
+
+function sayTrouble(n) {
+  const t = n.trouble;
+  if (!t || t.at === toldOf) return;
+  toldOf = t.at;
+  const name = (t.song || '').replace(/\.[^.]+$/, '');
+  toast(name ? '\u201c' + name + '\u201d stopped - ' + t.why : t.why);
+}
+
 async function poll() {
   try {
     state.now = await api('/api/state');
     renderPlayer();
     markDownloads();
+    sayTrouble(state.now);
   } catch (e) { /* server restarting: the next tick will catch up */ }
 }
 
@@ -2027,8 +2057,9 @@ vbar.onkeydown = e => {
 /* The one control that has to get ahead of the truth: a seek is a CLI call
    and /api/state won't agree for a moment, so the bar paints where you asked
    for straight away and `scrub` holds that until the server catches up. A
-   drag only sends on release - a seek is cheap now that mpv moves the song
-   it is already playing, but a CLI call per pixel is not. */
+   drag only sends on release, and so does a held arrow key - a seek is cheap
+   now that mpv moves the song it is already playing, but a CLI call per pixel
+   is not, and neither is one per auto-repeat. */
 
 const bar = $('#t-bar');
 let scrub = null, scrubbing = false, asked = 0;
@@ -2036,7 +2067,7 @@ let scrub = null, scrubbing = false, asked = 0;
 function settled(n) {
   /* Drop the pending position once the server reports one near it, or after
      two seconds, so a seek that never landed can't freeze the bar. */
-  if (scrub === null || scrubbing) return;
+  if (scrub === null || scrubbing || keyDir !== null) return;
   if (Math.abs((n.elapsed || 0) - scrub) < 1.5 || Date.now() - asked > 2000)
     scrub = null;
 }
@@ -2087,6 +2118,74 @@ bar.onpointercancel = () => {           // dropped mid-drag: forget the whole
   bar.classList.remove('scrubbing');
   renderPlayer();
 };
+
+/* The arrow keys, which are a drag done with a keyboard.
+
+   A tap is a 3s jump. A hold runs through the song, faster the longer you
+   hold it, and nothing is sent while the key is down: the bar moves, the song
+   carries on playing where it was, and the one seek that lands is the place
+   you let go on. That is the drag's bargain, for a sharper version of the
+   drag's reason. A seek per auto-repeat was a CLI call, two socket round
+   trips and a buffer refill per keystroke, and every step of it was computed
+   from `state.now.elapsed` - a number that only moves on a poll, and that a
+   busy mpv reports as zero. Held down, the old one asked a streamed song to
+   jump to three seconds, several times a second, forever.
+
+   The repeat is ours rather than the keyboard's, so the auto-repeat events
+   are dropped and how fast this runs is not a question about anybody's
+   key-repeat settings. Every KEY_ACCEL held adds another KEY_STEP to the
+   step, up to eight of them, so a nudge stays a nudge and a long hold crosses
+   a track in a couple of seconds. */
+
+const KEY_STEP = 3;        // seconds a tap moves, and the step a hold opens on
+const KEY_DELAY = 350;     // held this long before it starts running
+const KEY_TICK = 180;      // and a step this often once it has
+const KEY_ACCEL = 800;     // each of these held adds another KEY_STEP to it
+const KEY_MULT = 8;        // and this is as fast as it ever gets
+
+/* `keyHeld` is which arrows are down, so releasing one of two turns round
+   instead of landing - the other one is still being held. */
+const keyHeld = new Set();
+let keyDir = null, keyFrom = 0, keyWait = 0, keyRun = 0;
+
+function keyStep() {
+  const mult = Math.min(KEY_MULT,
+                        1 + Math.floor((Date.now() - keyFrom) / KEY_ACCEL));
+  const dur = state.now.duration || 0;
+  // Off `scrub` where there is one, so the steps add up - and off the song
+  // otherwise, which is what a track change under a held key leaves behind.
+  const at = (scrub !== null ? scrub : state.now.elapsed || 0)
+             + keyDir * KEY_STEP * mult;
+  scrub = Math.max(0, dur ? Math.min(at, dur) : at);
+  renderPlayer();
+}
+
+function keySeek(dir) {
+  /* Also a direction change mid-hold, where the accelerating clock starts
+     again: turning round is how you close in on a spot, not how you leave
+     one, so it should be slow again for a moment. */
+  const already = keyDir !== null;
+  keyDir = dir;
+  keyFrom = Date.now();
+  if (!already) bar.classList.add('scrubbing');
+  clearTimeout(keyWait);
+  clearInterval(keyRun);
+  keyStep();                            // the tap, before any hold is known
+  keyWait = setTimeout(() => { keyRun = setInterval(keyStep, KEY_TICK); },
+                       KEY_DELAY);
+}
+
+function keyRelease() {
+  /* Where the seek is finally sent. Called on losing the window as well as on
+     the key coming up: a keyup that never arrives would otherwise leave the
+     bar holding a position nothing was ever asked for. */
+  if (keyDir === null) return;
+  clearTimeout(keyWait);
+  clearInterval(keyRun);
+  keyDir = null;
+  bar.classList.remove('scrubbing');
+  seekTo(scrub === null ? state.now.elapsed || 0 : scrub);
+}
 
 /* search ----------------------------------------------------------------- */
 
@@ -2207,11 +2306,26 @@ document.onkeydown = e => {
     e.preventDefault();
     stepSidebar(e.key === 'ArrowDown' ? 1 : -1);
   }
+  // Left and right are the song's. They only paint while they are down: the
+  // seek is sent by keyRelease, when the last of them comes up.
   else if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && state.now.playing) {
     e.preventDefault();
-    seekTo((state.now.elapsed || 0) + (e.key === 'ArrowRight' ? 5 : -5));
+    keyHeld.add(e.key);
+    if (!e.repeat) keySeek(e.key === 'ArrowRight' ? 1 : -1);
   }
 };
+
+document.onkeyup = e => {
+  if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+  keyHeld.delete(e.key);
+  if (keyHeld.has('ArrowRight')) keySeek(1);
+  else if (keyHeld.has('ArrowLeft')) keySeek(-1);
+  else keyRelease();
+};
+
+// A window that loses focus mid-hold never sees the keyup: land the seek
+// anyway, rather than leave the bar somewhere nothing was asked for.
+addEventListener('blur', () => { keyHeld.clear(); keyRelease(); });
 
 /* ------------------------------------------------------------------ start */
 

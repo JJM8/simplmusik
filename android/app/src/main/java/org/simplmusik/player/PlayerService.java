@@ -14,6 +14,10 @@ import android.os.Looper;
 import android.util.Log;
 
 import androidx.core.app.NotificationCompat;
+import androidx.media3.common.MediaMetadata;
+import androidx.media3.common.Player;
+import androidx.media3.session.MediaSession;
+import androidx.media3.session.MediaStyleNotificationHelper;
 
 /**
  * What keeps the music going when the window is not on screen.
@@ -88,10 +92,27 @@ public class PlayerService extends Service {
     public void onCreate() {
         super.onCreate();
         channel();
-        startForeground(NOTE, note(getString(R.string.starting)));
+        // Made here, before the backend asks for it, so there is a session for
+        // the notification to be about from the very first one. This is the
+        // main thread, which is where the player was always going to be made.
+        Playback p = playback(this);
+        p.session().setSessionActivity(tap(this));
+        p.watch(new Player.Listener() {
+            @Override
+            public void onEvents(Player player, Player.Events events) {
+                if (events.containsAny(Player.EVENT_PLAY_WHEN_READY_CHANGED,
+                        Player.EVENT_MEDIA_METADATA_CHANGED,
+                        Player.EVENT_MEDIA_ITEM_TRANSITION,
+                        Player.EVENT_PLAYBACK_STATE_CHANGED)) {
+                    refresh(PlayerService.this);
+                }
+            }
+        });
+        startForeground(NOTE, note(this));
         new Thread(() -> {
             try {
                 port = Boot.start(this);
+                new Handler(Looper.getMainLooper()).post(() -> refresh(this));
             } catch (Throwable t) {
                 Log.e(TAG, "the backend would not start", t);
                 java.io.StringWriter w = new java.io.StringWriter();
@@ -103,6 +124,10 @@ public class PlayerService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // A button on the notification, on the Androids that draw them from
+        // the notification rather than from the session.
+        String op = intent == null ? null : intent.getAction();
+        if (op != null && playback != null) playback.press(op);
         // Restarted after being killed, the app comes back to a library and a
         // stopped player, which is the honest state: what was playing was in
         // the process that went away.
@@ -112,27 +137,72 @@ public class PlayerService extends Service {
     @Override
     public IBinder onBind(Intent intent) { return null; }
 
-    /** Update what the notification says is playing. */
-    static void showing(Context c, String text) {
+    /** Put the notification back in step with the player. Main thread only. */
+    static void refresh(Context c) {
         NotificationManager nm = c.getSystemService(NotificationManager.class);
-        if (nm != null) nm.notify(NOTE, note(c, text));
+        if (nm != null) nm.notify(NOTE, note(c));
     }
 
-    private Notification note(String text) { return note(this, text); }
-
-    private static Notification note(Context c, String text) {
+    private static PendingIntent tap(Context c) {
         Intent open = new Intent(c, MainActivity.class);
-        PendingIntent tap = PendingIntent.getActivity(
+        return PendingIntent.getActivity(
                 c, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        return new NotificationCompat.Builder(c, CHANNEL)
-                .setContentTitle(c.getString(R.string.app_name))
-                .setContentText(text)
+    }
+
+    private static NotificationCompat.Action button(Context c, int icon, String label, String op) {
+        Intent i = new Intent(c, PlayerService.class).setAction(op);
+        PendingIntent pi = PendingIntent.getService(c, op.hashCode(), i,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        return new NotificationCompat.Action(icon, label, pi);
+    }
+
+    /**
+     * The notification, drawn around the media session.
+     *
+     * <p>From Android 13 the system draws a media notification itself, out of
+     * the session - title, artist, cover, a progress bar and the buttons -
+     * and what is set here is mostly ignored. Before 13 this is what shows,
+     * so it says the same things by hand.
+     */
+    private static Notification note(Context c) {
+        Playback p = playback;
+        MediaSession session = p == null ? null : p.session();
+        Player player = session == null ? null : session.getPlayer();
+        boolean loaded = player != null && player.getCurrentMediaItem() != null;
+
+        NotificationCompat.Builder b = new NotificationCompat.Builder(c, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_media_play)
-                .setContentIntent(tap)
+                .setContentIntent(tap(c))
+                .setShowWhen(false)
                 .setOngoing(true)
                 .setSilent(true)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build();
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                .setPriority(NotificationCompat.PRIORITY_LOW);
+
+        if (!loaded) {
+            b.setContentTitle(c.getString(R.string.app_name))
+             .setContentText(c.getString(port == 0 ? R.string.starting : R.string.nothing_playing));
+        } else {
+            MediaMetadata md = player.getMediaMetadata();
+            boolean playing = player.getPlayWhenReady();
+            b.setContentTitle(md.title != null ? md.title : c.getString(R.string.app_name))
+             .setContentText(md.artist)
+             .setSubText(md.albumTitle)
+             .setLargeIcon(p.artwork())
+             .addAction(button(c, android.R.drawable.ic_media_previous, "Previous", "back"))
+             .addAction(playing
+                     ? button(c, android.R.drawable.ic_media_pause, "Pause", "pause")
+                     : button(c, android.R.drawable.ic_media_play, "Play", "play"))
+             .addAction(button(c, android.R.drawable.ic_media_next, "Next", "skip"));
+        }
+        if (session != null) {
+            MediaStyleNotificationHelper.MediaStyle style =
+                    new MediaStyleNotificationHelper.MediaStyle(session);
+            if (loaded) style.setShowActionsInCompactView(0, 1, 2);
+            b.setStyle(style);
+        }
+        return b.build();
     }
 
     private void channel() {

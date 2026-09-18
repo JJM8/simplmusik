@@ -76,7 +76,23 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
-    <release version="0.2.4" date="2026-09-15"/>
+    <release version="0.2.6" date="2026-09-18">
+      <description>
+        <p>
+          Lock screen and notification controls on Android, a download that
+          survives a dropped connection, and a tidier sidebar.
+        </p>
+      </description>
+    </release>
+    <release version="0.2.5" date="2026-09-16"/>
+    <release version="0.2.4" date="2026-09-15">
+      <description>
+        <p>
+          Even loudness and song identification now work on Android, not only
+          on the desktop.
+        </p>
+      </description>
+    </release>
     <release version="0.2.2" date="2026-09-13">
       <description>
         <p>Listening stats with top songs and most skipped, and a simpler settings page.</p>

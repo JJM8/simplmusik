@@ -214,11 +214,24 @@ input  { font: inherit; }
   mask: url(/logo.png) center / contain no-repeat;
 }
 
+/* The heading is the button, so it wears the same 8px margin and 10px padding
+   a playlist row does: the band that comes up under it on hover is then the
+   width of the chips beneath it, rather than a stripe running edge to edge
+   past where every other row stops. Its own padding is even top and bottom
+   for the same reason - the 10/6 a plain heading could get away with shows up
+   as soon as there is a background behind it. The room above the heading is
+   the margin's job now. */
 .section {
-  padding: 10px 18px 6px;
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 6px 8px 2px;
+  padding: 6px 10px;
+  border-radius: var(--radius);
   font-size: 11px; font-weight: 500; letter-spacing: .8px;
   text-transform: uppercase; color: var(--faint);
+  transition: background .12s, color .12s;
 }
+.section:hover { background: var(--hover); color: var(--text); }
+.section .ico { flex: none; opacity: .85; }
 
 /* The same 8px gutter either side for both lists, so "All songs" wears a
    chip the width of a playlist's when it is the one selected, rather than a
@@ -257,29 +270,20 @@ input  { font: inherit; }
   background: var(--surface);
 }
 
-.side-foot { padding: 10px; display: flex; flex-direction: column; gap: 2px; }
-
-/* New playlist sits over the two pages rather than beside them, so its text is
-   centred: ranged left it reads as a third item in a column of three, and the
-   line under it is what says there are two things there and not three. */
-.linkbtn.center { justify-content: center; }
-
-/* Settings and Stats share the line under it, and Stats takes half the room
-   Settings does. That is the honest proportion: settings is the page you go
-   into looking for something, stats is the one you glance at and leave. */
-.foot-row { display: flex; gap: 2px; }
-.foot-row .linkbtn { width: auto; min-width: 0; flex: 2; }
-.foot-row .linkbtn.half {
-  flex: 1; justify-content: center; gap: 6px; padding: 0 6px;
-  white-space: nowrap; overflow: hidden;
-}
+/* One line, split down the middle. Both halves are centred on their own half
+   rather than ranged left, because two ranged-left labels in a row of two
+   leave a gap in the middle that reads as a third thing missing. */
+.side-foot { padding: 8px; display: flex; gap: 2px; }
 
 .linkbtn {
-  display: flex; align-items: center; gap: 9px;
-  width: 100%; padding: 0 10px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  gap: 8px;
+  flex: 1; min-width: 0; padding: 0 8px; height: 34px;
   border-radius: var(--radius);
   color: var(--dim); font-size: 13px;
+  white-space: nowrap; overflow: hidden;
 }
+.linkbtn .ico { flex: none; opacity: .85; }
 .linkbtn:hover { background: var(--hover); color: var(--text); }
 .linkbtn.on { background: var(--hover); color: var(--text); }
 

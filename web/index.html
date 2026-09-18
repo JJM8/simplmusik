@@ -57,23 +57,30 @@
 
     <nav id="lib-nav"></nav>
 
-    <div class="section">Playlists</div>
+    <!-- Making a playlist belongs to the list of playlists rather than to the
+         bottom of the window, so it lives on the heading the new one will
+         appear under - and the whole heading is the button, not just the plus
+         on the end of it. The row was already the width of the sidebar doing
+         nothing, and a 26px target for the only thing you do here was mean.
+         The name it answers to is what it does, not what it says: the plus is
+         the word "Playlists" doing a second job, and a reader hearing
+         "Playlists, button" would have no idea it makes one. -->
+    <button class="section" id="new-pl" title="New playlist" aria-label="New playlist">
+      Playlists
+      <svg class="ico" width="15" height="15"><use href="#i-plus"/></svg>
+    </button>
     <nav id="playlists"></nav>
 
+    <!-- The two pages that are not the music: one line, one half each. They
+         are the same kind of thing and you visit them about as often, so
+         neither gets to look more important than the other. -->
     <div class="side-foot">
-      <button class="linkbtn center" id="new-pl">
-        <svg class="ico" width="15" height="15"><use href="#i-plus"/></svg> New playlist
+      <button class="linkbtn" id="settings-btn">
+        <svg class="ico" width="15" height="15"><use href="#i-gear"/></svg> Settings
       </button>
-      <!-- The two pages, on one line. Settings is the one you go looking for
-           something in, so it keeps the room; stats is the one you glance at. -->
-      <div class="foot-row">
-        <button class="linkbtn" id="settings-btn">
-          <svg class="ico" width="15" height="15"><use href="#i-gear"/></svg> Settings
-        </button>
-        <button class="linkbtn half" id="stats-btn" title="Stats">
-          <svg class="ico" width="15" height="15"><use href="#i-chart"/></svg> Stats
-        </button>
-      </div>
+      <button class="linkbtn" id="stats-btn">
+        <svg class="ico" width="15" height="15"><use href="#i-chart"/></svg> Stats
+      </button>
     </div>
   </aside>
 

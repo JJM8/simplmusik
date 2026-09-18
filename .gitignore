@@ -21,3 +21,10 @@ ios/Python.xcframework/
 
 # Syncthing conflict copies
 *.sync-conflict-*
+
+# local-only working folders
+.stignore
+
+# the intro video lives on the v0.2.5 release, where the README links it;
+# kept out of the repository so its 6 MB isn't in every clone forever
+screenshots/intro.mp4

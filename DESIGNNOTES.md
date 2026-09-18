@@ -136,7 +136,6 @@ plus the folder it was last seen in, relative to your music folder:
 ```json
 {
   "name": "Road trip",
-  "cover": "Road trip.jpg",
   "songs": [
     {"file": "Killer Queen - Queen.mp3", "dir": ""},
     {"file": "Don't Stop Me Now - Queen.mp3", "dir": "rock"}
@@ -144,8 +143,10 @@ plus the folder it was last seen in, relative to your music folder:
 }
 ```
 
-`name` is what you see and is yours to change; `cover` is a picture beside the
-list, named on its own so it can only ever be one in that same folder. The
+`name` is what you see and is yours to change. The cover isn't in the list at
+all: it is whichever picture sits beside it with the same stem (`main.json`,
+`main.jpg`), so changing one writes only the picture, and a sync can never
+carry a list and its picture across out of step. The
 **filename is the identity**; `dir` is only a shortcut, so the usual case
 is one `stat` rather than a search. It is relative - `""` is the music folder
 itself - because the same folder is `/home/me/Music` on a desktop and
