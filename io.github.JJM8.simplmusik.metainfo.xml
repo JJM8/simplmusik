@@ -76,6 +76,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.2.7" date="2026-09-18">
+      <description>
+        <p>
+          The Flatpak now only asks for your Music folder. Music anywhere else,
+          on another disk or a USB stick, is a folder you choose in your
+          desktop's own file dialog.
+        </p>
+      </description>
+    </release>
     <release version="0.2.6" date="2026-09-18">
       <description>
         <p>

@@ -780,7 +780,7 @@ function songRow(s, i) {
    a setting to go and find. */
 
 function emptyLibrary(e) {
-  const root = state.lib.root || '~/Music';
+  const root = state.lib.root_shown || state.lib.root || '~/Music';
   const gone = state.lib.root_exists === false;
   e.append(el('strong', '', 'No songs yet'),
            el('div', '', gone ? 'There is no folder at ' + root
@@ -1063,7 +1063,7 @@ function folderPicker(cta) {
   const chose = async (r, dir) => {
     if (!r.ok || (r.data && !r.data.changed)) return;
     await loadLibrary();
-    toast('Music folder is now ' + ((r.data && r.data.folder) || dir));
+    toast('Music folder is now ' + (state.lib.root_shown || (r.data && r.data.folder) || dir));
   };
   if (!typedFolder()) {
     const pick = el('button', 'btn primary small', cta || 'Choose\u2026');
@@ -1197,7 +1197,7 @@ function renderSettings() {
   head.append(el('h1', '', 'Settings'));
 
   const page = el('div', 'settings');
-  const root = state.lib.root || '';
+  const root = state.lib.root_shown || state.lib.root || '';
   // Every song we found is somewhere under the folder, so the count on the
   // row is simply the library - subfolders came with it.
   const here = state.lib.songs.filter(s => !s.missing).length;

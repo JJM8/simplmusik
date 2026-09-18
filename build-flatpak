@@ -15,11 +15,19 @@ packs the result into one file you can hand to someone.
     ./build-flatpak --fresh          # ...moving yt-dlp to its newest release
     ./build-flatpak --install        # ...and install it when it's done
     ./build-flatpak --keep           # leave the build tree for a look
+    ./build-flatpak --flathub        # write the manifest Flathub builds from
 
 The version being built gets a <release> in the metainfo if it has none yet,
 written into the file in this folder rather than a copy, so it is there to be
 committed for Flathub. --fresh likewise rewrites the manifest's yt-dlp URL and
 checksum in place.
+
+--flathub builds nothing. The manifest here takes the app's own files from
+this folder, so a build is of whatever is on the disk; Flathub builds on its
+own machines, from the repository, so its copy names a release tag instead.
+That copy is written to build/flathub/, for the pull request to Flathub (and,
+once it is in, the io.github.JJM8.simplmusik repository it gets there). The
+tag has to exist and be pushed first: that is what Flathub will check out.
 
 Needs flatpak, and flatpak-builder either on the PATH or installed as
 org.flatpak.Builder - the build prints the command to get what's missing.
@@ -35,6 +43,8 @@ REPO = os.path.join(BUILD, "flatpak-repo")      # the one-app repo it exports to
 
 APP_ID = "io.github.JJM8.simplmusik"
 MANIFEST = os.path.join(HERE, APP_ID + ".yml")
+GIT_URL = "https://github.com/JJM8/simplmusik.git"
+FLATHUB = os.path.join(BUILD, "flathub")          # where --flathub writes
 RUNTIME, RUNTIME_VERSION = "org.gnome.Platform", "50"
 SDK = "org.gnome.Sdk"
 
@@ -117,6 +127,42 @@ def note_release(version):
     print("  added release %s to the metainfo" % version)
 
 
+def flathub_manifest(version):
+    """The manifest as Flathub needs it: every file this repository supplies
+    taken from the release tag rather than from this folder. What is fetched
+    by URL is already fetched the same way everywhere, and stays as it is."""
+    tag = "v" + version
+    try:
+        commit = subprocess.run(["git", "rev-list", "-n1", tag], cwd=HERE,
+                                capture_output=True, text=True,
+                                check=True).stdout.strip()
+    except subprocess.CalledProcessError:
+        sys.exit("there is no tag %s - tag the release and push it first:\n"
+                 "    git tag %s && git push origin %s" % (tag, tag, tag))
+    with open(MANIFEST) as f:
+        text = f.read()
+    # Every local source is one `- type:` item with a `path:` under it.
+    text, dropped = re.subn(r"      - type: (?:file|dir)\n        path: [^\n]+\n"
+                            r"(?:        dest: [^\n]+\n)?", "", text)
+    git = ("      - type: git\n"
+           "        url: %s\n"
+           "        tag: %s\n"
+           "        commit: %s\n"
+           "        x-checker-data:\n"
+           "          type: git\n"
+           "          tag-pattern: ^v([\\d.]+)$\n" % (GIT_URL, tag, commit))
+    at = text.index("    sources:\n", text.index("  - name: simplmusik\n"))
+    at += len("    sources:\n")
+    text = text[:at] + git + text[at:]
+    if re.search(r"^\s+path: ", text, re.M) or not dropped:
+        sys.exit("couldn't swap the local sources in %s for the tag" % MANIFEST)
+    os.makedirs(FLATHUB, exist_ok=True)
+    out = os.path.join(FLATHUB, APP_ID + ".yml")
+    with open(out, "w") as f:
+        f.write(text)
+    print("%s\n  the app from %s at %s (%s)" % (out, GIT_URL, tag, commit[:7]))
+
+
 def main():
     args = sys.argv[1:]
     deb = load("build-deb", "simplmusik_build_deb_version")
@@ -126,6 +172,8 @@ def main():
         if i + 1 >= len(args):
             sys.exit("--version needs a number, e.g. --version 0.2.0")
         version = args[i + 1]
+    if "--flathub" in args:
+        return flathub_manifest(version)
     if not shutil.which("flatpak"):
         sys.exit("flatpak isn't installed - `sudo apt install flatpak`")
     build = builder()

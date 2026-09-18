@@ -237,6 +237,7 @@ def library():
     ordered = list(songs.values())
     root = sm.folder()
     return {"root": root, "root_exists": os.path.isdir(root),
+            "root_shown": sm.host_path(root),   # a portal folder's real name
             "playlists": pls, "songs": ordered,
             "playlists_dir": sm.playlists_dir(), "levelling": sm.levelling(), "picker": bool(sm.chooser()),
             "target": sm.target(),

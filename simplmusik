@@ -156,37 +156,51 @@ import subprocess, sys, threading, time, zipfile
 AUDIO = {".mp3", ".m4a", ".m4b", ".aac", ".opus", ".ogg", ".oga", ".webm", ".weba",
          ".mka", ".flac", ".wav", ".aif", ".aiff", ".aifc", ".wma", ".ape", ".wv",
          ".mpc", ".amr", ".3gp", ".caf", ".dsf", ".dff"}
+
+def xdg_home(var, fallback):
+    """One of the desktop's own folders for app files, where it names one.
+    Almost nowhere does, and then it is the usual place under your home - but
+    a flatpak does, pointing each at the app's own folder in ~/.var/app, which
+    is the only part of your home a sandbox without it can write to."""
+    d = os.environ.get(var, "")
+    return d if os.path.isabs(d) else os.path.expanduser(fallback)
+
+CONFIG_HOME = xdg_home("XDG_CONFIG_HOME", "~/.config")
+STATE = xdg_home("XDG_STATE_HOME", "~/.local/state")
+CACHE_HOME = xdg_home("XDG_CACHE_HOME", "~/.cache")
+DATA_HOME = xdg_home("XDG_DATA_HOME", "~/.local/share")
+
 HOME_MUSIC = os.path.expanduser("~/Music")          # where playlists once sat
-CONF = os.path.expanduser("~/.config/simplmusik")  # the simplmusik folder
+CONF = os.path.join(CONFIG_HOME, "simplmusik")      # the simplmusik folder
 CONFIG = os.path.join(CONF, "config.json")
 HOMELESS = os.path.join(CONF, "playlists")          # where they waited, once
 WAS = [HOMELESS, os.path.join(HOME_MUSIC, "playlists")]   # where they used to live
-LOCK = os.path.expanduser("~/.local/state/simplmusik-player.lock")
-SOCK = os.path.expanduser("~/.local/state/simplmusik-player.sock")
-MPVSOCK = os.path.expanduser("~/.local/state/simplmusik-mpv.sock")
-JOB = os.path.expanduser("~/.local/state/simplmusik-job.json")
+LOCK = os.path.join(STATE, "simplmusik-player.lock")
+SOCK = os.path.join(STATE, "simplmusik-player.sock")
+MPVSOCK = os.path.join(STATE, "simplmusik-mpv.sock")
+JOB = os.path.join(STATE, "simplmusik-job.json")
 # Where playback used to be written down, back when it was written down at all.
 # Nothing reads these now; a player sweeps them up so an upgrade leaves nothing
 # behind that looks like a player to a copy of this that hasn't been upgraded.
-LEGACY = [os.path.expanduser("~/.local/state/simplmusik.json"),
-          os.path.expanduser("~/.local/state/simplmusik-ctl.json")]
+LEGACY = [os.path.join(STATE, "simplmusik.json"),
+          os.path.join(STATE, "simplmusik-ctl.json")]
 # Where the play log used to be, back when it was this machine's rather than
 # the library's. `migrate` lifts it into the music folder, once.
-WAS_PLAYS = os.path.expanduser("~/.local/state/simplmusik-plays.jsonl")
-DLDIR = os.path.expanduser("~/.local/state/simplmusik-downloads")
+WAS_PLAYS = os.path.join(STATE, "simplmusik-plays.jsonl")
+DLDIR = os.path.join(STATE, "simplmusik-downloads")
 # Where the player leaves word that the music stopped without being asked to.
 # In the state folder with the rest of what this machine is doing, not in your
 # music folder: it is news for the next few seconds and nothing afterwards.
-TROUBLE = os.path.expanduser("~/.local/state/simplmusik-trouble.json")
+TROUBLE = os.path.join(STATE, "simplmusik-trouble.json")
 TROUBLE_TTL = 60            # after this, it is history rather than news
-RESOLVED = os.path.expanduser("~/.local/state/simplmusik-resolved")
-SHOWN = os.path.expanduser("~/.local/state/simplmusik-shown.json")
+RESOLVED = os.path.join(STATE, "simplmusik-resolved")
+SHOWN = os.path.join(STATE, "simplmusik-shown.json")
 # This machine's own name for itself, and the playlist it last put on - both
 # this machine's business and no part of the library, so neither travels with
 # the music folder. See `device` and `mark_played`.
-DEVICE = os.path.expanduser("~/.local/state/simplmusik-device")
-PLAYED = os.path.expanduser("~/.local/state/simplmusik-played.json")
-CACHE = os.path.expanduser("~/.cache/simplmusik.json")
+DEVICE = os.path.join(STATE, "simplmusik-device")
+PLAYED = os.path.join(STATE, "simplmusik-played.json")
+CACHE = os.path.join(CACHE_HOME, "simplmusik.json")
 NULL = subprocess.DEVNULL
 
 CONF_DOT = ".simplmusik"            # the hidden folder playlists sit in
@@ -214,7 +228,7 @@ def is_library(name):
 # what ships alongside - the bundled yt-dlp included.
 HERE = os.path.dirname(os.path.realpath(__file__))
 YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
-YTDLP_USER = os.path.expanduser("~/.local/share/simplmusik/yt-dlp")
+YTDLP_USER = os.path.join(DATA_HOME, "simplmusik", "yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 
 # Installed from a store - a flatpak or a snap, each of which says so in the
@@ -480,19 +494,77 @@ def remember(name, path, **facts):
 # does. What comes back joins the same path a typed one takes, so there is one
 # way the folder is chosen and not two. zenity is what Mint has; kdialog is what a
 # KDE machine has instead. No display means no dialog, so don't offer one.
+#
+# A flatpak asks the desktop's file chooser portal instead. zenity in the
+# sandbox could only show the sandbox, which holds your Music folder and
+# nothing else; the portal's dialog is the desktop's own, sees every disk and
+# USB stick, and hands back the one folder you picked as a place the sandbox
+# can reach - for good, not just until the next restart.
 
 CHOOSERS = [["zenity", "--file-selection", "--directory",
              "--title", "Choose a music folder"],
             ["kdialog", "--getexistingdirectory", os.path.expanduser("~")]]
+PORTAL = ["portal"]                 # not a command: the portal, over D-Bus
 
 def chooser():
     """The command that opens this desktop's folder picker, or None."""
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return None
+    if STORE == "flatpak":
+        return PORTAL
     for cmd in CHOOSERS:
         if shutil.which(cmd[0]):
             return cmd
     return None
+
+def portal_folder():
+    """Ask the file chooser portal for a folder, the same three answers as
+    `choose_folder`. The answer comes back as a signal on a request object
+    rather than from the call, and the object's path is known before the call
+    is made, so the signal is listened for first and cannot be missed."""
+    try:
+        from gi.repository import Gio, GLib
+    except ImportError:
+        return None
+    got = {}
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        token = "simplmusik%d" % os.getpid()
+        sender = bus.get_unique_name()[1:].replace(".", "_")
+        request = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+        loop = GLib.MainLoop()
+
+        def answered(_bus, _sender, _path, _iface, _signal, params):
+            code, results = params.unpack()
+            got["uris"] = results.get("uris") or [] if code == 0 else []
+            loop.quit()
+
+        sub = bus.signal_subscribe(
+            "org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+            "Response", request, None, Gio.DBusSignalFlags.NONE, answered)
+        options = {"handle_token": GLib.Variant("s", token),
+                   "directory": GLib.Variant("b", True),
+                   "modal": GLib.Variant("b", True)}
+        bus.call_sync("org.freedesktop.portal.Desktop",
+                      "/org/freedesktop/portal/desktop",
+                      "org.freedesktop.portal.FileChooser", "OpenFile",
+                      GLib.Variant("(ssa{sv})", ("", "Choose a music folder", options)),
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None)
+        loop.run()
+        bus.signal_unsubscribe(sub)
+    except GLib.Error:
+        return None
+    uris = got.get("uris") or []
+    return Gio.File.new_for_uri(uris[0]).get_path() or "" if uris else ""
+
+def host_path(path):
+    """A folder as you would know it. One the portal handed over sits in the
+    sandbox at /run/user/<uid>/doc/<id>/, a name nobody has ever seen, and the
+    portal notes on it where it really is; everything else is its own name."""
+    try:
+        return os.getxattr(path, "user.document-portal.host-path").decode().rstrip("\0")
+    except (OSError, AttributeError, UnicodeDecodeError):
+        return path
 
 def choose_folder():
     """Ask the desktop for a folder: the path, "" if the dialog was closed
@@ -501,6 +573,8 @@ def choose_folder():
     cmd = chooser()
     if not cmd:
         return None
+    if cmd is PORTAL:
+        return portal_folder()
     try:
         p = subprocess.run(cmd, capture_output=True, text=True)
     except (OSError, subprocess.SubprocessError):
@@ -527,9 +601,8 @@ def xdg_music():
     its word would make the library the whole of your home directory - so that
     one answer is declined."""
     home = os.path.expanduser("~")
-    conf = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
     try:
-        with open(os.path.join(conf, "user-dirs.dirs")) as f:
+        with open(os.path.join(CONFIG_HOME, "user-dirs.dirs")) as f:
             for line in f:
                 m = re.match(r'\s*XDG_MUSIC_DIR\s*=\s*"(.*)"\s*$', line)
                 if m:
@@ -1446,7 +1519,7 @@ def levelled(name, path):
 # once, and two decodes side by side would only take twice the battery to
 # reach the same numbers.
 
-LEVELS_LOCK = os.path.expanduser("~/.local/state/simplmusik-levels.lock")
+LEVELS_LOCK = os.path.join(STATE, "simplmusik-levels.lock")
 
 def unmeasured(idx=None):
     """Library songs with no measurement for the file as it is now, newest
@@ -3644,7 +3717,7 @@ def cmd_folder(args):
     away and left with none. Nothing here ever touches a file."""
     dir_, action = folder(), (args.action or "").lower()
     if not action:
-        return emit(args.json, dir_, dir_) or 0
+        return emit(args.json, dir_, host_path(dir_)) or 0
     if action != "set":
         return fail(args.json, "say `folder` or `folder set PATH`", 1)
     if args.path:
@@ -3666,12 +3739,12 @@ def cmd_folder(args):
         # Choosing the folder you are already on is not a mistake to report,
         # it is simply nothing to do.
         return emit(args.json, {"folder": dir_, "changed": False},
-                    "already your music folder: " + path) or 0
+                    "already your music folder: " + host_path(path)) or 0
     was, logs = playlists_dir(), plays_files()  # before the change, so the
     set_folder(path)                           # move has somewhere to follow
     rehome(was, logs)           # all live in the folder, so all go with it
     return emit(args.json, {"folder": path, "changed": True},
-                "music folder is now " + path) or 0
+                "music folder is now " + host_path(path)) or 0
 
 def cmd_levelling(args):
     """Levelling on, off, or as it stands. Changing it mid-song swaps the filter

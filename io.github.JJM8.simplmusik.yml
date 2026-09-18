@@ -36,11 +36,12 @@ finish-args:
   # mpv has to reach the sound server, and yt-dlp the network.
   - --socket=pulseaudio
   - --share=network
-  # Your music, and the app's own settings and playlists, are addressed by
-  # absolute path - ~/Music, ~/.config/simplmusik, ~/.local/state - so home is
-  # what makes them the same files the .deb and the checkout use. Anything
-  # narrower gives the flatpak a private empty home and its own second library.
-  - --filesystem=home
+  # Your Music folder, and nothing else of your home. Settings and state live
+  # in the app's own folder under ~/.var/app, where the XDG_* variables flatpak
+  # sets point them. Music anywhere else - another disk, a USB stick - is a
+  # folder you pick in the desktop's own dialog, which the file chooser portal
+  # then opens to the app, that one folder and for good.
+  - --filesystem=xdg-music
 
 cleanup:
   - /include
