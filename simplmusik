@@ -278,8 +278,38 @@ def detach(*argv):
     if EMBEDDED:
         threading.Thread(target=main, args=(argv,), daemon=True).start()
         return
+    if STORE == "flatpak" and portal_spawn(argv):
+        return
     subprocess.Popen([sys.executable, os.path.abspath(__file__)] + argv,
                      start_new_session=True, stdin=NULL, stdout=NULL, stderr=NULL)
+
+def portal_spawn(argv):
+    """Start an internal command in a sandbox of its own, through the flatpak
+    portal. A flatpak lasts as long as anything in it is running, so a player
+    started in the same one would keep `flatpak run ... play` from ever handing
+    the terminal back - and would go when the window that started it closed.
+    One of its own is as detached as a new session is outside. True if the
+    portal took it; False sends it the ordinary way."""
+    try:
+        from gi.repository import Gio, GLib
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        fds = Gio.UnixFDList.new()
+        null = os.open(os.devnull, os.O_RDWR)
+        try:
+            h = fds.append(null)            # a copy, so ours can go at once
+        finally:
+            os.close(null)
+        env = {k: v for k, v in os.environ.items() if k.startswith("SIMPLMUSIK_")}
+        bus.call_with_unix_fd_list_sync(
+            "org.freedesktop.portal.Flatpak", "/org/freedesktop/portal/Flatpak",
+            "org.freedesktop.portal.Flatpak", "Spawn",
+            GLib.Variant("(ayaaya{uh}a{ss}ua{sv})",
+                         (b"/\0", [a.encode() + b"\0" for a in ["simplmusik"] + argv],
+                          {0: h, 1: h, 2: h}, env, 0, {})),
+            GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, -1, fds, None)
+        return True
+    except Exception:
+        return False
 
 # --------------------------------------------------------------- the player
 # There is one player, and this is what makes it one.
@@ -3534,7 +3564,7 @@ def cmd_status(args):
         now = "playing: nothing"
     else:
         pos = ("#%d, shuffled" % (st["index"] + 1) if shuffling()
-               else "%d/%d" % (track, len(st["songs"])) if track else "")
+               else "%d/%d" % (track, st["queue"]) if track else "")
         now = "%s %s  (%s%s)" % ("paused:" if st.get("paused") else "playing:",
                                  st["song"], st.get("playlist") or "library",
                                  ", " + pos if pos else "")
