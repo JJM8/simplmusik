@@ -754,6 +754,17 @@ input  { font: inherit; }
 .set-row input[type=text]::placeholder { color: var(--faint); }
 .set-row input[type=text]:focus { border-color: var(--accent-ink); }
 
+.set-row code.cli {
+  flex: 1; min-width: 0; padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font: 12px/1.5 ui-monospace, "DejaVu Sans Mono", monospace;
+  color: var(--dim);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  user-select: all;
+}
+
 .btn.small { height: 30px; padding: 0 13px; font-size: 13px; }
 .btn.small:not(.primary) { border: 1px solid var(--border); }
 

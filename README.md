@@ -50,6 +50,10 @@ This builds all three packages into `build/`.
 simplmusik --help
 ```
 
+With the Flatpak, go to Settings → Command line and run the line shown there
+once. Until then the same commands work as
+`flatpak run io.github.JJM8.simplmusik --help`.
+
 ## Credits
 
 Music in the intro video:

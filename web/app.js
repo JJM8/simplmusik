@@ -1255,9 +1255,39 @@ function renderSettings() {
               setRow(label('Playlists folder'),
                      el('div', 'val', state.lib.playlists_dir || '')));
   page.append(info);
+  if (state.lib.cli_setup) page.append(...cliSetup(state.lib.cli_setup));
   page.append(el('div', 'hint',
     'simplmusik - A JJM8 Production.'));
   $('#list').replaceChildren(page);
+}
+
+/* Installed as a flatpak, the CLI is in the box but has no name outside it,
+   and the sandbox may not give it one. So here is the line that does, to
+   paste into a terminal once. A folder ~/.local/bin that didn't exist before
+   is only put on PATH at login, which is the one case it needs more. */
+
+function cliSetup(line) {
+  const box = el('div', 'panel');
+  const code = el('code', 'cli', line);
+  const copy = el('button', 'btn small', 'Copy');
+  copy.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(line);
+    } catch (_) {
+      const r = document.createRange();         // WebKit without the async
+      r.selectNodeContents(code);               // clipboard: copy it the old way
+      getSelection().removeAllRanges(); getSelection().addRange(r);
+      const ok = document.execCommand('copy');
+      getSelection().removeAllRanges();
+      if (!ok) return toast('Select the line below and copy it');
+    }
+    toast('Copied - paste it into a terminal');
+  };
+  box.append(setRow(label('Use simplmusik in a terminal',
+                          'Run this once, then open a new terminal. If the ' +
+                          'command is not found, log out and back in.'), copy),
+             setRow(code));
+  return [el('div', 'set-sec', 'Command line'), box];
 }
 
 /* ------------------------------------------------------------------ stats */

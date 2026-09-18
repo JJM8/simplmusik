@@ -80,8 +80,41 @@ def run(script, args, label):
     return time.time() - started
 
 
+def committed():
+    """The commit being built, which is the one a release is tagged at - or
+    the reason there isn't one. A release is its packages and its source, and
+    the tag is where the source comes from, so what is built has to be a commit
+    and nothing more: edits not yet committed would be in the packages and
+    nowhere in the tag."""
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                           cwd=HERE, capture_output=True, text=True).stdout.strip()
+    if dirty:
+        sys.exit("uncommitted changes - commit them first, or build with "
+                 "--no-publish:\n" + dirty)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def tag_release(tag, commit):
+    """Tag the commit that was built, and push the tag. Left to GitHub, a new
+    release is tagged at whatever main is on GitHub at the time - which is not
+    this commit whenever it hasn't been pushed yet, and was how v0.2.4 to
+    v0.2.6 all came to name the same old one. False if the tag is already
+    somewhere else, which is a mistake to look at rather than paper over."""
+    have = subprocess.run(["git", "rev-list", "-n1", tag], cwd=HERE,
+                          capture_output=True, text=True).stdout.strip()
+    if have and have != commit:
+        print("\n%s is already at %s, not %s - nothing was uploaded"
+              % (tag, have[:7], commit[:7]))
+        return False
+    if not have:
+        subprocess.run(["git", "tag", tag, commit], cwd=HERE, check=True)
+    return subprocess.run(["git", "push", "origin", tag], cwd=HERE).returncode == 0
+
+
 def main():
     args = sys.argv[1:]
+    commit = None if "--no-publish" in args else committed()
     deb = load("build-deb", "simplmusik_build_all_version")
     version, pinned = deb.VERSION, "--version" in args
     if pinned:
@@ -140,7 +173,7 @@ def main():
             built[button] = p
 
     if "--no-publish" not in args:
-        publish(built, version)
+        publish(built, version, commit)
 
 
 NOTES = """\
@@ -156,7 +189,7 @@ NOTES = """\
 """
 
 
-def publish(built, version):
+def publish(built, version, commit):
     """Put the packages on the release for `version`, making it if need be.
 
     The README's buttons link to releases/latest/download/<name>, so the name
@@ -190,7 +223,10 @@ def publish(built, version):
     if exists:
         cmd = ["gh", "release", "upload", tag, "--clobber"] + files
     else:
-        cmd = ["gh", "release", "create", tag, "--latest",
+        if not tag_release(tag, commit):
+            print("the builds are still in build/")
+            return
+        cmd = ["gh", "release", "create", tag, "--verify-tag", "--latest",
                "--title", "simplmusik " + version, "--notes", NOTES] + files
     if subprocess.run(cmd, cwd=HERE).returncode:
         print("\nthe upload failed - the builds are still in build/")

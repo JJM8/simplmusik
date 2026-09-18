@@ -241,6 +241,17 @@ STORE = "flatpak" if os.environ.get("FLATPAK_ID") else \
 UPDATE_HINT = ("update simplmusik from your software store" if STORE
                else "update it with `simplmusik update`")
 
+# A flatpak gives the window a launcher and the CLI no name at all out on the
+# host - and putting one in ~/.local/bin is exactly the reach outside the
+# sandbox it is there to stop. So the window shows this, for you to run once:
+# a three-line `simplmusik` that hands its arguments to the one inside. The
+# old one is removed rather than written over, so a symlink there - into a
+# checkout, say - is replaced instead of followed.
+CLI_SETUP = (("mkdir -p ~/.local/bin && rm -f ~/.local/bin/simplmusik && printf '#!/bin/sh\\nexec flatpak run "
+              "--command=simplmusik %s \"$@\"\\n' > ~/.local/bin/simplmusik && "
+              "chmod +x ~/.local/bin/simplmusik" % os.environ["FLATPAK_ID"])
+             if STORE == "flatpak" else None)
+
 # ------------------------------------------------------------------ detaching
 # Three things here are started and then not waited for: the player, the
 # download that runs behind a stream, and the promotion that follows it. On a
