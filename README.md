@@ -3,6 +3,7 @@
 A local music player for Linux and Android.
 
 Please press the speaker button on the video for the full experience.
+Little Claude /brag showcase video directed by me.
 
 https://github.com/user-attachments/assets/8a941465-c79c-4385-b200-c95256c1c242
 
