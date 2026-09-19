@@ -8,6 +8,7 @@ https://github.com/user-attachments/assets/8a941465-c79c-4385-b200-c95256c1c242
 
 ![simplmusik](screenshots/playlist.png)
 
+The app should be pretty intuitive to use. The only thing you may have to do if the software hasn't caught on to your existing music folder is to go into settings and change the folder.
 ## Download
 
 | | |
@@ -21,7 +22,7 @@ These links always give you the newest release. Older versions are on the
 
 ## Install
 
-**Flatpak**
+**Flatpak** not on flathub because flathub wanted me to remake my clauded manifest and then blocked me.
 
 ```sh
 flatpak install --user ./simplmusik.flatpak

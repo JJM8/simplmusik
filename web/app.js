@@ -160,7 +160,7 @@ function foundRows(box, s, pl) {
   // you off rewording a query when yt-dlp simply isn't installed.
   if (s.error)          return void box.append(el('div', 'none', s.error));
   if (!s.found.length)  return void box.append(el('div', 'none', 'Nothing on YouTube.'));
-  s.found.forEach(r => box.append(foundRow(r, pl)));
+  s.found.filter(r => !failed.has(r.id)).forEach(r => box.append(foundRow(r, pl)));
   if (s.found.length >= s.n) box.append(moreRow(s));
 }
 
@@ -1202,6 +1202,8 @@ function renderSettings() {
   // row is simply the library - subfolders came with it.
   const here = state.lib.songs.filter(s => !s.missing).length;
 
+  if (state.lib.update) page.append(...updateRow(state.lib.update));
+
   page.append(el('div', 'set-sec', 'Music folder'));
   const box = el('div', 'panel');
   const ico = svg('i-folder');
@@ -1259,6 +1261,19 @@ function renderSettings() {
   page.append(el('div', 'hint',
     'simplmusik - A JJM8 Production.'));
   $('#list').replaceChildren(page);
+}
+
+/* A newer simplmusik is out. The button opens the release in your browser. */
+
+function updateRow(u) {
+  const box = el('div', 'panel');
+  const get = el('a', 'btn small primary', 'Get it');
+  get.href = u.url;
+  get.target = '_blank';
+  get.rel = 'noopener';
+  box.append(setRow(label('simplmusik ' + u.version + ' is out',
+                          'Download it from the releases page.'), get));
+  return [el('div', 'set-sec', 'Update'), box];
 }
 
 /* Installed as a flatpak, the CLI is in the box but has no name outside it,
@@ -1606,13 +1621,23 @@ function markDownloads() {
    after this is a rename, not a fetch. */
 async function stream(r, pl) {
   const res = await call('stream', r.id);
-  if (!res.ok) return void toast(res.error || 'couldn\'t play that');
+  if (!res.ok) return void dropFound(r);
   const d = res.data || {};
   render();
   poll();                           // the bar should say what is playing at once
   // Asked for from inside a playlist, it joins that playlist once it is a real
   // song - which is the same promise the download button makes.
   if (pl && d.song && !d.streaming) addTo(pl, d.song);
+}
+
+/* A result YouTube won't give us is taken off the list, so it can't be
+   picked again. */
+const failed = new Set();
+
+function dropFound(r) {
+  failed.add(r.id);
+  render();
+  toast('That one isn\'t available. Try another.');
 }
 
 /* `pl` is the playlist the row is being offered from, or nothing when this is
@@ -1729,11 +1754,7 @@ async function download(r, pl) {
   render();                         // say so now, not when the bytes land
   const res = await call('download', r.id);
   downloadOver(r);
-  if (!res.ok) {
-    render();
-    toast(res.error || 'the download didn\'t work');
-    return;
-  }
+  if (!res.ok) return void dropFound(r);
   const d = res.data || {};
   r.song = d.song;
   render();                         // the ring stops here, not at the next poll
@@ -1928,8 +1949,15 @@ function renderPlayer() {
 
 /* ------------------------------------------------------------------ data */
 
+let toldUpdate = null;               // the new version already mentioned
+
 async function loadLibrary() {
   state.lib = await api('/api/library');
+  const u = state.lib.update;
+  if (u && u.version !== toldUpdate) {
+    toldUpdate = u.version;
+    toast('simplmusik ' + u.version + ' is out. It\'s in Settings.');
+  }
   state.byFile = Object.fromEntries(state.lib.songs.map(s => [s.file, s]));
   // A delete still in flight is still deleted, as far as the page is
   // concerned: the server's answer simply hasn't caught up, and a row

@@ -230,16 +230,16 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 YTDLP_BUNDLED = os.path.join(HERE, "yt-dlp")        # the one shipped with us
 YTDLP_USER = os.path.join(DATA_HOME, "simplmusik", "yt-dlp")
 YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+YTDLP_LATEST = "https://github.com/yt-dlp/yt-dlp/releases/latest"
+APP_LATEST = "https://github.com/JJM8/simplmusik/releases/latest"
+UPDATES = os.path.join(DATA_HOME, "simplmusik", "updates.json")
 
-# Installed from a store - a flatpak or a snap, each of which says so in the
-# environment it runs us in - the store is what updates us, yt-dlp included.
-# Code fetched past it is exactly what store review exists to stop, so there
-# only the copy shipped in the package is ever imported, and `update` points
-# at the store instead of reaching for the network.
+# Installed as a flatpak or a snap, each of which says so in the environment
+# it runs us in. Every build keeps its own yt-dlp current the same way, so this
+# only changes how the CLI is reached from outside.
 STORE = "flatpak" if os.environ.get("FLATPAK_ID") else \
         "snap" if os.environ.get("SNAP") else None
-UPDATE_HINT = ("update simplmusik from your software store" if STORE
-               else "update it with `simplmusik update`")
+UPDATE_HINT = "update it with `simplmusik update`"
 
 # A flatpak gives the window a launcher and the CLI no name at all out on the
 # host - and putting one in ~/.local/bin is exactly the reach outside the
@@ -3647,8 +3647,7 @@ CACHE_GRACE = 5             # ...and how long `stream --to` gives a fetch it
 RESOLVE_TTL = 3600          # how long a looked-up stream URL is trusted for.
                             # YouTube's own last about six hours; an hour is
                             # short enough that a stale one is never played
-YTDLP_GONE = ("yt-dlp is missing from this install - reinstall simplmusik" if STORE
-              else "yt-dlp isn't installed - run `simplmusik update`")
+YTDLP_GONE = "yt-dlp isn't installed - run `simplmusik update`"
 SEARCH_N = 8                # results a search comes back with
 SEARCH_MAX = 40             # ...and the most it will, however many you ask for
 SHOWN_TTL = 3600            # how long a printed list's numbering is worth
@@ -3675,21 +3674,17 @@ def ytdlp():
     Four places one can be: installed as a package, on the PATH, fetched by
     `update` into your own folder, or shipped beside the app. The last two are
     what let this work with nothing installed at all - and they are separate
-    because the shipped copy may belong to root, which `update` cannot write.
-
-    A store install looks only at the shipped copy: see STORE."""
+    because the shipped copy may belong to root, which `update` cannot write."""
     if _ytdlp:
         return _ytdlp[0]
     mod = None
-    if not STORE:
-        try:
-            import yt_dlp as mod
-        except ImportError:
-            pass
+    try:
+        import yt_dlp as mod
+    except ImportError:
+        pass
     best = None
     newest = mod.version.__version__ if mod else None
-    places = (YTDLP_BUNDLED,) if STORE else \
-             (shutil.which("yt-dlp"), YTDLP_USER, YTDLP_BUNDLED)
+    places = (shutil.which("yt-dlp"), YTDLP_USER, YTDLP_BUNDLED)
     for path in places:
         zv = zipapp_version(path) if path else None
         if zv and (newest is None or zv > newest):
@@ -4698,6 +4693,17 @@ def search_library(args, query):
     return emit(args.json, [{"n": i + 1, "file": n, "path": idx[n]}
                             for i, n in enumerate(hits)], "\n".join(lines)) or 0
 
+SEARCH_SPARE = 4            # extra results asked for, to stand in for the
+                            # ones `gettable` leaves out
+UNGETTABLE = {"private", "premium_only", "subscriber_only", "needs_auth"}
+
+def gettable(entry):
+    """Whether a search result is one a download can have. A live stream or a
+    premiere that hasn't started has no song to fetch yet, and a members only
+    video needs an account this app doesn't have."""
+    return (entry.get("live_status") not in ("is_live", "is_upcoming")
+            and entry.get("availability") not in UNGETTABLE)
+
 def search_youtube(args, query):
     """Search YouTube for songs. `extract_flat` keeps this to the search page
     itself - no per-video page is ever fetched - which is the difference
@@ -4710,12 +4716,15 @@ def search_youtube(args, query):
     try:
         with m.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True,
                           "skip_download": True, "ignoreerrors": True}) as y:
-            found = y.extract_info("ytsearch%d:%s" % (n, query), download=False)
+            found = y.extract_info("ytsearch%d:%s" % (n + SEARCH_SPARE, query),
+                                   download=False)
     except Exception as e:                  # yt-dlp raises a wide family of these
         return fail(args.json, "search failed: %s" % e, 1)
     out = []
     for e in (found or {}).get("entries") or []:
-        if e and e.get("id"):
+        if len(out) == n:
+            break
+        if e and e.get("id") and gettable(e):
             out.append({"n": len(out) + 1, "id": e["id"],
                         "title": e.get("title") or e["id"],
                         "channel": e.get("channel") or e.get("uploader") or "",
@@ -5263,6 +5272,10 @@ def dl_opts(dest):
             # morning under a date years old and drop it to the bottom of a
             # library that reads newest first.
             "updatetime": False,
+            # YouTube hides some audio behind a puzzle only JavaScript can
+            # solve. yt-dlp uses whichever of these it finds; the flatpak
+            # carries QuickJS for it.
+            "js_runtimes": {"deno": {}, "node": {}, "bun": {}, "quickjs": {}},
             "format": DL_FORMAT,
             "outtmpl": {"default": os.path.join(dest, "%(title)s.%(ext)s")}}
     if can_transcode():
@@ -5488,6 +5501,15 @@ def dl_hook(vid):
     return hook
 
 def fetch_id(vid):
+    """Fetch one video into the library, as (what landed, why not). A fetch
+    YouTube turned away gets one more try when there is a newer yt-dlp to try
+    it with, since that is usually what the failure was."""
+    got, why = fetch_once(vid)
+    if why and why.startswith("download failed") and newer_ytdlp(RETRY_EVERY):
+        got, why = fetch_once(vid)
+    return got, why
+
+def fetch_once(vid):
     """Fetch one video into the library, as (what landed, why not).
 
     The work `download` does with none of the printing, so that `add` can do
@@ -5906,7 +5928,12 @@ def cmd_stream(args):
     if not running:
         dl_done(vid)            # asking again clears what last time left behind
     try:
-        info, url, song = resolve(vid)
+        try:
+            info, url, song = resolve(vid)
+        except Exception:       # a newer yt-dlp, if there is one, then again
+            if not newer_ytdlp(RETRY_EVERY):
+                raise
+            info, url, song = resolve(vid)
     except Exception as e:      # yt-dlp raises a wide family of these
         return fail(args.json, "couldn't start that song: %s" % e, 1)
     if not url:
@@ -5957,30 +5984,27 @@ def cmd_stream(args):
 # finished once it works; yt-dlp is in a race with YouTube, and the copy that
 # played a song last month is the one that finds nothing but thumbnails today.
 
-def cmd_update(args):
-    """Fetch the newest yt-dlp.
+CHECK_EVERY = 86400         # how often the window looks for a newer yt-dlp
+                            # and a newer simplmusik
+RETRY_EVERY = 3600          # ...and how soon a failed download may look again
+_updates_lock = threading.Lock()
 
-    It lands in your own folder rather than beside the app, which is what lets
-    this work the same whether simplmusik was unpacked into a folder you own
-    or installed as a package owned by root. `ytdlp` prefers whichever copy is
-    newest, so the fetched one simply wins from here on.
+def fetch_ytdlp():
+    """Download the newest yt-dlp into your own folder, as (version, error).
 
-    Not from a store install, which the store keeps current instead."""
-    if STORE:
-        return fail(args.json, "this is the %s build - yt-dlp %s ships inside it "
-                    "and is updated with the app: %s"
-                    % (STORE, zipapp_version(YTDLP_BUNDLED) or "(missing)",
-                       UPDATE_HINT), 1)
-    import urllib.request                # only this command ever needs it
-    was = zipapp_version(YTDLP_USER) or zipapp_version(YTDLP_BUNDLED)
+    It lands there rather than beside the app, which is what lets this work
+    the same whether simplmusik was unpacked into a folder you own, installed
+    as a package owned by root, or sealed in a flatpak. `ytdlp` prefers
+    whichever copy is newest, so the fetched one simply wins from here on."""
+    import urllib.request
     try:
         with urllib.request.urlopen(YTDLP_URL, timeout=180) as r:
             blob = r.read()
     except Exception as e:               # urllib raises a wide family of these
-        return fail(args.json, "couldn't fetch yt-dlp: %s" % e, 1)
+        return None, "couldn't fetch yt-dlp: %s" % e
 
     os.makedirs(os.path.dirname(YTDLP_USER), exist_ok=True)
-    tmp = YTDLP_USER + ".tmp"
+    tmp = "%s.%d.tmp" % (YTDLP_USER, os.getpid())
     try:
         with open(tmp, "wb") as f:
             f.write(blob)
@@ -5990,16 +6014,118 @@ def cmd_update(args):
             # Checking that what came back is a yt-dlp is what keeps that
             # something from being written over a working one.
             os.remove(tmp)
-            return fail(args.json, "what came back isn't a yt-dlp - check the network", 1)
+            return None, "what came back isn't a yt-dlp - check the network"
         os.chmod(tmp, 0o755)
         os.replace(tmp, YTDLP_USER)      # atomic: no half file is ever run
     except OSError as e:
-        return fail(args.json, "couldn't write %s: %s" % (YTDLP_USER, e), 1)
-
+        return None, "couldn't write %s: %s" % (YTDLP_USER, e)
     _ytdlp[:] = []                       # decided already, and now out of date
+    return got, None
+
+def cmd_update(args):
+    """Fetch the newest yt-dlp."""
+    was = zipapp_version(YTDLP_USER) or zipapp_version(YTDLP_BUNDLED)
+    got, why = fetch_ytdlp()
+    if why:
+        return fail(args.json, why, 1)
     return emit(args.json, {"version": got, "was": was, "path": YTDLP_USER},
                 "yt-dlp is now %s%s" % (got, "" if was in (None, got)
                                         else " (was %s)" % was)) or 0
+
+def version_key(v):
+    """A version as numbers, so 0.10.0 sorts after 0.9.0 and 2026.08.19 after
+    2026.8.1."""
+    return tuple(int(n) for n in re.findall(r"\d+", v or ""))
+
+def latest_tag(url):
+    """The version a GitHub project's newest release is tagged with, or None.
+    Its releases/latest page redirects to that release, so the address it
+    lands on names it, and nothing is downloaded to find out."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            end = r.geturl()
+    except Exception:                    # offline, or GitHub is having a day
+        return None
+    m = re.search(r"/releases/tag/v?(\d[\d.]*)$", end)
+    return m.group(1) if m else None
+
+def updates():
+    """What the last look for updates found."""
+    try:
+        with open(UPDATES) as f:
+            got = json.load(f)
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def looked(key, **found):
+    """Note that `key` was just checked, and what was found."""
+    state = updates()
+    state.update(found)
+    state[key] = time.time()
+    os.makedirs(os.path.dirname(UPDATES), exist_ok=True)
+    tmp = "%s.%d.tmp" % (UPDATES, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, UPDATES)
+
+def newer_ytdlp(since=CHECK_EVERY):
+    """Fetch yt-dlp's newest release if it is newer than the one in use, and
+    nobody has checked in the last `since` seconds. The new version, or None.
+
+    YouTube changes how it hands out audio every few weeks and yt-dlp follows
+    within days, so this is what keeps downloads working with nobody running
+    `update` by hand."""
+    with _updates_lock:
+        if time.time() - updates().get("ytdlp", 0) < since:
+            return None
+        tag = latest_tag(YTDLP_LATEST)
+        if not tag:
+            return None                  # try again next time, not tomorrow
+        looked("ytdlp")
+    m = ytdlp()
+    have = m.version.__version__ if m else ""
+    if version_key(tag) <= version_key(have):
+        return None
+    got, _ = fetch_ytdlp()
+    return got
+
+def app_version():
+    """This build's version: the newest release its store listing names. The
+    listing is installed beside every build, the phone's included."""
+    name = "io.github.JJM8.simplmusik.metainfo.xml"
+    for path in (os.path.join(HERE, "..", "..", "share", "metainfo", name),
+                 os.path.join(HERE, name)):
+        try:
+            with open(path) as f:
+                m = re.search(r'<release version="([^"]+)"', f.read())
+            if m:
+                return m.group(1)
+        except OSError:
+            pass
+    return None
+
+def check_updates():
+    """The daily look for a newer yt-dlp and a newer simplmusik. The window
+    runs it on a thread at start, so nobody waits on it."""
+    try:
+        newer_ytdlp()
+        with _updates_lock:
+            if time.time() - updates().get("checked", 0) >= CHECK_EVERY:
+                tag = latest_tag(APP_LATEST)
+                if tag:
+                    looked("checked", app=tag)
+    except Exception:
+        pass                             # a failed check is just no news
+
+def app_update():
+    """The newer simplmusik that is out, as {version, url}, or None."""
+    new, have = updates().get("app"), app_version()
+    if new and have and version_key(new) > version_key(have):
+        return {"version": new, "url": APP_LATEST}
+    return None
 
 # ---------------------------------------------------------------------- main
 # name: (help, positional args, optional flag). "?" = optional, "+" = one or more.

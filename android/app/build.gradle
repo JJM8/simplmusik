@@ -22,7 +22,7 @@ def staged = layout.buildDirectory.dir("staged-assets")
 // Syncthing's conflict copies sit beside the real files and are never app.
 def stageAssets = tasks.register("stageAssets", Sync) {
     into staged
-    from(repoRoot) { include "simplmusik", "server.py" }
+    from(repoRoot) { include "simplmusik", "server.py", "io.github.JJM8.simplmusik.metainfo.xml" }
     from(repoRoot) { include "web/**" }
     exclude "**/*.sync-conflict-*"
     // A build that quietly staged nothing would produce an APK that starts and

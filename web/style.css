@@ -766,6 +766,7 @@ input  { font: inherit; }
 }
 
 .btn.small { height: 30px; padding: 0 13px; font-size: 13px; }
+a.btn { text-decoration: none; }
 .btn.small:not(.primary) { border: 1px solid var(--border); }
 
 /* The settings row that is one of a few named choices rather than simply on or

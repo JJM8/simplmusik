@@ -179,6 +179,21 @@ def app_window():
         content = WebKit2.UserContentManager()
         view = WebKit2.WebView(user_content_manager=content)
 
+        def outside(_view, decision, kind):
+            """A link out of the app opens in your browser, never in here."""
+            if kind == WebKit2.PolicyDecisionType.RESPONSE:
+                return False
+            uri = decision.get_navigation_action().get_request().get_uri()
+            if uri.startswith(url) or not uri.startswith(("http:", "https:")):
+                return False
+            try:
+                Gio.AppInfo.launch_default_for_uri(uri, None)
+            except GLib.Error:
+                pass
+            decision.ignore()
+            return True
+        view.connect("decide-policy", outside)
+
         def wear(dark):
             """Put the window in one palette or the other: the decoration
             through GTK, and the space behind the page - which is what shows

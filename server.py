@@ -56,8 +56,13 @@ sm.migrate()                    # the config and the playlists both moved, once
 # yt-dlp is imported the first time something wants it, which costs a fifth of
 # a second or so. This process outlives every command it runs, so importing it
 # here means that is paid once, at startup, instead of by whoever asks first -
-# and on a thread, so the window is being served while it happens.
-threading.Thread(target=sm.ytdlp, daemon=True).start()
+# and on a thread, so the window is being served while it happens. The same
+# thread then looks for a newer yt-dlp and a newer simplmusik, once a day.
+def warm_up():
+    sm.ytdlp()
+    sm.check_updates()
+
+threading.Thread(target=warm_up, daemon=True).start()
 
 # Commands the UI is allowed to invoke. Anything else is refused, so a stray
 # request can never turn into an arbitrary subprocess.
@@ -217,6 +222,7 @@ def library():
             "playlists": pls, "songs": ordered,
             "playlists_dir": sm.playlists_dir(), "levelling": sm.levelling(), "picker": bool(sm.chooser()),
             "cli_setup": sm.CLI_SETUP,  # a flatpak's CLI has no name on the host yet
+            "update": sm.app_update(),  # a newer simplmusik, when there is one
             "target": sm.target(),
             # The ends of the target slider, so the page can't offer a setting
             # the CLI would refuse - there is one place they are decided.

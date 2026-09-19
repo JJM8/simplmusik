@@ -83,8 +83,18 @@ public class MainActivity extends AppCompatActivity {
         web.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
-                String host = r.getUrl().getHost();
-                return !("127.0.0.1".equals(host) || "localhost".equals(host));
+                Uri u = r.getUrl();
+                String host = u.getHost();
+                if ("127.0.0.1".equals(host) || "localhost".equals(host)) return false;
+                // A link out of the app opens in the browser, never in here.
+                if ("http".equals(u.getScheme()) || "https".equals(u.getScheme())) {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, u));
+                    } catch (android.content.ActivityNotFoundException e) {
+                        // no browser: nothing to hand it to
+                    }
+                }
+                return true;
             }
 
             @Override
