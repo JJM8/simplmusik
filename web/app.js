@@ -1285,7 +1285,9 @@ function cliSetup(line) {
   };
   box.append(setRow(label('Use simplmusik in a terminal',
                           'Run this once, then open a new terminal. If the ' +
-                          'command is not found, log out and back in.'), copy),
+                          'command is not found, log out of your computer ' +
+                          'and back in - a ~/.local/bin that was not there ' +
+                          'when you logged in is not on your PATH yet.'), copy),
              setRow(code));
   return [el('div', 'set-sec', 'Command line'), box];
 }
