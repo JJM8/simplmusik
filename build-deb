@@ -37,7 +37,7 @@ import time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(HERE, "build")
-VERSION = "0.2.8"          # what the next build will be; see bump()
+VERSION = "0.3.0"          # what the next build will be; see bump()
 PKG = "simplmusik"
 MAINTAINER = "Josh <mcgilljoshy2@gmail.com>"
 
@@ -245,7 +245,13 @@ def note_release(version):
     and the other finds it already there.
 
     An entry with no words in it is still a true one - that version, that day
-    - and the words can be written afterwards. See undescribed()."""
+    - and the words can be written afterwards. See undescribed().
+
+    Called for the version now due - VERSION - however the build was started:
+    ./build-all names it on the command line so its three packages agree, and
+    that is a release, not a rebuild. A number named by hand that is not the
+    one due is a rebuild of something already out, and leaves the listing as
+    it is."""
     text = metainfo(version)
     with open(METAINFO) as f:
         if f.read() == text:
@@ -359,7 +365,7 @@ def main():
         shutil.rmtree(stage)
     os.makedirs(stage)
     print("building %s %s" % (PKG, version))
-    if not pinned:
+    if version == VERSION:
         note_release(version)
 
     lib = os.path.join(stage, LIBDIR.lstrip("/"))
@@ -380,7 +386,7 @@ def main():
     print("\n%s  (%.1f MB)" % (out, os.path.getsize(out) / 1e6))
     print("\nInstall it with:\n    sudo apt install %s" % out)
 
-    if not pinned and undescribed(version):
+    if version == VERSION and undescribed(version):
         print("\n%s has no description in the metainfo yet - the store will\n"
               "show it with no note of what changed. Worth a line in %s\n"
               "before the release goes out." % (version, os.path.basename(METAINFO)))

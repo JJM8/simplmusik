@@ -156,8 +156,7 @@ def main():
     args = sys.argv[1:]
     deb = load("build-deb", "simplmusik_build_deb_version")
     version = deb.VERSION                       # one version, kept in build-deb
-    pinned = "--version" in args
-    if pinned:
+    if "--version" in args:
         i = args.index("--version")
         if i + 1 >= len(args):
             sys.exit("--version needs a number, e.g. --version 0.2.0")
@@ -172,7 +171,7 @@ def main():
     print("building %s %s" % (APP_ID, version))
     if "--fresh" in args:
         fresh_ytdlp()
-    if not pinned:
+    if version == deb.VERSION:
         deb.note_release(version)
 
     print("  building the flatpak (mpv is compiled here - give it a while)")
@@ -194,7 +193,7 @@ def main():
     else:
         print("\nInstall it with:\n    flatpak install --user %s" % out)
 
-    if not pinned and deb.undescribed(version):
+    if version == deb.VERSION and deb.undescribed(version):
         print("\n%s has no description in the metainfo yet - the store will\n"
               "show it with no note of what changed. Worth a line in %s\n"
               "before the release goes out." % (version, os.path.basename(deb.METAINFO)))
