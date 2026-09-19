@@ -167,35 +167,11 @@ def song_path(name):
     resolve, so nothing sent from the page can reach outside your folder."""
     return index().get(os.path.basename(name or ""))
 
-# Tags are read once per file and kept until the file changes on disk, so
-# scrolling a big library never re-parses anything.
-
-_tags = {}
-_tags_lock = threading.Lock()
-
-def tags(path):
-    """title / artist / album / duration for one song, best effort."""
-    try:
-        key = (path, os.path.getmtime(path))
-    except OSError:
-        return {}
-    with _tags_lock:
-        if key in _tags:
-            return _tags[key]
-    info = {}
-    try:
-        import mutagen
-        a = mutagen.File(path, easy=True)
-        if a is not None:
-            g = lambda k: (a.get(k) or [None])[0]
-            info = {"title": g("title"), "artist": g("artist"), "album": g("album"),
-                    "duration": round(a.info.length, 1) if a.info else None}
-    except Exception:
-        pass
-    info = {k: v for k, v in info.items() if v}
-    with _tags_lock:
-        _tags[key] = info
-    return info
+# Tags and covers are read by the CLI, which the player needs them from too:
+# the desktop's media controls show the song that is playing, and the player
+# is a process of its own with no server in it.
+tags = sm.tags
+cover_bytes = sm.cover_bytes
 
 def song_entry(name, path):
     """One song as the UI wants it. `file` is its whole identity; `path` is
@@ -291,41 +267,6 @@ def take_cover(stem, body):
             os.remove(tmp)
         except OSError:
             pass
-
-_cover_cache = {}
-
-def cover_bytes(path):
-    """Embedded artwork for a song, or None. There is no folder to fall back
-    to: a folder holds whatever you happened to put in it, so a cover.jpg
-    there would be every song's cover, which is worse than none."""
-    try:
-        key = (path, os.path.getmtime(path))
-    except OSError:
-        return None
-    if key in _cover_cache:
-        return _cover_cache[key]
-    data = None
-    try:
-        import mutagen
-        a = mutagen.File(path)
-        if a is not None:
-            for tag in (getattr(a, "tags", None) or {}):
-                if str(tag).startswith("APIC"):            # mp3
-                    data = a.tags[tag].data
-                    break
-            if data is None and getattr(a, "pictures", None):   # flac / ogg
-                data = a.pictures[0].data
-            # mutagen's MP4 tags act like a dict without being one.
-            if data is None and hasattr(getattr(a, "tags", None), "get"):
-                cov = a.tags.get("covr")                   # m4a
-                if cov:
-                    data = bytes(cov[0])
-    except Exception:
-        data = None
-    if len(_cover_cache) > 500:
-        _cover_cache.clear()
-    _cover_cache[key] = data
-    return data
 
 # -------------------------------------------------------------- play state
 # This page has no idea what is playing and never keeps one. It asks the player

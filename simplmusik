@@ -1209,6 +1209,71 @@ def set_cover(stem, src):
     drop_cover(stem, keep=dest)     # then an old one of another kind goes
     return dest
 
+# Tags are read once per file and kept until the file changes on disk, so
+# scrolling a big library never re-parses anything.
+
+_tags = {}
+_tags_lock = threading.Lock()
+
+def tags(path):
+    """title / artist / album / duration for one song, best effort."""
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return {}
+    with _tags_lock:
+        if key in _tags:
+            return _tags[key]
+    info = {}
+    try:
+        import mutagen
+        a = mutagen.File(path, easy=True)
+        if a is not None:
+            g = lambda k: (a.get(k) or [None])[0]
+            info = {"title": g("title"), "artist": g("artist"), "album": g("album"),
+                    "duration": round(a.info.length, 1) if a.info else None}
+    except Exception:
+        pass
+    info = {k: v for k, v in info.items() if v}
+    with _tags_lock:
+        _tags[key] = info
+    return info
+
+_cover_cache = {}
+
+def cover_bytes(path):
+    """Embedded artwork for a song, or None. There is no folder to fall back
+    to: a folder holds whatever you happened to put in it, so a cover.jpg
+    there would be every song's cover, which is worse than none."""
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return None
+    if key in _cover_cache:
+        return _cover_cache[key]
+    data = None
+    try:
+        import mutagen
+        a = mutagen.File(path)
+        if a is not None:
+            for tag in (getattr(a, "tags", None) or {}):
+                if str(tag).startswith("APIC"):            # mp3
+                    data = a.tags[tag].data
+                    break
+            if data is None and getattr(a, "pictures", None):   # flac / ogg
+                data = a.pictures[0].data
+            # mutagen's MP4 tags act like a dict without being one.
+            if data is None and hasattr(getattr(a, "tags", None), "get"):
+                cov = a.tags.get("covr")                   # m4a
+                if cov:
+                    data = bytes(cov[0])
+    except Exception:
+        data = None
+    if len(_cover_cache) > 500:
+        _cover_cache.clear()
+    _cover_cache[key] = data
+    return data
+
 _last_played = {}
 
 def last_played():
@@ -2766,6 +2831,308 @@ def clear_trouble():
     except OSError:
         pass
 
+# ------------------------------------------------------- the desktop's buttons
+# The play, next and previous keys on a keyboard are not a window's to catch:
+# the desktop takes them before any window sees them, and hands them to
+# whichever player has put itself on the session bus under MPRIS - the same
+# interface the sound menu, the lock screen and a Bluetooth headset drive. So
+# the player puts itself there. The player and not the window, because it is
+# the player that outlives the window: music started from a terminal, or still
+# going after the window was closed, answers the keys all the same.
+#
+# Every button is passed on through the socket, exactly as `simplmusik skip` in
+# a terminal would be, so the desktop is one more thing asking the player and
+# has no say the window doesn't. Android has all of this already, from its own
+# media session: see Playback.java.
+
+MPRIS_NAME = "org.mpris.MediaPlayer2.simplmusik"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+MPRIS_PROPS = "org.freedesktop.DBus.Properties"
+MPRIS_TRACK = "/io/github/JJM8/simplmusik/track/%d"
+MPRIS_DESKTOP = "io.github.JJM8.simplmusik"
+# The song's cover, written out for the desktop to read, because MPRIS names a
+# picture by address rather than carrying it. Under the cache so a flatpak's
+# copy is at the same path out on the host, where the sound menu is looking.
+MPRIS_ART = os.path.join(CACHE_HOME, "simplmusik-art")
+MPRIS_XML = """<node>
+  <interface name="org.mpris.MediaPlayer2">
+    <method name="Raise"/>
+    <method name="Quit"/>
+    <property name="CanQuit" type="b" access="read"/>
+    <property name="CanRaise" type="b" access="read"/>
+    <property name="HasTrackList" type="b" access="read"/>
+    <property name="Identity" type="s" access="read"/>
+    <property name="DesktopEntry" type="s" access="read"/>
+    <property name="SupportedUriSchemes" type="as" access="read"/>
+    <property name="SupportedMimeTypes" type="as" access="read"/>
+  </interface>
+  <interface name="org.mpris.MediaPlayer2.Player">
+    <method name="Next"/>
+    <method name="Previous"/>
+    <method name="Pause"/>
+    <method name="PlayPause"/>
+    <method name="Stop"/>
+    <method name="Play"/>
+    <method name="Seek"><arg direction="in" name="Offset" type="x"/></method>
+    <method name="SetPosition">
+      <arg direction="in" name="TrackId" type="o"/>
+      <arg direction="in" name="Position" type="x"/>
+    </method>
+    <method name="OpenUri"><arg direction="in" name="Uri" type="s"/></method>
+    <signal name="Seeked"><arg name="Position" type="x"/></signal>
+    <property name="PlaybackStatus" type="s" access="read"/>
+    <property name="Rate" type="d" access="readwrite"/>
+    <property name="Metadata" type="a{sv}" access="read"/>
+    <property name="Volume" type="d" access="readwrite"/>
+    <property name="Position" type="x" access="read"/>
+    <property name="MinimumRate" type="d" access="read"/>
+    <property name="MaximumRate" type="d" access="read"/>
+    <property name="CanGoNext" type="b" access="read"/>
+    <property name="CanGoPrevious" type="b" access="read"/>
+    <property name="CanPlay" type="b" access="read"/>
+    <property name="CanPause" type="b" access="read"/>
+    <property name="CanSeek" type="b" access="read"/>
+    <property name="CanControl" type="b" access="read"/>
+  </interface>
+</node>"""
+
+# What each button asks the player, in the words the socket already knows. Stop
+# is a pause: stopping ends the player, and a keyboard has no button that could
+# start it again.
+MPRIS_ORDERS = {"Next": {"op": "skip"}, "Previous": {"op": "back"},
+                "Play": {"op": "pause", "want": False},
+                "Pause": {"op": "pause", "want": True},
+                "Stop": {"op": "pause", "want": True},
+                "PlayPause": {"op": "pause", "want": None}}
+
+def mpris(job, guard):
+    """Put the player on the session bus, on a thread of its own. Best effort,
+    all of it: no bus, no GObject, or the name already taken is music the keys
+    can't reach, never no music."""
+    if EMBEDDED:
+        return
+    try:
+        from gi.repository import Gio, GLib
+    except ImportError:
+        return
+    threading.Thread(target=_mpris, args=(job, guard, Gio, GLib),
+                     daemon=True, name="simplmusik-mpris").start()
+
+def _mpris(job, guard, Gio, GLib):
+    V = GLib.Variant
+    # A context of our own, made current before anything is registered: the
+    # bus calls in on whichever one was current then, so this thread is the
+    # only place any of what follows ever runs.
+    ctx = GLib.MainContext.new()
+    ctx.push_thread_default()
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        node = Gio.DBusNodeInfo.new_for_xml(MPRIS_XML)
+    except GLib.Error:
+        return
+
+    # What the desktop was last told, so it is only told again when that moves.
+    seen = {"seq": None, "status": None, "meta": V("a{sv}", {}), "length": 0,
+            "art": None, "pos": None, "at": 0.0}
+
+    def now():
+        with guard:
+            song = job.get("song")
+            return (song, (job.get("paths") or {}).get(song), job.get("seq", 0),
+                    bool(job.get("paused")), job.get("playlist"))
+
+    def art(path, seq, stem):
+        """The song's own cover, else its playlist's, as a file:// address."""
+        data = cover_bytes(path) if path and not remote(path) else None
+        if not data:
+            p = cover_path(stem) if stem else None
+            return GLib.filename_to_uri(p, None) if p else None
+        # A new name for every song: the desktop keeps a picture by its
+        # address, and one address for all of them is the first cover forever.
+        try:
+            os.makedirs(MPRIS_ART, exist_ok=True)
+            for old in os.listdir(MPRIS_ART):
+                os.remove(os.path.join(MPRIS_ART, old))
+            kind = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
+            dest = os.path.join(MPRIS_ART, "%d.%s" % (seq, kind))
+            with open(dest, "wb") as f:
+                f.write(data)
+            return GLib.filename_to_uri(dest, None)
+        except OSError:
+            return None
+
+    def metadata(song, path, seq, duration):
+        """The song as a sound menu shows it: named the way the page and the
+        Android notification name it, tags first and the file after."""
+        if not song:
+            return V("a{sv}", {})
+        info = tags(path) if path and not remote(path) else {}
+        title, artist = info.get("title"), info.get("artist")
+        if not title:
+            title = song
+            if os.path.splitext(title)[1].lower() in AUDIO:
+                title = os.path.splitext(title)[0]
+            if not artist and " - " in title:
+                artist, title = (p.strip() for p in title.split(" - ", 1))
+        md = {"mpris:trackid": V("o", MPRIS_TRACK % seq),
+              "xesam:title": V("s", title)}
+        if artist:
+            md["xesam:artist"] = V("as", [artist])
+        if info.get("album"):
+            md["xesam:album"] = V("s", info["album"])
+        seen["length"] = info.get("duration") or duration or 0
+        if seen["length"]:
+            md["mpris:length"] = V("x", int(seen["length"] * 1e6))
+        if seen["art"]:
+            md["mpris:artUrl"] = V("s", seen["art"])
+        return V("a{sv}", md)
+
+    def props(iface):
+        if iface == MPRIS_ROOT:
+            return {"CanQuit": V("b", True), "CanRaise": V("b", True),
+                    "HasTrackList": V("b", False),
+                    "Identity": V("s", "simplmusik"),
+                    "DesktopEntry": V("s", MPRIS_DESKTOP),
+                    "SupportedUriSchemes": V("as", []),
+                    "SupportedMimeTypes": V("as", [])}
+        if iface != MPRIS_PLAYER:
+            return {}
+        pos = mpv_props("time-pos").get("time-pos") or 0.0
+        can = V("b", True)
+        return {"PlaybackStatus": V("s", seen["status"] or "Stopped"),
+                "Rate": V("d", 1.0), "MinimumRate": V("d", 1.0),
+                "MaximumRate": V("d", 1.0), "Metadata": seen["meta"],
+                "Volume": V("d", volume() / 100.0),
+                "Position": V("x", int(max(0.0, pos) * 1e6)),
+                "CanGoNext": can, "CanGoPrevious": can, "CanPlay": can,
+                "CanPause": can, "CanSeek": can, "CanControl": can}
+
+    def emit(iface, name, value):
+        try:
+            bus.emit_signal(None, MPRIS_PATH, iface, name, value)
+        except GLib.Error:
+            pass
+
+    def poll():
+        """Tell the desktop whatever has moved since it was last told: the
+        song, playing or paused, and a jump in the song - from the window, a
+        terminal or here - which it has no way to see coming."""
+        song, path, seq, paused, stem = now()
+        got = mpv_props("time-pos", "duration")
+        t, duration = got.get("time-pos"), got.get("duration")
+        changed = {}
+        # A stream only learns its length once it is playing, so a song first
+        # described without one is described again when mpv knows.
+        if seq != seen["seq"] or (duration and not seen["length"]):
+            if seq != seen["seq"]:
+                seen["art"] = art(path, seq, stem) if song else None
+                seen["pos"] = None      # a new song is not a jump in the old one
+            seen["seq"] = seq
+            seen["meta"] = changed["Metadata"] = metadata(song, path, seq, duration)
+        status = "Stopped" if not song else "Paused" if paused else "Playing"
+        if status != seen["status"]:
+            seen["status"] = status
+            changed["PlaybackStatus"] = V("s", status)
+        if changed:
+            emit(MPRIS_PROPS, "PropertiesChanged",
+                 V("(sa{sv}as)", (MPRIS_PLAYER, changed, [])))
+        clock = time.monotonic()
+        if t is not None and seen["pos"] is not None:
+            ran = 0.0 if paused else clock - seen["at"]
+            if abs(t - (seen["pos"] + ran)) > 1.5:
+                emit(MPRIS_PLAYER, "Seeked", V("(x)", (int(t * 1e6),)))
+        seen["pos"], seen["at"] = t, clock
+
+    def safe_poll(*_a):
+        try:
+            poll()
+        except Exception:
+            pass                # the desktop a second behind is not a crash
+        return True
+
+    def soon():
+        """Look again in a moment: a skip lands when the loop gets to it, not
+        when the button's answer comes back."""
+        s = GLib.timeout_source_new(250)
+        s.set_callback(lambda *_a: safe_poll() and False)
+        s.attach(ctx)
+
+    def call(_bus, _sender, _path, iface, method, params, inv):
+        args = params.unpack()
+        if iface == MPRIS_PROPS:
+            # Asked here rather than of a getter, which is how GDBus hands a
+            # properties call over when no getter is given. It has already
+            # checked the property exists and may be read or written.
+            if method == "Get":
+                inv.return_value(V("(v)", (props(args[0])[args[1]],)))
+            elif method == "GetAll":
+                inv.return_value(V("(a{sv})", (props(args[0]),)))
+            else:
+                if args[1] == "Volume":         # what `simplmusik volume` does
+                    set_setting("volume", round(max(0.0, min(1.0, args[2])) * 100))
+                    send("volume")
+                    emit(MPRIS_PROPS, "PropertiesChanged", V("(sa{sv}as)", (
+                        MPRIS_PLAYER, {"Volume": V("d", volume() / 100.0)}, [])))
+                inv.return_value(None)          # Rate stays 1: nothing else
+            return
+        if method in MPRIS_ORDERS:
+            ask(MPRIS_ORDERS[method])
+        elif method == "Seek":
+            here = mpv_props("time-pos").get("time-pos") or 0.0
+            send("seek", pos=max(0.0, here + args[0] / 1e6))
+        elif method == "SetPosition":
+            # Only into the song it was meant for, as the spec asks: a slider
+            # dragged as the song changed must not land in the next one.
+            if args[0] == MPRIS_TRACK % (seen["seq"] or 0) and args[1] >= 0:
+                send("seek", pos=args[1] / 1e6)
+        elif method == "Raise":
+            # The window, as the menu launches it: a second launch raises the
+            # one already open, and with none open this is how one opens.
+            try:
+                subprocess.Popen([sys.executable, os.path.join(HERE, "simplmusik-ui")],
+                                 start_new_session=True,
+                                 stdin=NULL, stdout=NULL, stderr=NULL)
+            except OSError:
+                pass
+        elif method == "Quit":
+            # Answered first and pushed out, because stopping is the end of
+            # this process and the answer would otherwise go down with it.
+            inv.return_value(None)
+            try:
+                bus.flush_sync(None)
+            except GLib.Error:
+                pass
+            ask({"op": "stop"})
+            return
+        elif method == "OpenUri":
+            inv.return_dbus_error("org.freedesktop.DBus.Error.NotSupported",
+                                  "simplmusik plays its own library")
+            return
+        inv.return_value(None)
+        soon()
+
+    safe_poll()                 # so the first thing asked has an answer
+    try:
+        for iface in (MPRIS_ROOT, MPRIS_PLAYER):
+            bus.register_object(MPRIS_PATH, node.lookup_interface(iface), call,
+                                None, None)
+        # 4 is "don't queue": if the name is someone else's, it stays theirs.
+        # A flatpak without the permission for it is answered with an error.
+        r = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                          "org.freedesktop.DBus", "RequestName",
+                          V("(su)", (MPRIS_NAME, 4)), GLib.VariantType("(u)"),
+                          Gio.DBusCallFlags.NONE, -1, None)
+        if r.unpack()[0] != 1:
+            return
+    except GLib.Error:
+        return
+    tick = GLib.timeout_source_new(1000)
+    tick.set_callback(safe_poll)
+    tick.attach(ctx)
+    GLib.MainLoop(ctx).run()
+
 def serve_control(job, want, guard, wake_w, finish):
     """The player answering for itself, on its own thread.
 
@@ -3009,6 +3376,8 @@ def _player(job):
     # Answering starts before mpv does, so a `play` that has only just
     # returned is already something `status` and the window can ask about.
     serve_control(job, want, guard, wake_w, finish)
+    # ...and the keyboard's media keys, through the desktop.
+    mpris(job, guard)
     # Killed rather than asked - the sandbox torn down around us, or a plain
     # `kill` - and there is no loop left to hand it to.
     #

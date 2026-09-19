@@ -42,6 +42,9 @@ finish-args:
   # folder you pick in the desktop's own dialog, which the file chooser portal
   # then opens to the app, that one folder and for good.
   - --filesystem=xdg-music
+  # The keyboard's play, next and previous keys, and the desktop's sound menu:
+  # both reach a player by this name on the session bus.
+  - --own-name=org.mpris.MediaPlayer2.simplmusik
 
 cleanup:
   - /include
