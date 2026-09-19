@@ -17,6 +17,13 @@ alike. Set that line by hand to move a whole version - 0.2.0 - and the ticking
 carries on from there. Naming a version with --version uses it as given and
 leaves the counter where it is.
 
+The version being cut also gets a <release> in the store listing here if it
+hasn't one, written into the file in this folder so it is there to be
+committed - the same thing ./build-flatpak does, from the same function, so a
+version is recorded whichever way it was built. The entry it writes says only
+that this version shipped on this day; if it is still wordless when the build
+ends, the build says so.
+
 Use --fresh when cutting a release. The yt-dlp in build/yt-dlp.cache is reused
 between builds, which is what you want while working and not what you want in
 something you hand out - YouTube retires extractors within months, and a
@@ -25,7 +32,7 @@ package is only as current as the copy frozen into it.
 Needs dpkg-deb, which is on every Debian and Ubuntu already.
 """
 
-import importlib.machinery, importlib.util, gzip, os, shutil, subprocess, sys
+import importlib.machinery, importlib.util, gzip, os, re, shutil, subprocess, sys
 import time, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -51,8 +58,9 @@ def bump():
     cut - two builds never go out wearing the same number.
 
     To move a whole version, set VERSION by hand - 0.2.0 - and the ticking
-    carries on from there. Nothing else in the tree names a version, so that
-    one line is the whole of it."""
+    carries on from there. This is the only line in the tree a version is
+    written by hand into: the store listing's <release> entries are written
+    from it, by note_release(), rather than kept in step with it."""
     head, _, last = VERSION.rpartition(".")
     nxt = "%s.%d" % (head, int(last) + 1)
     path = os.path.abspath(__file__)
@@ -226,6 +234,39 @@ def metainfo(version):
     return text
 
 
+def note_release(version):
+    """Give the listing in this folder a <release> for `version` if it hasn't
+    one, and say whether that wrote anything.
+
+    Written into the file here rather than a copy, because this is the file
+    Flathub reads and the one that gets committed - the package's own copy
+    goes out with the build and is gone. Both builds call this, so a version
+    is recorded wherever it was spent; whichever runs first writes the entry
+    and the other finds it already there.
+
+    An entry with no words in it is still a true one - that version, that day
+    - and the words can be written afterwards. See undescribed()."""
+    text = metainfo(version)
+    with open(METAINFO) as f:
+        if f.read() == text:
+            return False
+    with open(METAINFO, "w") as f:
+        f.write(text)
+    print("  added release %s to the metainfo" % version)
+    return True
+
+
+def undescribed(version):
+    """True when `version` has a <release> with nothing said in it - the empty
+    one note_release() writes. The store shows such a release with no note of
+    what changed, which is worth a word at the end of a build rather than a
+    surprise at the end of a release."""
+    with open(METAINFO) as f:
+        text = f.read()
+    m = re.search(r'<release version="%s"[^>]*?(/?)>' % re.escape(version), text)
+    return bool(m) and m.group(1) == "/"
+
+
 def changelog(version):
     stamp = time.strftime("%a, %d %b %Y %H:%M:%S %z")
     return ("%s (%s) unstable; urgency=medium\n\n"
@@ -318,6 +359,8 @@ def main():
         shutil.rmtree(stage)
     os.makedirs(stage)
     print("building %s %s" % (PKG, version))
+    if not pinned:
+        note_release(version)
 
     lib = os.path.join(stage, LIBDIR.lstrip("/"))
     os.makedirs(lib)
@@ -336,6 +379,11 @@ def main():
 
     print("\n%s  (%.1f MB)" % (out, os.path.getsize(out) / 1e6))
     print("\nInstall it with:\n    sudo apt install %s" % out)
+
+    if not pinned and undescribed(version):
+        print("\n%s has no description in the metainfo yet - the store will\n"
+              "show it with no note of what changed. Worth a line in %s\n"
+              "before the release goes out." % (version, os.path.basename(METAINFO)))
 
     # The number is spent now the package is built: tick it over so the next
     # build is a new version rather than a second copy of this one. A version

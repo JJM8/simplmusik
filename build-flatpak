@@ -19,8 +19,9 @@ packs the result into one file you can hand to someone.
 
 The version being built gets a <release> in the metainfo if it has none yet,
 written into the file in this folder rather than a copy, so it is there to be
-committed for Flathub. --fresh likewise rewrites the manifest's yt-dlp URL and
-checksum in place.
+committed for Flathub. ./build-deb does the same, from the same function, so
+the listing records a version whichever build spent it. --fresh likewise
+rewrites the manifest's yt-dlp URL and checksum in place.
 
 --flathub builds nothing. The manifest here takes the app's own files from
 this folder, so a build is of whatever is on the disk; Flathub builds on its
@@ -115,18 +116,6 @@ def fresh_ytdlp():
     print(tag)
 
 
-def note_release(version):
-    """Give the metainfo a <release> for this version if it hasn't one."""
-    deb = load("build-deb", "simplmusik_build_deb")
-    text = deb.metainfo(version)
-    with open(deb.METAINFO) as f:
-        if f.read() == text:
-            return
-    with open(deb.METAINFO, "w") as f:
-        f.write(text)
-    print("  added release %s to the metainfo" % version)
-
-
 def flathub_manifest(version):
     """The manifest as Flathub needs it: every file this repository supplies
     taken from the release tag rather than from this folder. What is fetched
@@ -167,7 +156,8 @@ def main():
     args = sys.argv[1:]
     deb = load("build-deb", "simplmusik_build_deb_version")
     version = deb.VERSION                       # one version, kept in build-deb
-    if "--version" in args:
+    pinned = "--version" in args
+    if pinned:
         i = args.index("--version")
         if i + 1 >= len(args):
             sys.exit("--version needs a number, e.g. --version 0.2.0")
@@ -182,7 +172,8 @@ def main():
     print("building %s %s" % (APP_ID, version))
     if "--fresh" in args:
         fresh_ytdlp()
-    note_release(version)
+    if not pinned:
+        deb.note_release(version)
 
     print("  building the flatpak (mpv is compiled here - give it a while)")
     subprocess.run(build + ["--force-clean", "--disable-rofiles-fuse",
@@ -202,6 +193,11 @@ def main():
         print("\nInstalled. Press Super, type music.")
     else:
         print("\nInstall it with:\n    flatpak install --user %s" % out)
+
+    if not pinned and deb.undescribed(version):
+        print("\n%s has no description in the metainfo yet - the store will\n"
+              "show it with no note of what changed. Worth a line in %s\n"
+              "before the release goes out." % (version, os.path.basename(deb.METAINFO)))
 
 
 if __name__ == "__main__":
